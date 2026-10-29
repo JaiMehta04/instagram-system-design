@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rate Limiting — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="rate-limiting">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>A <strong>rate limiter</strong> caps how many requests or actions a caller may perform in a time window (e.g. "200 likes per hour per account") and rejects the excess with <strong>HTTP 429 Too Many Requests</strong>.</li>
+    <li>It protects against <strong>abuse and spam bots</strong>, keeps the system <strong>fair</strong>, controls <strong>cost</strong>, and shields <strong>downstream services</strong> from overload.</li>
+    <li>Five classic algorithms: <strong>token bucket</strong> (allows bursts, most popular), <strong>leaky bucket</strong> (smooth output), <strong>fixed window</strong> (simple, edge bursts), <strong>sliding window log</strong> (exact, memory-hungry), <strong>sliding window counter</strong> (approximate, cheap — a great default).</li>
+    <li>At scale, counters live in <strong>Redis</strong>; use <strong>Lua scripts</strong> for atomicity, and a <strong>local + global hybrid</strong> to keep latency low.</li>
+    <li>Rate limiting (per-caller fairness) is different from <strong>load shedding</strong> (dropping work when the server is overloaded) and <strong>backpressure</strong> (slowing producers down).</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why does Instagram need rate limiting?</h2>
+<p>Every action on Instagram — liking, following, commenting, logging in, searching — is an API call that consumes CPU, database writes and network. Most users do a few hundred of these a day. But Instagram's openness invites people (and programs) who want to do <em>millions</em>:</p>
+<ul>
+  <li><strong>Spam and growth bots</strong> follow 5,000 accounts an hour hoping for follow-backs, then unfollow them; they mass-like and mass-comment ("🔥 DM us for collab!") to promote scams.</li>
+  <li><strong>Credential stuffing</strong>: attackers take username/password pairs leaked from other websites and try them against Instagram's login endpoint at thousands of attempts per second.</li>
+  <li><strong>Scrapers</strong> crawl profiles and posts to harvest personal data.</li>
+  <li><strong>Buggy clients</strong>: a mobile app release with a retry loop bug can make millions of phones hammer one endpoint simultaneously — an accidental DDoS from your own users.</li>
+  <li><strong>Noisy neighbours</strong>: one third-party integration or one heavy user consuming a disproportionate share of capacity slows everyone else down.</li>
+</ul>
+<p>Without limits, these callers degrade the experience for everybody, inflate the infrastructure bill, and can cascade into outages when a downstream database is overwhelmed. A rate limiter sets a ceiling per caller so that no one can consume more than their fair share.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  A nightclub bouncer lets in at most a certain number of people per minute so the club never gets dangerously crowded, and refuses to let the same person keep going in and out every 10 seconds. A theme-park ride gives each visitor a limited number of "fast pass" tokens per day, which refill slowly — use them all in a burst and you wait. Rate limiters are those bouncers and token machines for an API.
+</div>
+
+<h3>1.1 Why, in one list</h3>
+<div class="cards">
+  <div class="card"><h4>🛡️ Abuse &amp; security</h4><p>Slows brute-force logins, credential stuffing, scraping and enumeration attacks.</p></div>
+  <div class="card"><h4>🤖 Spam bots</h4><p>Caps follow/like/comment velocity so automation stops being profitable.</p></div>
+  <div class="card"><h4>⚖️ Fairness</h4><p>No single user, app or tenant can monopolise shared capacity.</p></div>
+  <div class="card"><h4>💰 Cost control</h4><p>Bounds spend on expensive operations (ML inference, SMS for 2FA, third-party APIs).</p></div>
+  <div class="card"><h4>🏗️ Protect downstream</h4><p>Keeps databases and services below their safe throughput, preventing cascading failure.</p></div>
+  <div class="card"><h4>📜 Commercial plans</h4><p>Enforces quotas for partner/third-party API tiers (e.g. 200 calls/hour on a free tier).</p></div>
+</div>
+
+<h2>2. Where to rate limit</h2>
+<p>Limits can be enforced at several layers — and real systems use more than one (defence in depth).</p>
+<div class="diagram">
+<svg viewBox="0 0 820 230" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-rl-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600">
+    <rect x="10" y="60" width="130" height="60" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="75" y="86" text-anchor="middle">📱 Client</text><text x="75" y="104" text-anchor="middle" font-weight="400" font-size="11.5">debounce, backoff</text>
+    <rect x="180" y="60" width="130" height="60" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="245" y="86" text-anchor="middle">CDN / WAF</text><text x="245" y="104" text-anchor="middle" font-weight="400" font-size="11.5">per-IP, DDoS</text>
+    <rect x="350" y="60" width="140" height="60" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="420" y="86" text-anchor="middle">API Gateway</text><text x="420" y="104" text-anchor="middle" font-weight="400" font-size="11.5">per-user, per-route</text>
+    <rect x="530" y="60" width="140" height="60" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="600" y="86" text-anchor="middle">Service</text><text x="600" y="104" text-anchor="middle" font-weight="400" font-size="11.5">business limits</text>
+    <rect x="710" y="60" width="100" height="60" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="760" y="86" text-anchor="middle">Database</text><text x="760" y="104" text-anchor="middle" font-weight="400" font-size="11.5">conn. pools</text>
+    <rect x="350" y="160" width="140" height="44" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="420" y="187" text-anchor="middle">Redis counters</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" marker-end="url(#ar-rl-1)" fill="none">
+    <path d="M140,90 L178,90"/><path d="M310,90 L348,90"/><path d="M490,90 L528,90"/><path d="M670,90 L708,90"/>
+    <path d="M420,120 L420,158"/><path d="M600,120 L492,170"/>
+  </g>
+  <text x="410" y="30" text-anchor="middle" font-size="12" fill="#555">coarse, cheap  ◀────────────────────────────▶  precise, domain-aware</text>
+</svg>
+<div class="caption">Each layer catches different abuse: the edge stops floods cheaply, the gateway enforces per-user API limits, services enforce business rules.</div>
+</div>
+
+<div class="table-wrap"><table>
+  <tr><th>Layer</th><th>What it does well</th><th>Limitations</th><th>Instagram example</th></tr>
+  <tr><td><b>Client-side</b></td><td>Prevents accidental floods: debounce double-taps, exponential backoff on errors, honour <code>Retry-After</code></td><td>Never a security control — attackers don't use your app</td><td>App disables the Like button for 300 ms after a tap; backs off on 429</td></tr>
+  <tr><td><b>Edge (CDN/WAF/LB)</b></td><td>Absorbs volumetric floods by IP before they reach the data center</td><td>Only sees IPs; no user identity; shared IPs (carrier NAT) cause false positives</td><td>Block an IP sending 50k req/s</td></tr>
+  <tr><td><b>API gateway</b></td><td>Sees every request with authenticated identity; one consistent place for per-user / per-app / per-route limits</td><td>Doesn't understand business semantics (is this a follow of a new account?)</td><td>100 req/s per user overall; 10 login attempts/min per IP</td></tr>
+  <tr><td><b>Per-service</b></td><td>Domain-aware limits; protects the service's own capacity regardless of caller</td><td>Each team must implement it; requests already consumed gateway capacity</td><td>Graph service: max N new follows per hour; Like service: max likes per hour</td></tr>
+</table></div>
+
+<h2>3. What to limit by: the rate-limit key</h2>
+<p>A rate limiter keeps a counter per <strong>key</strong>. Choosing the key decides <em>who</em> is being limited.</p>
+<div class="table-wrap"><table>
+  <tr><th>Key</th><th>Good for</th><th>Pitfalls</th></tr>
+  <tr><td><b>User ID</b></td><td>Authenticated actions: likes, follows, comments, posting</td><td>Attackers create many accounts — combine with device/IP limits and signup limits</td></tr>
+  <tr><td><b>IP address</b></td><td>Unauthenticated endpoints: login, signup, password reset; DDoS</td><td>Mobile carriers and offices put thousands of users behind one IP (CGNAT); IPv6 gives attackers huge address ranges (limit by /64 prefix)</td></tr>
+  <tr><td><b>Device ID</b></td><td>Catches one phone farming many accounts</td><td>Can be spoofed by emulators; reset on reinstall</td></tr>
+  <tr><td><b>API token / app ID</b></td><td>Third-party developers and partner quotas</td><td>One app serves many users — usually combine with per-user-per-app limits</td></tr>
+  <tr><td><b>Endpoint / action</b></td><td>Different budgets for expensive vs cheap operations</td><td>Too many rules become hard to reason about</td></tr>
+  <tr><td><b>Composite</b></td><td><code>user:123:action:follow</code>, <code>ip:1.2.3.4:route:/login</code>, <code>app:77:user:123</code></td><td>Memory grows with the number of distinct keys</td></tr>
+</table></div>
+<p>A request is typically checked against <strong>several</strong> rules at once, and is rejected if <em>any</em> rule is exceeded:</p>
+<pre><code>rules for POST /v1/users/{id}/follow:
+  - key: "user:{uid}:all"         limit: 100 req / 1 s     # general API budget
+  - key: "user:{uid}:follow"      limit: 200   / 1 h       # anti-spam action limit
+  - key: "user:{uid}:follow:day"  limit: 1000  / 24 h
+  - key: "device:{did}:follow"    limit: 300   / 1 h       # catches multi-account farms
+  - key: "ip:{ip}:follow"         limit: 2000  / 1 h       # generous: shared IPs</code></pre>
+<div class="callout warn"><span class="callout-title">⚠️ Numbers in this lesson are illustrative</span>
+Instagram does not publish its exact limits (publishing them would help spammers tune their bots), and they vary by account age, reputation and behaviour. Treat all numbers here as assumptions for learning.</div>
+
+<h2>4. The algorithms</h2>
+<p>All rate-limiting algorithms answer one question per request: <em>"given what this key has done recently, allow or reject?"</em> They differ in how they remember "recently", how they treat bursts, and how much memory they need.</p>
+
+<h3>4.1 Token bucket</h3>
+<p>Imagine a bucket that holds at most <strong>B tokens</strong> (the <em>capacity</em> or <em>burst size</em>). Tokens are added at a constant <strong>refill rate R</strong> per second, and the bucket never overflows. Each request takes one token (or a cost <em>c</em> for expensive requests). No token → reject.</p>
+<pre class="ascii">
+      refill: R tokens/second  (e.g. 2/s)
+                 │
+                 ▼
+          ┌─────────────┐
+          │ ● ● ● ● ●   │   capacity B = 10 tokens
+          │ ● ● ● ●     │   current = 9
+          └──────┬──────┘
+                 │ each request removes 1 token
+                 ▼
+   request ──▶ token available? ── yes ──▶ ALLOW (tokens -= 1)
+                                 └─ no ──▶ REJECT 429
+</pre>
+<p><strong>Behaviour:</strong> a user who has been idle can burst up to B requests instantly, then is held to R per second on average. Over any interval of length <em>t</em>, at most <code>B + R·t</code> requests can pass.</p>
+<p>The clever implementation trick: you don't need a timer adding tokens. Store just two numbers per key — <code>tokens</code> and <code>last_refill_time</code> — and compute the refill lazily on each request:</p>
+<pre><code>function allow(key, cost = 1):
+    now = current_time_seconds()
+    state = store.get(key) or { tokens: B, last: now }
+    elapsed = now - state.last
+    state.tokens = min(B, state.tokens + elapsed * R)   # lazy refill
+    state.last = now
+    if state.tokens &gt;= cost:
+        state.tokens -= cost
+        store.put(key, state)
+        return ALLOW
+    else:
+        store.put(key, state)
+        retry_after = (cost - state.tokens) / R          # seconds until enough tokens
+        return REJECT(retry_after)</code></pre>
+<p><strong>Worked example:</strong> B = 10, R = 1 token/s. A user idle for a minute sends 15 requests at once: the first 10 pass, the next 5 get 429 with <code>Retry-After: 1</code>. Two seconds later 2 tokens have refilled, so 2 more requests pass.</p>
+<p><strong>Pros:</strong> allows natural bursts (opening the app triggers a flurry of calls), O(1) memory (two numbers per key), easy to reason about, supports per-request cost. <strong>Cons:</strong> two parameters to tune; a full bucket allows a burst that might still hurt a fragile downstream. Used by AWS API Gateway, Stripe, NGINX-like limiters and most cloud APIs.</p>
+
+<h3>4.2 Leaky bucket</h3>
+<p>Picture a bucket with a small hole in the bottom. Requests pour into the bucket (a <strong>FIFO queue</strong> of capacity B) and <strong>leak out at a constant rate R</strong> to be processed. If the bucket is full, new requests overflow and are rejected.</p>
+<pre class="ascii">
+   bursty input ──▶ ┌───────────┐
+   ▌▌▌  ▌    ▌▌▌▌   │ queue (B) │  ◀── full? → REJECT (overflow)
+                    │ ▌▌▌▌▌     │
+                    └─────┬─────┘
+                          │ constant drain: R requests/second
+                          ▼
+   smooth output:   ▌ ▌ ▌ ▌ ▌ ▌ ▌ ▌ ▌   ──▶ backend
+</pre>
+<pre><code>queue = BoundedQueue(capacity = B)
+
+on_request(req):
+    if queue.full(): return REJECT
+    queue.push(req)                       # will be processed later
+
+worker loop (runs every 1/R seconds):
+    if not queue.empty():
+        process(queue.pop())
+
+# "Leaky bucket as a meter" variant (no queue, just a counter):
+function allow(key):
+    now = time()
+    s = store.get(key) or { level: 0, last: now }
+    s.level = max(0, s.level - (now - s.last) * R)   # leak since last request
+    s.last = now
+    if s.level + 1 &lt;= B:
+        s.level += 1; store.put(key, s); return ALLOW
+    store.put(key, s); return REJECT</code></pre>
+<p><strong>Behaviour:</strong> output rate is perfectly smooth at R, no matter how bursty the input. The meter variant is mathematically equivalent to a token bucket (level = B − tokens); the queue variant actually <em>delays</em> requests rather than rejecting them.</p>
+<p><strong>Pros:</strong> protects a downstream that needs a steady rate (e.g. a partner SMS gateway allowing 100 messages/s); O(B) or O(1) memory. <strong>Cons:</strong> queued requests wait, adding latency; a burst of old requests can starve new ones; not great for interactive APIs where users expect instant answers. Used in traffic shaping (network routers), NGINX's <code>limit_req</code> (leaky-bucket based, with optional <code>burst</code> queueing), and outbound job processing.</p>
+
+<h3>4.3 Fixed window counter</h3>
+<p>Divide time into fixed windows (e.g. each calendar minute: 12:00:00–12:00:59). Keep one counter per key per window. Increment on each request; if it exceeds the limit, reject until the next window starts.</p>
+<pre class="ascii">
+ limit = 5 per minute
+   window 12:00                       window 12:01
+ |-----------------------------|-----------------------------|
+   ✔ ✔ ✔        ✔ ✔  ✖ ✖          ✔ ✔ ✔ ✔ ✔  ✖
+   count: 1 2 3   4 5  6 7          1 2 3 4 5  6
+</pre>
+<pre><code>function allow(key, limit, window_seconds):
+    window_id = floor(now() / window_seconds)
+    counter_key = key + ":" + window_id          # e.g. "user:42:follow:28950012"
+    count = store.incr(counter_key)              # atomic increment
+    if count == 1:
+        store.expire(counter_key, window_seconds)
+    return count &lt;= limit</code></pre>
+<p><strong>The boundary burst problem:</strong> with limit 100/minute, a client can send 100 requests at 12:00:59 and another 100 at 12:01:00 — <strong>200 requests in 2 seconds</strong>, double the intended rate, because they fall into different windows.</p>
+<pre class="ascii">
+              12:00:00                    12:01:00                    12:02:00
+                 |---------- window A ---------|---------- window B ---------|
+                                      ▌▌▌▌▌▌▌▌▌|▌▌▌▌▌▌▌▌▌
+                                     100 reqs  | 100 reqs
+                                      └──── 200 requests within ~2 s ────┘
+</pre>
+<p><strong>Pros:</strong> trivial, one counter per key, works perfectly with Redis <code>INCR</code> + <code>EXPIRE</code>. <strong>Cons:</strong> up to 2× bursts at window edges; all clients' windows reset at the same instant, causing synchronised "thundering herd" retries at the top of the minute.</p>
+
+<h3>4.4 Sliding window log</h3>
+<p>Keep a <strong>log of timestamps</strong> of each accepted request per key (e.g. a Redis sorted set). On each request, delete timestamps older than <code>now − window</code>, count what remains, and allow if the count is below the limit.</p>
+<pre class="ascii">
+ limit = 3 per 60 s, request arrives at t=100
+ log before: [ 30, 45, 70, 95 ]
+ drop &lt; 100-60=40:        [ 45, 70, 95 ]   → count 3 ≥ 3 → REJECT
+ at t=106:   drop &lt; 46:   [ 70, 95 ]       → count 2 &lt; 3 → ALLOW, log = [70, 95, 106]
+</pre>
+<pre><code>function allow(key, limit, window):
+    now = now_ms()
+    store.zremrangebyscore(key, 0, now - window)      # evict old entries
+    if store.zcard(key) &lt; limit:
+        store.zadd(key, score=now, member=now + ":" + random())
+        store.expire(key, window)
+        return ALLOW
+    return REJECT</code></pre>
+<p><strong>Pros:</strong> exact — at most <code>limit</code> requests in <em>any</em> rolling window; no boundary bursts. <strong>Cons:</strong> memory is O(limit) per key. For a limit of 1,000/hour and 10M active keys that's up to 10 billion timestamps (~8 bytes each plus overhead → easily 100+ GB). Also more work per request. Use it when limits are small and accuracy matters (e.g. 5 password-reset emails per hour).</p>
+
+<h3>4.5 Sliding window counter</h3>
+<p>A clever approximation that combines fixed-window cheapness with sliding-window smoothness. Keep counters for the <strong>current</strong> and <strong>previous</strong> fixed windows, and estimate the count in the rolling window by weighting the previous window by how much of it still overlaps:</p>
+<pre><code>estimated = current_count + previous_count × (1 − elapsed_in_current / window)</code></pre>
+<pre class="ascii">
+ limit = 100/min, request at 12:01:15  (25% into current window)
+            previous window (12:00)            current window (12:01)
+      |------------------------------------|------------------------------------|
+                 count = 84                    count = 36
+                          ◀──────────── rolling 60 s window ────────────▶
+                          (75% of previous)        (25% elapsed)
+ estimate = 36 + 84 × 0.75 = 99   → 99 &lt; 100 → ALLOW (count becomes 37)
+</pre>
+<pre><code>function allow(key, limit, window):
+    now = now_seconds()
+    cur_id  = floor(now / window)
+    elapsed = now - cur_id * window
+    cur  = store.get(key + ":" + cur_id) or 0
+    prev = store.get(key + ":" + (cur_id - 1)) or 0
+    estimate = cur + prev * (window - elapsed) / window
+    if estimate &gt;= limit: return REJECT
+    store.incr(key + ":" + cur_id)
+    store.expire(key + ":" + cur_id, 2 * window)
+    return ALLOW</code></pre>
+<p>It assumes requests in the previous window were evenly spread, so it's an approximation — but in practice the error is small. Cloudflare has publicly reported that, measured on real traffic, only a tiny fraction (~0.003%) of requests were wrongly allowed or limited with this approach. <strong>Pros:</strong> two counters per key, smooths edge bursts, fast. <strong>Cons:</strong> approximate; slightly more complex than fixed window.</p>
+
+<h3>4.6 Comparison</h3>
+<div class="table-wrap"><table>
+  <tr><th>Algorithm</th><th>Burst handling</th><th>Memory per key</th><th>Accuracy</th><th>Best for</th></tr>
+  <tr><td><b>Token bucket</b></td><td>Allows controlled bursts up to B, then rate R</td><td>O(1): tokens + timestamp</td><td>Exact for its model</td><td>General API limits; the default choice</td></tr>
+  <tr><td><b>Leaky bucket</b></td><td>Absorbs bursts in a queue, outputs smooth rate</td><td>O(1) meter or O(B) queue</td><td>Exact</td><td>Shaping traffic to a fragile downstream; outbound jobs</td></tr>
+  <tr><td><b>Fixed window</b></td><td>Up to 2× limit across a window boundary</td><td>O(1): one counter</td><td>Low at edges</td><td>Coarse limits, daily quotas, simplicity</td></tr>
+  <tr><td><b>Sliding window log</b></td><td>No edge bursts; strict</td><td>O(limit): every timestamp</td><td>Exact</td><td>Small, security-sensitive limits (login, OTP)</td></tr>
+  <tr><td><b>Sliding window counter</b></td><td>Edge bursts mostly smoothed</td><td>O(1): two counters</td><td>Approximate, very close</td><td>High-volume per-user limits at scale</td></tr>
+</table></div>
+<p>Two related ideas: <strong>GCRA</strong> (Generic Cell Rate Algorithm), a token-bucket variant that stores a single "theoretical arrival time" per key (used by libraries such as redis-cell and throttled); and <strong>concurrency limits</strong>, which cap the number of <em>in-flight</em> requests rather than requests per second (useful for long or expensive calls).</p>
+
+<h2>5. Distributed rate limiting with Redis</h2>
+<p>Instagram runs hundreds of gateway instances. If each kept its own counters, a user could get <code>limit × number_of_instances</code> by having requests spread across them. The counters must be <strong>shared</strong> — typically in a Redis cluster, because it's in-memory (sub-millisecond), supports atomic operations and key expiry, and shards horizontally. See <a href="caching.html">Caching (Redis)</a>.</p>
+
+<h3>5.1 Fixed window with INCR + EXPIRE</h3>
+<pre><code>key = "rl:user:42:like:" + floor(now/3600)      # hourly window
+MULTI
+  INCR   key
+  EXPIRE key 3600 NX      # set TTL only if none (Redis 7+); older: check INCR result == 1
+EXEC
+if result_of_INCR &gt; 200 → 429</code></pre>
+<p><code>INCR</code> is atomic, so two concurrent requests can never both read 199 and write 200. The <code>EXPIRE</code> makes old windows disappear automatically, so memory stays bounded.</p>
+
+<h3>5.2 Race conditions: why "read, then write" breaks</h3>
+<p>Algorithms that read state, compute, then write (token bucket, sliding window log) have a classic race when two gateway instances handle the same user simultaneously:</p>
+<pre class="ascii">
+ Gateway A                         Redis (tokens=1)                Gateway B
+   GET tokens  ─────────────────▶  1
+                                   1  ◀─────────────────────────── GET tokens
+   1 ≥ 1 → allow, SET tokens=0 ─▶  0
+                                   0  ◀─────────────────────────── 1 ≥ 1 → allow, SET tokens=0
+   Result: 2 requests allowed with only 1 token  ✖
+</pre>
+<p>Fixes: make the whole read-modify-write <strong>atomic on the Redis server</strong>. Options are <code>MULTI/EXEC</code> with <code>WATCH</code> (optimistic locking, retries under contention), or — the standard answer — a <strong>Lua script</strong>. Redis executes a Lua script atomically: no other command runs in the middle. It also saves round trips.</p>
+
+<h3>5.3 Token bucket as a Redis Lua script</h3>
+<pre><code>-- KEYS[1] = bucket key, ARGV = capacity, refill_per_sec, now_ms, cost
+local capacity = tonumber(ARGV[1])
+local rate     = tonumber(ARGV[2])
+local now      = tonumber(ARGV[3])
+local cost     = tonumber(ARGV[4])
+
+local data   = redis.call("HMGET", KEYS[1], "tokens", "ts")
+local tokens = tonumber(data[1]) or capacity
+local ts     = tonumber(data[2]) or now
+
+local elapsed = math.max(0, now - ts) / 1000
+tokens = math.min(capacity, tokens + elapsed * rate)
+
+local allowed = 0
+local retry_ms = 0
+if tokens &gt;= cost then
+  tokens = tokens - cost
+  allowed = 1
+else
+  retry_ms = math.ceil((cost - tokens) / rate * 1000)
+end
+
+redis.call("HSET", KEYS[1], "tokens", tokens, "ts", now)
+-- expire idle buckets once they would be full again
+redis.call("PEXPIRE", KEYS[1], math.ceil(capacity / rate * 1000) + 1000)
+return { allowed, math.floor(tokens), retry_ms }</code></pre>
+<p>The gateway calls it with <code>EVALSHA &lt;sha&gt; 1 rl:user:42:api 100 50 &lt;now_ms&gt; 1</code>. Details that matter in production:</p>
+<ul>
+  <li><strong>Clock source:</strong> different gateway machines have slightly different clocks. Either pass a time from a well-synchronised clock (NTP) and tolerate small skew, or use Redis's own <code>TIME</code> command inside the script so one clock is authoritative.</li>
+  <li><strong>Cluster keys:</strong> in Redis Cluster all keys a script touches must hash to the same slot; use hash tags like <code>rl:{user:42}:cur</code> and <code>rl:{user:42}:prev</code>.</li>
+  <li><strong>Sharding:</strong> keys spread naturally across shards by user ID (see <a href="consistent-hashing.html">consistent hashing</a>). Watch for hot keys — e.g. a single per-IP key for a huge carrier NAT.</li>
+</ul>
+
+<h3>5.4 Latency and availability concerns</h3>
+<p>A Redis round trip within a data center is ~0.2–1&nbsp;ms. Fine for one check — but a request might hit 3–5 rules, at millions of requests per second. Mitigations:</p>
+<ul>
+  <li>Evaluate all rules for a request in <strong>one Lua script</strong> or one pipelined batch → one round trip.</li>
+  <li>Co-locate Redis with gateways in the same zone/region; don't make cross-region calls for rate limiting.</li>
+  <li>Decide <strong>fail-open vs fail-closed</strong> when Redis is down: fail open for ordinary traffic (an outage of the limiter shouldn't take down Instagram), fail closed (or fall back to strict local limits) for sensitive endpoints like login and OTP.</li>
+  <li>Per-region counters: a user's requests normally stay in one region, so global (cross-region) exactness is rarely worth the latency. Accept that a determined attacker spreading across regions gets slightly more.</li>
+</ul>
+
+<h3>5.5 Local + global hybrid</h3>
+<p>To avoid a network hop on every request, each gateway instance keeps <strong>local in-memory token buckets</strong> and synchronises with the global store only periodically:</p>
+<ol class="steps">
+  <li><strong>Local fast path:</strong> each instance checks a local bucket in memory (nanoseconds). Obvious abusers are rejected without touching Redis.</li>
+  <li><strong>Batch sync:</strong> every ~100 ms–1 s, each instance pushes its local counts to Redis (<code>INCRBY</code>) and reads back the global total for active keys.</li>
+  <li><strong>Lease / quota allocation variant:</strong> an instance "borrows" a chunk of the user's budget (e.g. 10 tokens) from the global store and spends it locally; when exhausted, it asks for another chunk.</li>
+  <li><strong>Trade-off:</strong> between syncs, a user spread over many instances can slightly exceed the limit. For anti-abuse limits measured per hour, overshooting by a few requests is irrelevant; for strict limits (OTP attempts), go straight to the global store.</li>
+</ol>
+<div class="diagram">
+<svg viewBox="0 0 800 250" width="800" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-rl-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600">
+    <rect x="20" y="100" width="120" height="44" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="80" y="127" text-anchor="middle">Load Balancer</text>
+    <rect x="200" y="20" width="200" height="60" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="300" y="44" text-anchor="middle">Gateway instance 1</text><text x="300" y="64" text-anchor="middle" font-weight="400" font-size="11.5">local buckets (in RAM)</text>
+    <rect x="200" y="95" width="200" height="60" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="300" y="119" text-anchor="middle">Gateway instance 2</text><text x="300" y="139" text-anchor="middle" font-weight="400" font-size="11.5">local buckets (in RAM)</text>
+    <rect x="200" y="170" width="200" height="60" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="300" y="194" text-anchor="middle">Gateway instance N</text><text x="300" y="214" text-anchor="middle" font-weight="400" font-size="11.5">local buckets (in RAM)</text>
+    <rect x="520" y="85" width="170" height="80" rx="10" fill="#fff8e1" stroke="#f9a825"/><text x="605" y="115" text-anchor="middle">Redis cluster</text><text x="605" y="135" text-anchor="middle" font-weight="400" font-size="11.5">global counters</text><text x="605" y="151" text-anchor="middle" font-weight="400" font-size="11.5">Lua scripts</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" marker-end="url(#ar-rl-2)" fill="none">
+    <path d="M140,115 L198,55"/><path d="M140,122 L198,125"/><path d="M140,130 L198,195"/>
+  </g>
+  <g stroke="#f9a825" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#ar-rl-2)" fill="none">
+    <path d="M400,50 L518,105"/><path d="M400,125 L518,125"/><path d="M400,200 L518,145"/>
+  </g>
+  <text x="460" y="70" font-size="11" fill="#555" text-anchor="middle">sync</text>
+  <text x="460" y="240" font-size="11" fill="#555" text-anchor="middle">every ~100 ms or per request for strict rules</text>
+</svg>
+<div class="caption">Hybrid limiting: each instance decides locally in nanoseconds and reconciles with global counters asynchronously.</div>
+</div>
+
+<h2>6. Telling the client: HTTP 429 and rate-limit headers</h2>
+<p>A well-behaved limiter tells clients what happened and when to try again, so good clients back off instead of retrying blindly.</p>
+<pre><code>HTTP/1.1 429 Too Many Requests
+Content-Type: application/json
+Retry-After: 120
+X-RateLimit-Limit: 200
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1793098920
+
+{
+  "error": {
+    "code": "RATE_LIMITED",
+    "message": "You're doing that too often. Please try again later.",
+    "retry_after_seconds": 120
+  }
+}</code></pre>
+<ul>
+  <li><code>429 Too Many Requests</code> — the standard status for "you, specifically, are over your limit". (Contrast with <code>503 Service Unavailable</code> — "the server is overloaded for everyone", used by load shedding.)</li>
+  <li><code>Retry-After</code> — seconds to wait (or an HTTP date). Clients should honour it.</li>
+  <li><code>X-RateLimit-Limit</code> / <code>-Remaining</code> / <code>-Reset</code> — the de-facto convention (GitHub, Twitter/X and many APIs) telling clients their budget on <em>every</em> response, so they can self-throttle. Reset is often a Unix timestamp. An IETF draft standardises unprefixed <code>RateLimit</code> and <code>RateLimit-Policy</code> headers.</li>
+</ul>
+<p>Client behaviour on 429: stop, wait <code>Retry-After</code>, then retry with <strong>exponential backoff plus jitter</strong> (random spread) so millions of clients don't all retry at the same instant. See <a href="resilience-patterns.html">Resilience patterns</a>.</p>
+<div class="callout tip"><span class="callout-title">💡 Anti-abuse twist: don't always tell the truth</span>
+For third-party developers, transparent headers are great. For spam bots, precise feedback helps them tune their speed to sit just below the limit. Anti-abuse systems sometimes return vague messages ("Action blocked — try again later"), randomise thresholds, or <strong>shadow-limit</strong> (silently accept but don't apply/display the action) so bot operators can't easily detect the boundary.</div>
+
+<h2>7. Soft vs hard limits, and quotas</h2>
+<div class="table-wrap"><table>
+  <tr><th>Concept</th><th>Meaning</th><th>Example</th></tr>
+  <tr><td><b>Hard limit</b></td><td>Strictly enforced; excess requests are rejected</td><td>10 failed logins per 15 min per account → reject further attempts</td></tr>
+  <tr><td><b>Soft limit</b></td><td>Exceeding it triggers a gentler response: a warning, a CAPTCHA/challenge, extra logging, reduced priority, or a manual review — not an outright block</td><td>After 150 follows in an hour, show "We limit how often you can do certain things" and require a challenge</td></tr>
+  <tr><td><b>Quota</b></td><td>A budget over a long period (day/month), often tied to a plan or billing; usually fixed window, reset at a set time</td><td>Third-party app: 200 calls/hour per user token; partner tier: 5M calls/day</td></tr>
+  <tr><td><b>Burst vs sustained</b></td><td>Two-tier limits: short-term burst allowance plus a long-term ceiling</td><td>20 likes/minute burst, 500 likes/day sustained</td></tr>
+  <tr><td><b>Adaptive / reputation-based</b></td><td>Limits adjusted by trust signals</td><td>New accounts get tighter follow limits than 5-year-old verified accounts</td></tr>
+</table></div>
+
+<h2>8. Rate limiting vs load shedding vs backpressure</h2>
+<p>These three are often confused in interviews. They solve different problems:</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Rate limiting</th><th>Load shedding</th><th>Backpressure</th></tr>
+  <tr><td><b>Question it answers</b></td><td>"Is <em>this caller</em> using more than their fair share?"</td><td>"Am <em>I</em> (the server) overloaded right now?"</td><td>"Is the consumer keeping up with the producer?"</td></tr>
+  <tr><td><b>Trigger</b></td><td>Per-key counter exceeds a configured limit — even if the system is idle</td><td>Server health signals: CPU, queue length, latency, concurrency</td><td>Downstream buffer/queue filling up</td></tr>
+  <tr><td><b>Action</b></td><td>Reject that caller (429)</td><td>Drop lowest-priority work for everyone (503), keep core features alive</td><td>Signal upstream to slow down or pause (blocking, credit-based flow control, TCP window)</td></tr>
+  <tr><td><b>Scope</b></td><td>Fairness &amp; abuse</td><td>Survival under overload</td><td>Flow control in pipelines/streams</td></tr>
+  <tr><td><b>Instagram example</b></td><td>Bot hits the hourly like cap</td><td>During a spike, skip prefetching Explore and ranking enrichment; keep feed and posting working</td><td>Feed fan-out workers fall behind; <a href="message-queues.html">Kafka</a> consumer lag grows and producers/consumers adjust; gRPC streams use flow-control windows</td></tr>
+</table></div>
+<p>A healthy system uses all three: rate limits stop individual abusers, load shedding protects the whole service from global surges, and backpressure keeps async pipelines from drowning. See <a href="resilience-patterns.html">Resilience patterns</a>.</p>
+
+<h2>9. How Instagram uses rate limiting</h2>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+Instagram publicly tells users that it "limits how often you can do certain things" — users who follow, like or comment too rapidly see an <em>"Action Blocked"</em> / <em>"Try Again Later"</em> message. These limits exist primarily to stop spam and automation, and they are not published. Third-party developers using Meta's Graph APIs get documented per-app and per-user call limits and receive rate-limit usage information in response headers. All specific numbers below are assumptions for learning.</div>
+
+<h3>9.1 Action limits against spam bots</h3>
+<p>Assume a real human rarely follows more than ~50 accounts in an hour, while a growth bot wants thousands. Layered limits in the Follow/Graph service and Like &amp; Comment service:</p>
+<div class="table-wrap"><table>
+  <tr><th>Action</th><th>Example limit (assumed)</th><th>Algorithm</th><th>Response on breach</th></tr>
+  <tr><td>Follow</td><td>~200/hour, ~1,000/day; lower for new accounts</td><td>Sliding window counter per user + per device</td><td>Soft: challenge; hard: "Action Blocked" for hours</td></tr>
+  <tr><td>Like</td><td>~300–500/hour</td><td>Token bucket (allow bursts while scrolling) + daily cap</td><td>429 / action block</td></tr>
+  <tr><td>Comment</td><td>~60/hour; identical text repeated is limited much harder</td><td>Sliding window + content-similarity spam check</td><td>Comment hidden or blocked</td></tr>
+  <tr><td>DM to non-followers</td><td>Small daily number of message requests</td><td>Fixed-window daily quota</td><td>Requests queued / blocked</td></tr>
+  <tr><td>Login</td><td>~5–10 failed attempts per account per 15 min; per-IP limits too</td><td>Sliding window log (small, exact)</td><td>Challenge (CAPTCHA, verification code), then temporary lockout</td></tr>
+  <tr><td>Password reset / OTP SMS</td><td>~3–5 per hour per account and per phone number</td><td>Sliding window log</td><td>Hard block — SMS costs money and enables abuse</td></tr>
+</table></div>
+<div class="callout warn"><span class="callout-title">⚠️ Login limits: lockouts can become a weapon</span>
+If 10 failed attempts lock the <em>account</em>, an attacker can lock any victim out by deliberately failing 10 times. Better: limit per (account, IP/device) pair, trigger a challenge rather than a hard lock, and let logins from known trusted devices through. See <a href="authentication.html">Authentication</a>.</div>
+
+<h3>9.2 A follow request, through every layer</h3>
+<div class="flow">
+  <div class="fnode client">📱 App<small>debounced tap</small></div><div class="farrow">→</div>
+  <div class="fnode edge">Edge / WAF<small>per-IP flood check</small></div><div class="farrow">→</div>
+  <div class="fnode edge">API Gateway<small>user: 100 req/s</small></div><div class="farrow">→</div>
+  <div class="fnode svc">Follow/Graph Service<small>follows/hour, device</small></div><div class="farrow">↔</div>
+  <div class="fnode store">Redis<small>counters</small></div>
+</div>
+<ol class="steps">
+  <li>The app debounces repeated taps and backs off if it recently got a 429.</li>
+  <li>The edge checks per-IP request rates (cheap, catches floods).</li>
+  <li>The gateway authenticates the user and checks the general per-user API budget (token bucket in Redis, local hybrid).</li>
+  <li>The Graph service checks the follow-specific rules (user, device, account age) via one Lua script evaluating all rules at once.</li>
+  <li>If allowed, the follow is written and a <code>follow.created</code> event goes to Kafka. If a soft limit is hit, the response asks the app to show a challenge; if a hard limit, a 429 with a friendly message.</li>
+  <li>Breach events are logged to the anti-abuse pipeline (<a href="analytics-ml.html">ML models</a>), which can tighten limits on suspicious accounts.</li>
+</ol>
+
+<h3>9.3 Rough capacity numbers</h3>
+<pre><code>Assume 1.5M API req/s at peak, each checked against ~3 rules → 4.5M rule checks/s.
+With one Lua script per request → 1.5M Redis script calls/s.
+If one Redis shard handles ~100k script calls/s → ~15 shards (+ replicas), or fewer with
+a local hybrid that syncs every 100 ms.
+
+Memory (sliding window counter, 2 counters × ~50 bytes incl. key overhead):
+  100M active users × 5 rules × 100 B ≈ 50 GB → fits in a modest Redis cluster.
+Sliding window LOG for a 500/hour rule instead: 100M × 500 × ~16 B ≈ 800 GB → why we avoid it at scale.</code></pre>
+
+<h3>9.4 Third-party API limits</h3>
+<p>Partner and developer apps that use Meta's Graph APIs (e.g. to schedule posts for businesses) are limited by a combination of <strong>app-level</strong> limits (scaled by the app's number of users), <strong>per-user-token</strong> limits, and per-endpoint cost. Usage is reported back in response headers, and apps exceeding limits are throttled. This is a classic <em>quota</em> system: a long window, tied to the app ID and token, enforced at the gateway.</p>
+
+<h2>10. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Benefits</h4><ul>
+    <li>Blocks spam, scraping, brute force and credential stuffing</li>
+    <li>Fairness between users, apps and tenants</li>
+    <li>Protects databases and services from overload and runaway clients</li>
+    <li>Predictable cost for expensive operations (SMS, ML)</li>
+    <li>Enables commercial quotas and plans</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs</h4><ul>
+    <li>Adds latency (a Redis hop) and a new dependency on the request path</li>
+    <li>False positives frustrate legitimate power users and shared-IP users</li>
+    <li>Distributed accuracy vs latency trade-off</li>
+    <li>Tuning many limits is ongoing work; attackers adapt</li>
+    <li>Memory for counters at high cardinality</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Per-instance counters only</strong> — the effective limit becomes limit × instances, and changes when you autoscale.</li>
+  <li><strong>Non-atomic read-modify-write</strong> — race conditions allow overshoot; use <code>INCR</code> or Lua.</li>
+  <li><strong>Limiting only by IP</strong> — punishes everyone behind a carrier NAT or university network while attackers rotate through residential proxies.</li>
+  <li><strong>Fixed windows aligned for everyone</strong> — all clients' budgets reset at :00 and stampede; add jitter or use sliding windows/token buckets.</li>
+  <li><strong>Clients that retry immediately on 429</strong> — amplifies load; require backoff with jitter and honour <code>Retry-After</code>.</li>
+  <li><strong>Failing closed on limiter outage</strong> for all traffic — the limiter becomes a single point of failure for the whole product.</li>
+  <li><strong>Rate limiting in place of capacity planning</strong> — if legitimate users routinely hit limits, you need more capacity or better limits, not more 429s.</li>
+  <li><strong>Counting rejected requests toward the limit</strong> forever — a client that keeps retrying never recovers; decide deliberately whether rejections consume budget.</li>
+</ul>
+
+<h2>11. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>Notes</th><th>When to use</th></tr>
+  <tr><td><b>Redis (INCR, sorted sets, Lua)</b></td><td>The standard shared counter store; atomic scripts; TTLs</td><td>Custom distributed limits at any scale</td></tr>
+  <tr><td><b>redis-cell / GCRA libraries</b></td><td>Redis module / libraries implementing GCRA in one command</td><td>Token-bucket semantics without writing Lua</td></tr>
+  <tr><td><b>NGINX <code>limit_req</code> / <code>limit_conn</code></b></td><td>Leaky-bucket request limiting and concurrency limits per key (local to each NGINX)</td><td>Simple per-IP limits at a reverse proxy</td></tr>
+  <tr><td><b>Envoy local + global rate limit</b></td><td>Local token buckets per proxy plus a gRPC global rate-limit service (backed by Redis)</td><td>Gateways and service meshes needing the hybrid model</td></tr>
+  <tr><td><b>Kong / AWS API Gateway / Apigee</b></td><td>Built-in rate limiting and quota plugins/usage plans (token bucket in AWS)</td><td>Managed API products, partner quotas</td></tr>
+  <tr><td><b>Cloudflare / AWS WAF / Akamai</b></td><td>Edge rate limiting by IP, path, headers; bot management</td><td>Volumetric abuse before it reaches your data center</td></tr>
+  <tr><td><b>Guava RateLimiter, Bucket4j, resilience4j</b></td><td>In-process token-bucket libraries (JVM)</td><td>Local limits inside a service, client-side throttling</td></tr>
+</table></div>
+
+<h2>12. Interview corner</h2>
+<details class="qa"><summary>Design a rate limiter for Instagram's API.</summary>
+<p>Clarify requirements: limit per user/IP/app per route, configurable rules, low latency (&lt;1 ms overhead), highly available, distributed across hundreds of gateway instances, accurate enough (small overshoot OK except for login/OTP). Design: a rules config (key template, limit, window, algorithm, soft/hard) pushed to gateways; gateway middleware builds keys from the authenticated identity and route; counters in a sharded Redis cluster in each region; one Lua script per request evaluating all rules atomically (token bucket or sliding window counter); local in-memory buckets for a fast path with periodic sync; 429 with <code>Retry-After</code> and <code>X-RateLimit-*</code> headers; fail open with local fallback if Redis is down (fail closed for login). Domain-aware limits (follows/hour) in the owning services using the same library. Emit metrics on rejections per rule to tune limits and feed anti-abuse ML.</p></details>
+<details class="qa"><summary>Token bucket vs leaky bucket — when would you use each?</summary>
+<p>Token bucket allows bursts up to the capacity, then enforces the average rate; it rejects excess immediately — ideal for interactive APIs where natural bursts (opening the app) are fine. Leaky bucket (queue form) smooths traffic to a constant output rate, delaying rather than rejecting bursts — ideal when protecting a downstream that needs steady input, like an SMS provider or a partner API with strict QPS. As meters, they're mathematically equivalent.</p></details>
+<details class="qa"><summary>What's wrong with a fixed window counter, and how do you fix it?</summary>
+<p>Boundary bursts: a client can use the full limit at the end of one window and again at the start of the next — up to 2× the limit within a short span. Also synchronised resets cause stampedes. Fix with a sliding window log (exact but memory-heavy) or a sliding window counter (weights the previous window's count by its overlap — two counters, very close to exact), or use a token bucket.</p></details>
+<details class="qa"><summary>How do you make distributed rate limiting correct under concurrency?</summary>
+<p>Make the check-and-update atomic at the store: Redis <code>INCR</code> for simple counters, or a Lua script for token bucket/sliding window logic (Redis runs scripts atomically). Use hash tags so all keys for one script live on one cluster slot. Use a single time source (Redis <code>TIME</code>) or tolerate small NTP skew. Avoid client-side read-then-write without <code>WATCH</code>/transactions.</p></details>
+<details class="qa"><summary>Redis goes down. What happens to your rate limiter?</summary>
+<p>Decide per rule. General API limits fail open — fall back to local in-memory buckets per instance (with limit ÷ number_of_instances as a rough per-instance budget), so the product stays up and gross abuse is still capped. Security-critical limits (login, OTP, password reset) fail closed or degrade to strict local limits and challenges. Alert immediately; Redis should be replicated with automatic failover to make this rare.</p></details>
+<details class="qa"><summary>How is rate limiting different from load shedding and backpressure?</summary>
+<p>Rate limiting enforces per-caller fairness against configured limits, regardless of system load, returning 429 to that caller. Load shedding is the server protecting itself when overloaded, dropping lowest-priority work for everyone (503), based on health signals like queue depth or latency. Backpressure is flow control in a pipeline: a slow consumer signals producers to slow down (blocking queues, credit windows, Kafka consumer lag), rather than dropping work.</p></details>
+<details class="qa"><summary>How would you stop spam bots from mass-following without hurting real users?</summary>
+<p>Layered, reputation-aware limits: per-user follows/hour and /day (sliding window counter), per-device and per-IP-prefix limits to catch account farms, tighter limits for new or unverified accounts. Use soft limits first (challenge, CAPTCHA, phone verification) before hard blocks. Combine with ML signals (follow/unfollow churn, identical timing patterns) and avoid exposing exact thresholds. Measure false-positive rates via appeals and power-user metrics.</p></details>
+
+<h2>13. Check your understanding</h2>
+<details class="quiz"><summary>Token bucket with capacity 20 and refill 5 tokens/s. The bucket is full. A client sends 50 requests instantly, then 10 requests 2 seconds later. How many succeed?</summary>
+<p>First burst: 20 succeed (bucket empties), 30 rejected. After 2 s, 2 × 5 = 10 tokens refilled → all 10 of the second batch succeed. Total 30 succeed.</p></details>
+<details class="quiz"><summary>Fixed window, limit 100/min. What's the maximum number of requests a client can get accepted in any 60-second span?</summary>
+<p>Up to 200: 100 at the very end of one window and 100 at the very start of the next. That's the boundary-burst flaw.</p></details>
+<details class="quiz"><summary>Sliding window counter, limit 50/min. Previous minute had 40 requests; current minute has 20 so far; we're 30 s into the current minute. Is the next request allowed?</summary>
+<p>Estimate = 20 + 40 × (1 − 30/60) = 20 + 20 = 40 &lt; 50 → allowed.</p></details>
+<details class="quiz"><summary>Each of 200 gateway instances enforces "10 login attempts/min per IP" with in-memory counters only. What's the real limit an attacker can get?</summary>
+<p>Up to 200 × 10 = 2,000 attempts/min, if the load balancer spreads their requests across instances — and it changes whenever you autoscale. Login limits need a shared (global) store.</p></details>
+<details class="quiz"><summary>Why might you choose a sliding window log for OTP/SMS sending but not for a "1,000 API requests/hour" limit?</summary>
+<p>The OTP limit is tiny (e.g. 5/hour) so storing every timestamp costs almost nothing and you get exact enforcement on a security/cost-sensitive action. For 1,000/hour across 100M users, storing up to 1,000 timestamps per user is hundreds of GB — a sliding window counter or token bucket gives nearly the same result with two numbers.</p></details>
+<details class="quiz"><summary>Which status code and headers should you return when a user exceeds a limit, and what should a well-behaved client do?</summary>
+<p><code>429 Too Many Requests</code> with <code>Retry-After</code> and ideally <code>X-RateLimit-Limit</code>, <code>-Remaining</code>, <code>-Reset</code>. The client should stop, wait at least <code>Retry-After</code>, then retry with exponential backoff and jitter — not hammer immediately.</p></details>
+<details class="quiz"><summary>During a viral event, Feed service latency spikes and its queue fills — but no individual user is over their limit. Which mechanism should act?</summary>
+<p>Load shedding (and possibly backpressure), not rate limiting. The server should drop or degrade low-priority work (prefetch, non-essential ranking features) and return 503s for what it can't handle, protecting core functionality. Rate limits are per-caller and wouldn't trigger here.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Rate limiting protects against <strong>abuse, spam and overload</strong> and enforces <strong>fairness and quotas</strong>.</li>
+    <li>Pick keys carefully — <strong>user, IP, device, app token, endpoint</strong> — and combine several rules per request.</li>
+    <li><strong>Token bucket</strong> (bursts OK) and <strong>sliding window counter</strong> (cheap, accurate enough) are the workhorses; sliding log for small strict limits.</li>
+    <li>Distributed limits need <strong>shared atomic counters</strong> (Redis INCR / Lua) and a <strong>local + global hybrid</strong> for low latency.</li>
+    <li>Return <strong>429 + Retry-After</strong>; distinguish rate limiting from <strong>load shedding</strong> and <strong>backpressure</strong>.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="api-gateway.html">API Gateway</a> — where most rate limits are enforced</li>
+  <li><a href="caching.html">Caching (Redis &amp; Memcached)</a> — the in-memory store that holds the counters</li>
+  <li><a href="authentication.html">Authentication &amp; Authorization</a> — login attempt limits and identity used as rate-limit keys</li>
+  <li><a href="resilience-patterns.html">Resilience patterns</a> — backoff, jitter, load shedding and circuit breakers</li>
+  <li><a href="security.html">Security &amp; Privacy</a> — DDoS protection, bots and abuse defences</li>
+  <li><a href="social-graph.html">Social Graph &amp; Follow Service</a> — where follow limits are applied</li>
+  <li><a href="likes-comments.html">Likes, Comments &amp; Counters</a> — action limits on likes and comments</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

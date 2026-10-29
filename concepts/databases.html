@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Databases: SQL vs NoSQL — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="databases">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>A <strong>relational (SQL) database</strong> stores data in tables with a fixed schema, enforces relationships, and offers <strong>ACID transactions</strong> — ideal for data where correctness matters (accounts, usernames, the follow relationship).</li>
+    <li><strong>Isolation levels</strong> (read uncommitted → read committed → repeatable read → serializable) trade speed for protection against anomalies: <em>dirty reads, non-repeatable reads, phantoms and lost updates</em>.</li>
+    <li><strong>NoSQL</strong> is a family of six main shapes — <strong>key-value, document, wide-column, graph, time-series and search</strong> — each optimised for a specific access pattern, usually by giving up joins and strict consistency (<strong>BASE</strong>) in exchange for horizontal scale.</li>
+    <li><strong>Wide-column stores like Cassandra</strong> are modelled <em>query-first</em>: you choose a <strong>partition key</strong> (which node) and <strong>clustering key</strong> (sort order inside the partition) for each query, and you denormalise freely.</li>
+    <li>Real systems use <strong>polyglot persistence</strong>. Instagram, per public engineering talks, runs <strong>sharded PostgreSQL</strong> for its relational core (users, relationships) and <strong>Cassandra</strong> for high-write data such as feeds and activity, plus Redis, Elasticsearch and object storage.</li>
+    <li><strong>NewSQL</strong> (Spanner, CockroachDB) tries to give you SQL + ACID <em>and</em> horizontal scale, at the cost of latency and operational complexity.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why can't Instagram just use "a database"?</h2>
+<p>Think about the different kinds of data a single Instagram session touches:</p>
+<ul>
+  <li><strong>Your account</strong> — username, email, password hash, privacy setting. Small, read often, must <em>never</em> be wrong: two people can't both own <code>@alice</code>.</li>
+  <li><strong>Follow relationships</strong> — billions of edges between users. You need "who does Alice follow?" and "who follows Alice?" quickly.</li>
+  <li><strong>Posts, likes and comments</strong> — hundreds of millions of new rows per day. Likes arrive in floods when something goes viral.</li>
+  <li><strong>Your feed and activity inbox</strong> — a constantly appended list per user, written far more often than it's read in full.</li>
+  <li><strong>Search</strong> — "find accounts whose name sounds like <em>selena</em>", which no ordinary table lookup can do.</li>
+  <li><strong>Photos and videos</strong> — petabytes of large immutable blobs that don't belong in a database at all (they go to <a href="object-storage.html">object storage</a>).</li>
+</ul>
+<p>Each of these has a different <strong>shape</strong> (rows, edges, append-only logs, text), a different <strong>read/write ratio</strong>, different <strong>consistency needs</strong>, and a different <strong>scale</strong>. No single database engine is best at all of them. Picking a database is therefore not a matter of taste; it's a matter of matching the engine's strengths to each workload's access pattern. That is what this lesson teaches you to do.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  A relational database is like a <strong>meticulous accountant's ledger</strong>: every entry has fixed columns, every cross-reference is checked, and a transaction either fully happens or doesn't happen at all. A wide-column NoSQL store is like a <strong>huge warehouse of labelled shelves</strong>: you can put boxes away incredibly fast and retrieve any shelf instantly if you know its label, but there is no clerk cross-checking that box 17 references a valid box 42 — and if you want to find "every box containing red shoes" you'd better have built a separate shelf for that question in advance. A company needs <em>both</em> the accountant and the warehouse.
+</div>
+
+<h2>2. The relational model</h2>
+
+<h3>2.1 Tables, rows, keys and joins</h3>
+<p>The <strong>relational model</strong> (Edgar Codd, 1970) organises data into <strong>tables</strong> (formally <em>relations</em>). Each table has a fixed set of named, typed <strong>columns</strong>; each <strong>row</strong> is one record. Key vocabulary:</p>
+<ul>
+  <li><strong>Primary key (PK)</strong> — a column (or set of columns) that uniquely identifies a row, e.g. <code>users.id</code>. The database guarantees no two rows share it.</li>
+  <li><strong>Foreign key (FK)</strong> — a column that references another table's primary key, e.g. <code>posts.user_id → users.id</code>. The database can <em>refuse</em> a post whose <code>user_id</code> doesn't exist (this is called <strong>referential integrity</strong>).</li>
+  <li><strong>Constraint</strong> — a rule the database enforces on every write: <code>NOT NULL</code>, <code>UNIQUE</code>, <code>CHECK (like_count &gt;= 0)</code>.</li>
+  <li><strong>Schema</strong> — the declared structure of all tables. Relational databases are <strong>schema-on-write</strong>: data must match the schema when it is written. (Most NoSQL stores are closer to <strong>schema-on-read</strong>: the application interprets whatever is stored.)</li>
+  <li><strong>Join</strong> — combining rows from several tables at query time, e.g. "posts together with their author's username".</li>
+  <li><strong>SQL</strong> — the declarative query language: you describe <em>what</em> you want; the <strong>query planner</strong> decides <em>how</em> to get it (which <a href="indexing.html">indexes</a> to use, which join algorithm).</li>
+</ul>
+
+<div class="diagram">
+<svg viewBox="0 0 820 340" width="820" xmlns="http://www.w3.org/2000/svg" font-size="12">
+  <defs><marker id="ar-db-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g fill="#fff8e1" stroke="#f9a825">
+    <rect x="20" y="20" width="200" height="120" rx="8"/>
+    <rect x="310" y="20" width="200" height="120" rx="8"/>
+    <rect x="600" y="20" width="200" height="120" rx="8"/>
+    <rect x="20" y="200" width="200" height="120" rx="8"/>
+    <rect x="310" y="200" width="200" height="120" rx="8"/>
+    <rect x="600" y="200" width="200" height="120" rx="8"/>
+  </g>
+  <g font-weight="700" font-size="13" text-anchor="middle">
+    <text x="120" y="40">users</text><text x="410" y="40">posts</text><text x="700" y="40">media</text>
+    <text x="120" y="220">follows</text><text x="410" y="220">likes</text><text x="700" y="220">comments</text>
+  </g>
+  <g stroke="#f9a825"><path d="M20,48 h200"/><path d="M310,48 h200"/><path d="M600,48 h200"/><path d="M20,228 h200"/><path d="M310,228 h200"/><path d="M600,228 h200"/></g>
+  <g font-family="monospace" font-size="11.5">
+    <text x="30" y="68">🔑 id BIGINT</text><text x="30" y="88">username UNIQUE</text><text x="30" y="108">email, bio</text><text x="30" y="128">created_at</text>
+    <text x="320" y="68">🔑 id BIGINT</text><text x="320" y="88">user_id → users</text><text x="320" y="108">caption</text><text x="320" y="128">created_at</text>
+    <text x="610" y="68">🔑 id BIGINT</text><text x="610" y="88">post_id → posts</text><text x="610" y="108">storage_key (S3)</text><text x="610" y="128">width, height</text>
+    <text x="30" y="248">🔑 follower_id → users</text><text x="30" y="268">🔑 followee_id → users</text><text x="30" y="288">created_at</text>
+    <text x="320" y="248">🔑 post_id → posts</text><text x="320" y="268">🔑 user_id → users</text><text x="320" y="288">created_at</text>
+    <text x="610" y="248">🔑 id BIGINT</text><text x="610" y="268">post_id → posts</text><text x="610" y="288">user_id → users</text><text x="610" y="308">text, created_at</text>
+  </g>
+  <g stroke="#555" stroke-width="1.4" fill="none" marker-end="url(#ar-db-1)">
+    <path d="M308,88 L222,70"/>
+    <path d="M598,88 L512,70"/>
+    <path d="M120,198 L120,142"/>
+    <path d="M410,198 L410,142"/>
+    <path d="M650,198 L500,142"/>
+    <path d="M308,268 L222,90"/>
+  </g>
+  <text x="265" y="70" font-size="11" fill="#555" text-anchor="middle">N:1</text>
+  <text x="555" y="70" font-size="11" fill="#555" text-anchor="middle">N:1</text>
+  <text x="130" y="175" font-size="11" fill="#555">N:1 (×2)</text>
+  <text x="418" y="175" font-size="11" fill="#555">N:1</text>
+</svg>
+<div class="caption">Instagram's core entities as a normalised relational schema. Arrows point from a foreign key to the row it references. 🔑 marks primary-key columns; likes and follows use composite primary keys.</div>
+</div>
+
+<h3>2.2 Why the relational model has lasted 50+ years</h3>
+<ul>
+  <li><strong>Flexible querying.</strong> Because data is normalised and SQL is declarative, you can answer questions nobody anticipated when the schema was designed ("how many users who joined in 2019 commented on a post in Brazil?").</li>
+  <li><strong>Strong guarantees.</strong> Constraints and transactions keep data correct even with concurrent writers and crashes.</li>
+  <li><strong>Mature tooling.</strong> Backups, replication, migrations, monitoring, ORMs (Instagram began life as a Django app talking to PostgreSQL through Django's ORM).</li>
+</ul>
+<p>The main weakness is that a classic relational database is designed to run on <strong>one machine</strong> (plus <a href="replication.html">replicas</a>). Joins, foreign keys and multi-row transactions are cheap when all rows are on the same disk and expensive when they live on different servers. Scaling writes beyond one machine requires <a href="sharding.html">sharding</a>, and sharding breaks many of those conveniences.</p>
+
+<h2>3. ACID, explained with concrete examples</h2>
+<p>A <strong>transaction</strong> is a group of reads and writes that the database treats as one logical unit. <strong>ACID</strong> is the set of guarantees a transactional database makes about it.</p>
+
+<h3>3.1 Atomicity — all or nothing</h3>
+<p>Example: when Bob likes a post, we must (1) insert a row into <code>likes</code> and (2) increment <code>posts.like_count</code>. If the server crashes between the two steps, without atomicity we'd have a like that isn't counted (or a count with no like).</p>
+<pre><code>BEGIN;
+  INSERT INTO likes (post_id, user_id, created_at) VALUES (9001, 42, now());
+  UPDATE posts SET like_count = like_count + 1 WHERE id = 9001;
+COMMIT;   -- both changes become visible together, or (on error/crash) neither does</code></pre>
+<p>If anything fails before <code>COMMIT</code> — a constraint violation, a crash, an explicit <code>ROLLBACK</code> — the database undoes every change in the transaction. "Atomic" here means <em>indivisible</em>, not "concurrent-safe" (that's isolation).</p>
+
+<h3>3.2 Consistency — the rules always hold</h3>
+<p>Consistency means a transaction takes the database from one <strong>valid state</strong> to another, where "valid" is defined by your invariants: constraints, foreign keys, uniqueness. Examples:</p>
+<ul>
+  <li><code>UNIQUE (username)</code> — two concurrent sign-ups for <code>@alice</code>: exactly one succeeds; the other gets a unique-violation error.</li>
+  <li><code>PRIMARY KEY (post_id, user_id)</code> on <code>likes</code> — a double-tap that sends the request twice cannot create two likes.</li>
+  <li><code>FOREIGN KEY (post_id) REFERENCES posts(id)</code> — you can't like a post that was deleted a millisecond earlier.</li>
+</ul>
+<div class="callout warn"><span class="callout-title">⚠️ Two different "consistencies"</span>
+The "C" in ACID (invariants hold) is <strong>not</strong> the "C" in the <a href="cap-consistency.html">CAP theorem</a> (every read sees the latest write across replicas). Interviewers love to check that you know the difference. ACID's C is partly the application's responsibility; the database only enforces the rules you declare.</div>
+
+<h3>3.3 Isolation — concurrent transactions don't trip over each other</h3>
+<p>Thousands of transactions run at once. Isolation means each behaves <em>as if</em> it were running alone. Perfect isolation (<strong>serializability</strong>) is expensive, so databases offer weaker <strong>isolation levels</strong> — the next section covers them in detail.</p>
+
+<h3>3.4 Durability — committed means committed</h3>
+<p>Once <code>COMMIT</code> returns success, the data survives a crash or power loss. Databases achieve this with a <strong>write-ahead log (WAL)</strong>: before modifying data pages, the change is appended to a sequential log file and <code>fsync</code>-ed to disk. After a crash, the database replays the WAL to recover. In distributed systems, durability also means "written to more than one machine" — see <a href="replication.html">Replication</a>.</p>
+
+<pre class="ascii">
+ Client                    Database engine                         Disk
+   | COMMIT                     |                                     |
+   |--------------------------&gt; | 1. append change records to WAL     |
+   |                            |------------------------------------&gt;| wal/000123
+   |                            | 2. fsync(WAL)  (data is now safe)   |
+   |                            |&lt;------------------------------------|
+   | &lt;------ "COMMIT OK" ------ |                                     |
+   |                            | 3. later: flush dirty data pages    |
+   |                            |    in the background (checkpoint)   |
+   |                            |------------------------------------&gt;| table files
+ Crash after step 2?  →  on restart, replay WAL from last checkpoint → nothing lost.
+</pre>
+
+<h2>4. Transactions and isolation levels</h2>
+<p>To understand isolation levels you first need the <strong>anomalies</strong> — the weird things that can happen when transactions interleave.</p>
+
+<h3>4.1 The four classic anomalies</h3>
+<div class="cards">
+  <div class="card"><h4>🫥 Dirty read</h4><p>T2 reads data that T1 has written but <em>not yet committed</em>. If T1 rolls back, T2 acted on data that never existed.</p></div>
+  <div class="card"><h4>🔁 Non-repeatable read</h4><p>T1 reads a row twice and gets different values, because T2 committed an update in between.</p></div>
+  <div class="card"><h4>👻 Phantom read</h4><p>T1 runs the same <em>range query</em> twice and gets a different <em>set</em> of rows, because T2 inserted or deleted matching rows.</p></div>
+  <div class="card"><h4>💥 Lost update</h4><p>T1 and T2 both read a value, both compute a new value from it, both write. One write silently overwrites the other.</p></div>
+</div>
+
+<p><strong>Dirty read</strong> in Instagram terms — a moderation job reads a post that is being created and fails:</p>
+<pre class="ascii">
+ T1 (Upload Service)                     T2 (Moderation job)
+ BEGIN
+ INSERT post 777 (caption "hi")
+                                          SELECT * FROM posts WHERE id = 777
+                                          → sees post 777   ← DIRTY: not committed!
+                                          sends "new post" notification
+ ROLLBACK  (media upload failed)
+ → post 777 never existed, but a notification about it was already sent.
+</pre>
+
+<p><strong>Lost update</strong> — two like requests processed by an application that does read-modify-write in code:</p>
+<pre class="ascii">
+ T1 (like from Bob)                      T2 (like from Carol)
+ SELECT like_count FROM posts WHERE id=9 → 100
+                                          SELECT like_count FROM posts WHERE id=9 → 100
+ UPDATE posts SET like_count = 101
+ COMMIT
+                                          UPDATE posts SET like_count = 101
+                                          COMMIT
+ Final value: 101.  Expected: 102.  Bob's like was LOST.
+</pre>
+
+<p><strong>Non-repeatable read</strong> — a report reads Alice's follower count at the start and end of a transaction and gets 1,000 then 1,001, so its totals don't add up. <strong>Phantom</strong> — a job counts "comments on post 9 in the last hour" twice in one transaction and gets 50 then 51 because a new comment row appeared.</p>
+<p>There's also a subtler anomaly, <strong>write skew</strong>: two transactions each read an overlapping set of rows, make a decision based on it, and write to <em>different</em> rows, together breaking an invariant. Classic example: "at least one admin must remain on a group" — two admins each check "there are 2 admins, so I can leave" and both leave. Only serializable isolation prevents write skew in general.</p>
+
+<h3>4.2 The four standard isolation levels</h3>
+<div class="table-wrap"><table>
+  <tr><th>Isolation level</th><th>Dirty read</th><th>Non-repeatable read</th><th>Phantom</th><th>Lost update</th><th>Typical implementation</th></tr>
+  <tr><td><b>Read uncommitted</b></td><td>❌ possible</td><td>❌ possible</td><td>❌ possible</td><td>❌ possible</td><td>No read protection. Rarely used (PostgreSQL silently treats it as read committed).</td></tr>
+  <tr><td><b>Read committed</b></td><td>✅ prevented</td><td>❌ possible</td><td>❌ possible</td><td>❌ possible</td><td>Each <em>statement</em> sees a fresh snapshot of committed data. Default in PostgreSQL, Oracle, SQL Server.</td></tr>
+  <tr><td><b>Repeatable read</b></td><td>✅ prevented</td><td>✅ prevented</td><td>⚠️ allowed by the SQL standard; prevented by snapshot-based engines (PostgreSQL)</td><td>⚠️ PostgreSQL detects and aborts; MySQL InnoDB does <em>not</em> for plain read-then-write</td><td>Whole <em>transaction</em> sees one snapshot (snapshot isolation). Default in MySQL InnoDB.</td></tr>
+  <tr><td><b>Serializable</b></td><td>✅ prevented</td><td>✅ prevented</td><td>✅ prevented</td><td>✅ prevented (and write skew)</td><td>Result equals <em>some</em> serial order. Via strict 2-phase locking, actual serial execution, or Serializable Snapshot Isolation (PostgreSQL SSI, CockroachDB).</td></tr>
+</table></div>
+<p>Read the table top to bottom as "each level adds protection and adds cost". Stronger levels either <strong>block</strong> more (locks) or <strong>abort</strong> more (optimistic engines raise a serialization failure that the application must retry).</p>
+
+<h3>4.3 How databases implement isolation: locks and MVCC</h3>
+<ul>
+  <li><strong>Locking.</strong> A transaction takes <em>shared locks</em> for reads and <em>exclusive locks</em> for writes. <strong>Two-phase locking (2PL)</strong> — acquire locks as you go, release them only at commit — gives serializability but readers block writers and vice versa, and deadlocks become possible (the database detects cycles and aborts one victim).</li>
+  <li><strong>MVCC (multi-version concurrency control).</strong> Instead of overwriting a row, the database keeps multiple <em>versions</em> tagged with the transaction ID that created them. A reader sees the versions that were committed as of its <strong>snapshot</strong>. Readers never block writers and writers never block readers. PostgreSQL, MySQL InnoDB, Oracle and CockroachDB all use MVCC. Old versions are later cleaned up (PostgreSQL's <code>VACUUM</code>).</li>
+</ul>
+
+<h3>4.4 Fixing lost updates in practice</h3>
+<p>Most production apps run at <strong>read committed</strong> for performance, so you must know the targeted fixes for lost updates:</p>
+<ol>
+  <li><strong>Atomic update in the database</strong> (best): <code>UPDATE posts SET like_count = like_count + 1 WHERE id = 9;</code> — the read and the write happen inside one statement under a row lock.</li>
+  <li><strong>Explicit row lock</strong>: <code>SELECT like_count FROM posts WHERE id = 9 FOR UPDATE;</code> — the second transaction waits until the first commits.</li>
+  <li><strong>Optimistic concurrency control (compare-and-set)</strong>: add a <code>version</code> column; <code>UPDATE posts SET caption = 'new', version = 8 WHERE id = 9 AND version = 7;</code> — if 0 rows are affected, someone else won; re-read and retry. Great for rarely-conflicting edits like editing a caption.</li>
+  <li><strong>Raise the isolation level</strong> to repeatable read (PostgreSQL) or serializable and retry on serialization failure.</li>
+</ol>
+<div class="callout tip"><span class="callout-title">💡 At Instagram scale</span>
+Hot counters (likes on a viral post) are usually <strong>not</strong> incremented row-by-row in the primary database at all: increments are buffered, sharded across several counter rows, or kept in Redis and flushed periodically. See <a href="likes-comments.html">Likes, Comments &amp; Counters at Scale</a>.</div>
+
+<h2>5. Normalization vs denormalization</h2>
+
+<h3>5.1 Normalization: store each fact once</h3>
+<p><strong>Normalization</strong> organises tables so that every fact is stored in exactly one place, eliminating <em>update anomalies</em> (changing a fact in one place but forgetting another copy). The first three normal forms, informally:</p>
+<ul>
+  <li><strong>1NF</strong> — every column holds a single atomic value (no comma-separated list of tags in one cell; use a separate <code>post_tags</code> table).</li>
+  <li><strong>2NF</strong> — every non-key column depends on the <em>whole</em> primary key (in <code>likes(post_id, user_id, …)</code> don't store <code>post_caption</code>, which depends only on <code>post_id</code>).</li>
+  <li><strong>3NF</strong> — non-key columns depend <em>only</em> on the key, not on other non-key columns (don't store <code>author_username</code> in <code>posts</code>; it depends on <code>user_id</code>, which lives in <code>users</code>).</li>
+</ul>
+<p>The schema in the diagram above is normalised: a username lives only in <code>users</code>; to show it next to a post you <strong>join</strong>.</p>
+
+<h3>5.2 Denormalization: store facts where you read them</h3>
+<p><strong>Denormalization</strong> deliberately duplicates or precomputes data to make reads cheap. Instagram-style examples:</p>
+<ul>
+  <li><code>posts.like_count</code> — a precomputed count instead of <code>SELECT COUNT(*) FROM likes WHERE post_id = ?</code> over millions of rows on every feed render.</li>
+  <li>Storing <code>author_username</code> and <code>author_avatar_url</code> inside each feed entry so the <a href="news-feed.html">feed</a> can be rendered without a join to a different shard.</li>
+  <li>Storing the same comment in <code>comments_by_post</code> <em>and</em> <code>comments_by_user</code> tables in Cassandra, one per query.</li>
+</ul>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Normalized</th><th>Denormalized</th></tr>
+  <tr><td><b>Reads</b></td><td>Need joins — slower, and hard across shards</td><td>Single lookup — fast and shard-local</td></tr>
+  <tr><td><b>Writes</b></td><td>One place to update — cheap and simple</td><td>Must update every copy (fan-out writes)</td></tr>
+  <tr><td><b>Consistency</b></td><td>Automatically consistent</td><td>Copies can drift; needs background repair or events</td></tr>
+  <tr><td><b>Storage</b></td><td>Minimal</td><td>More (duplicates)</td></tr>
+  <tr><td><b>Flexibility</b></td><td>Any new query possible</td><td>Optimised for known queries only</td></tr>
+  <tr><td><b>Best for</b></td><td>Write-heavy or correctness-critical data, ad-hoc analytics</td><td>Read-heavy, latency-critical paths (feeds, profiles)</td></tr>
+</table></div>
+<p>Rule of thumb: <strong>start normalised, denormalise specific hot read paths</strong>, and keep the denormalised copies updated asynchronously through events (e.g. a <code>username_changed</code> event on <a href="message-queues.html">Kafka</a>). Accept that a renamed user's old name may show in a few feed entries for a short while.</p>
+
+<h2>6. The NoSQL families</h2>
+<p>"NoSQL" ("not only SQL") isn't one technology; it's a label for databases that drop parts of the relational model — usually joins, multi-row transactions and fixed schemas — to gain <strong>horizontal scalability</strong>, <strong>high write throughput</strong>, <strong>flexible schemas</strong> or a <strong>more natural data model</strong> for a specific problem. There are six families you should know.</p>
+
+<div class="cards">
+  <div class="card"><h4>🔑 Key-value</h4><p>A giant distributed hash map: <code>get(key)</code>, <code>put(key, value)</code>. The value is opaque. Fastest and simplest. <em>Redis, Memcached, DynamoDB, RocksDB, etcd.</em></p></div>
+  <div class="card"><h4>📄 Document</h4><p>Values are JSON-like documents with nested fields, queryable by field and indexable. Schema-flexible. <em>MongoDB, Couchbase, Firestore, DynamoDB (also).</em></p></div>
+  <div class="card"><h4>🧱 Wide-column</h4><p>Rows grouped into partitions by a partition key, sorted by clustering columns; built on LSM trees for huge write throughput. <em>Cassandra, ScyllaDB, HBase, Bigtable.</em></p></div>
+  <div class="card"><h4>🕸️ Graph</h4><p>Nodes and edges are first-class; queries traverse relationships ("friends of friends who like X"). <em>Neo4j, Amazon Neptune, JanusGraph; Facebook's TAO is a graph-shaped cache over MySQL.</em></p></div>
+  <div class="card"><h4>📈 Time-series</h4><p>Append-mostly <code>(series, timestamp, value)</code> points, heavy compression, downsampling and retention. <em>Prometheus, InfluxDB, TimescaleDB, Facebook's Gorilla.</em></p></div>
+  <div class="card"><h4>🔎 Search engine</h4><p>Inverted indexes over text, relevance scoring, fuzzy matching, facets. Usually a <em>secondary</em> copy of data. <em>Elasticsearch, OpenSearch, Solr.</em></p></div>
+</div>
+
+<div class="table-wrap"><table>
+  <tr><th>Family</th><th>Data model</th><th>Good at</th><th>Bad at</th><th>Instagram-style use case</th></tr>
+  <tr><td><b>Key-value</b></td><td>key → blob</td><td>O(1) lookups, caching, sessions, counters, extreme throughput</td><td>Queries by anything but the key; relationships</td><td>Session tokens, <a href="caching.html">feed cache &amp; counters in Redis</a>, rate-limit buckets</td></tr>
+  <tr><td><b>Document</b></td><td>key → JSON document</td><td>Self-contained aggregates read together; evolving schemas</td><td>Many-to-many relationships, cross-document transactions (limited)</td><td>User settings blob, a post with its media list and tags as one document</td></tr>
+  <tr><td><b>Wide-column</b></td><td>(partition key, clustering key) → columns</td><td>Massive write rates, time-ordered data per entity, linear scale-out, multi-DC</td><td>Ad-hoc queries, joins, aggregations, strong consistency by default</td><td>Feed timelines, activity/notification inbox, comments by post, <a href="direct-messaging.html">messages</a></td></tr>
+  <tr><td><b>Graph</b></td><td>nodes + typed edges</td><td>Multi-hop traversals, recommendations, fraud rings</td><td>Huge write rates of simple edges, sharding (traversals cross shards)</td><td>"Suggested for you" (friends-of-friends); the <a href="social-graph.html">social graph</a></td></tr>
+  <tr><td><b>Time-series</b></td><td>(metric, tags, ts) → value</td><td>Ingesting millions of points/sec, range aggregations, compression</td><td>Updates, arbitrary entity lookups</td><td>Service metrics and dashboards in <a href="observability.html">observability</a></td></tr>
+  <tr><td><b>Search</b></td><td>documents + inverted index</td><td>Full-text, prefix/fuzzy, relevance ranking, facets</td><td>Being the source of truth, transactions, fast exact updates</td><td>User/hashtag/place <a href="search.html">search</a></td></tr>
+</table></div>
+
+<div class="callout tip"><span class="callout-title">💡 Families blur</span>
+Modern products cross categories: DynamoDB is key-value <em>and</em> document; PostgreSQL has a <code>JSONB</code> document type, full-text search and (via extensions) time-series and geospatial support; Redis has sorted sets, streams and search modules. Choose by <strong>access pattern and scale</strong>, not by label.</div>
+
+<h2>7. BASE: the NoSQL counterpart to ACID</h2>
+<p>Many distributed NoSQL stores describe their guarantees as <strong>BASE</strong>:</p>
+<ul>
+  <li><strong>Basically Available</strong> — the system answers requests even when some nodes or network links fail, possibly with stale data, rather than refusing.</li>
+  <li><strong>Soft state</strong> — the state of replicas may change over time even without new input, as background replication and repair converge them.</li>
+  <li><strong>Eventual consistency</strong> — if writes stop, all replicas eventually return the same value. There's no promise about <em>when</em> (in practice usually milliseconds).</li>
+</ul>
+<p>BASE is the natural choice when you prefer availability during network partitions (the "AP" side of <a href="cap-consistency.html">CAP</a>). Example: if a like takes 500 ms to appear for a user on another continent, nobody is harmed; if Instagram refused all likes during a network blip, millions would be annoyed.</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>ACID</th><th>BASE</th></tr>
+  <tr><td><b>Priority</b></td><td>Correctness</td><td>Availability &amp; scale</td></tr>
+  <tr><td><b>Consistency</b></td><td>Strong — reads see committed latest data</td><td>Eventual — reads may be stale for a while</td></tr>
+  <tr><td><b>Under a partition</b></td><td>May reject requests</td><td>Keeps serving; reconciles later</td></tr>
+  <tr><td><b>Conflict handling</b></td><td>Prevented by locks/serialization</td><td>Resolved after the fact (last-write-wins, CRDTs)</td></tr>
+  <tr><td><b>Example</b></td><td>Username registration, payments</td><td>Like counts, feed entries, view counts</td></tr>
+</table></div>
+<p>It isn't binary: Cassandra lets you choose a <strong>consistency level per query</strong> (<code>ONE</code>, <code>QUORUM</code>, <code>ALL</code>), and with <code>QUORUM</code> reads and writes you get read-your-latest-write behaviour. The maths (R + W &gt; N) is in <a href="replication.html">Replication</a>.</p>
+
+<h2>8. Wide-column deep dive: Cassandra</h2>
+<p>Apache Cassandra (originally built at Facebook for inbox search, combining Amazon Dynamo's distribution with Google Bigtable's data model) is the wide-column store you are most likely to be asked about — and one Instagram has publicly described using heavily.</p>
+
+<h3>8.1 The data model: partition key + clustering key</h3>
+<p>A Cassandra table's <code>PRIMARY KEY</code> has two parts:</p>
+<ul>
+  <li><strong>Partition key</strong> (the first part, in inner parentheses) — hashed to decide <strong>which nodes</strong> store the data (via <a href="consistent-hashing.html">consistent hashing</a> on a token ring). All rows sharing a partition key form one <strong>partition</strong>, stored together on the same replicas.</li>
+  <li><strong>Clustering key</strong> (the remaining columns) — decides the <strong>sort order of rows inside a partition</strong>. Rows are physically stored sorted by it, so range scans within a partition ("the 20 newest") are sequential and fast.</li>
+</ul>
+<pre><code>CREATE TABLE comments_by_post (
+  post_id     bigint,
+  comment_id  bigint,          -- time-sortable ID, newer = larger
+  user_id     bigint,
+  text        text,
+  PRIMARY KEY ((post_id), comment_id)   -- partition key: post_id; clustering key: comment_id
+) WITH CLUSTERING ORDER BY (comment_id DESC);
+
+-- The query this table exists to serve: one partition, sequential read, newest first
+SELECT comment_id, user_id, text FROM comments_by_post
+ WHERE post_id = 9001 LIMIT 20;</code></pre>
+
+<pre class="ascii">
+ Token ring (hash of partition key → node)        Inside node B, partition post_id=9001
+                                                  (rows sorted by clustering key DESC)
+   hash(9001) = 0x7A.. ──► Node B (+ 2 replicas)   +-----------------+---------+-------------+
+   hash(9002) = 0x13.. ──► Node A                  | comment_id      | user_id | text        |
+   hash(9003) = 0xC4.. ──► Node D                  +-----------------+---------+-------------+
+                                                   | 7012..998 (new) |   42    | "wow!"      |
+                                                   | 7012..871       |   77    | "where is.."|
+                                                   | 7011..003       |   15    | "first!"    |
+                                                   | ... could be millions of rows ...       |
+                                                   +-----------------+---------+-------------+
+</pre>
+
+<h3>8.2 Query-first modelling</h3>
+<p>In SQL you model <em>entities</em> and figure out queries later. In Cassandra you do the opposite: <strong>list your queries first, then create one table per query</strong>, shaped so each query hits exactly one partition. The rules:</p>
+<ol class="steps">
+  <li><strong>Every query must specify the full partition key</strong> with equality. Cassandra won't efficiently answer "comments by user 42" from <code>comments_by_post</code> — that would need to scan every partition on every node.</li>
+  <li><strong>Range filters and ordering only on clustering columns</strong>, in their declared order.</li>
+  <li><strong>No joins, so denormalise.</strong> Need comments by user too? Create <code>comments_by_user</code> with <code>PRIMARY KEY ((user_id), comment_id)</code> and write each comment to both tables (a <em>logged batch</em> ensures both writes eventually apply).</li>
+  <li><strong>Writes are cheap, reads must be planned.</strong> Cassandra's LSM-tree storage (see <a href="indexing.html">Indexing &amp; Storage Engines</a>) appends writes sequentially, so duplicating data is the accepted price for single-partition reads.</li>
+</ol>
+
+<h3>8.3 Wide partitions and bucketing</h3>
+<p>A partition lives entirely on its replica nodes, so it can't grow forever. Guidance commonly cited for Cassandra is to keep partitions under roughly <strong>100 MB and a few hundred thousand rows</strong>. A celebrity's activity feed or a viral post's comments can blow past that, causing slow reads, compaction pain, GC pauses and a <strong>hot partition</strong> overloading three nodes while the rest idle.</p>
+<p>The fix is <strong>bucketing</strong>: add a component to the partition key that splits one logical entity into many physical partitions.</p>
+<pre><code>CREATE TABLE activity_by_user (
+  user_id     bigint,
+  day_bucket  int,             -- e.g. 20261023 (one partition per user per day)
+  activity_id timeuuid,
+  actor_id    bigint,
+  type        text,            -- 'like' | 'comment' | 'follow' | 'mention'
+  post_id     bigint,
+  PRIMARY KEY ((user_id, day_bucket), activity_id)
+) WITH CLUSTERING ORDER BY (activity_id DESC)
+  AND default_time_to_live = 7776000;   -- 90 days, old activity expires automatically</code></pre>
+<p>Reading "latest 50 activities" now means: query today's bucket; if fewer than 50, query yesterday's, and so on. Worked example: if a celebrity receives 2 million activity events a day at ~200 bytes each, a daily bucket is ~400 MB — still too big, so you would bucket by hour (≈17 MB) or add a hash sub-bucket <code>(user_id, day, shard 0..15)</code>. Bucket size is a deliberate design decision based on your write rate.</p>
+
+<h3>8.4 Other Cassandra facts worth knowing</h3>
+<ul>
+  <li><strong>Writes are upserts.</strong> <code>INSERT</code> on an existing key overwrites it; there's no "row already exists" error. Conflicts are resolved by <strong>last-write-wins</strong> using per-cell timestamps.</li>
+  <li><strong>Deletes write tombstones.</strong> A delete is a marker that hides older data until compaction removes it after <code>gc_grace_seconds</code>. Queue-like "insert then delete" patterns create tombstone storms that make reads crawl.</li>
+  <li><strong>Lightweight transactions</strong> (<code>INSERT … IF NOT EXISTS</code>) use Paxos for compare-and-set on a single partition — about 4 round trips, so use sparingly (e.g. claiming a unique handle).</li>
+  <li><strong>Counters</strong> are a special column type for distributed increments, but they're not idempotent (a retried increment may double count).</li>
+  <li><strong>Secondary indexes and materialized views exist</strong> but are generally discouraged for high-cardinality data at scale; prefer explicit denormalised tables.</li>
+  <li><strong>Multi-datacenter replication</strong> is built in: <code>NetworkTopologyStrategy</code> with e.g. RF=3 per region.</li>
+</ul>
+
+<h2>9. SQL vs NoSQL: how to decide</h2>
+<div class="table-wrap"><table>
+  <tr><th>Question about the workload</th><th>Points to SQL (PostgreSQL/MySQL)</th><th>Points to NoSQL</th></tr>
+  <tr><td>Do you need multi-row / multi-table transactions?</td><td>Yes — money, inventory, unique usernames</td><td>No, or only within one key/partition</td></tr>
+  <tr><td>Are relationships rich and queried in many ways?</td><td>Yes — joins and ad-hoc queries</td><td>No — few, known access patterns</td></tr>
+  <tr><td>Write volume?</td><td>Fits on one primary (or a manageable number of shards)</td><td>Hundreds of thousands to millions of writes/sec</td></tr>
+  <tr><td>Data volume?</td><td>GBs to tens of TBs</td><td>Hundreds of TBs to PBs</td></tr>
+  <tr><td>Schema stability?</td><td>Well understood, stable</td><td>Evolving, sparse or heterogeneous</td></tr>
+  <tr><td>Consistency need?</td><td>Strong, immediately</td><td>Eventual is acceptable</td></tr>
+  <tr><td>Availability across regions during partitions?</td><td>Can tolerate failover pauses</td><td>Must keep accepting writes everywhere</td></tr>
+  <tr><td>Data shape?</td><td>Tabular entities</td><td>Aggregates (document), edges (graph), logs/timelines (wide-column), text (search)</td></tr>
+  <tr><td>Team skills &amp; tooling?</td><td>Everyone knows SQL; rich ecosystem</td><td>Needs specialised modelling and ops knowledge</td></tr>
+</table></div>
+<div class="callout interview"><span class="callout-title">🎤 Interview framing</span>
+Never answer "SQL vs NoSQL" in the abstract. Say: "For <em>this</em> data, the access pattern is X, the volume is Y, the consistency need is Z, so I pick …". Then explicitly name what you're giving up. A great answer for Instagram assigns <em>different</em> stores to different data.</div>
+
+<h2>10. Polyglot persistence</h2>
+<p><strong>Polyglot persistence</strong> means using several database technologies in one system, each for the data it suits best. Each <a href="microservices.html">microservice</a> owns its data store, and data is kept in sync between stores via events on the <a href="message-queues.html">event bus</a> or change data capture (CDC), rather than distributed transactions.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 400" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-db-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g fill="#e8f5e9" stroke="#2e7d32">
+    <rect x="20" y="20" width="190" height="40" rx="8"/>
+    <rect x="20" y="80" width="190" height="40" rx="8"/>
+    <rect x="20" y="140" width="190" height="40" rx="8"/>
+    <rect x="20" y="200" width="190" height="40" rx="8"/>
+    <rect x="20" y="260" width="190" height="40" rx="8"/>
+    <rect x="20" y="320" width="190" height="40" rx="8"/>
+  </g>
+  <g font-weight="600" text-anchor="middle">
+    <text x="115" y="45">User/Auth Service</text>
+    <text x="115" y="105">Follow/Graph Service</text>
+    <text x="115" y="165">Upload / Like &amp; Comment</text>
+    <text x="115" y="225">News Feed Service</text>
+    <text x="115" y="285">Search Service</text>
+    <text x="115" y="345">Upload (media bytes)</text>
+  </g>
+  <rect x="300" y="170" width="140" height="50" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/>
+  <text x="370" y="192" text-anchor="middle" font-weight="600">Kafka</text>
+  <text x="370" y="209" text-anchor="middle" font-size="11.5">events / CDC</text>
+  <g fill="#fff8e1" stroke="#f9a825">
+    <rect x="530" y="20" width="270" height="40" rx="8"/>
+    <rect x="530" y="80" width="270" height="40" rx="8"/>
+    <rect x="530" y="140" width="270" height="40" rx="8"/>
+    <rect x="530" y="200" width="270" height="40" rx="8"/>
+    <rect x="530" y="260" width="270" height="40" rx="8"/>
+    <rect x="530" y="320" width="270" height="40" rx="8"/>
+  </g>
+  <g text-anchor="middle">
+    <text x="665" y="45"><tspan font-weight="600">PostgreSQL</tspan> (sharded, ACID)</text>
+    <text x="665" y="105"><tspan font-weight="600">Graph store</tspan> (edge lists)</text>
+    <text x="665" y="165"><tspan font-weight="600">Cassandra</tspan> (high-write)</text>
+    <text x="665" y="225"><tspan font-weight="600">Redis</tspan> (timelines, counters)</text>
+    <text x="665" y="285"><tspan font-weight="600">Elasticsearch</tspan> (inverted idx)</text>
+    <text x="665" y="345"><tspan font-weight="600">Object storage</tspan> (S3 blobs)</text>
+  </g>
+  <g stroke="#555" stroke-width="1.4" fill="none" marker-end="url(#ar-db-2)">
+    <path d="M210,40 C380,30 400,40 528,40"/>
+    <path d="M210,100 C380,95 400,100 528,100"/>
+    <path d="M210,160 C330,150 420,160 528,160"/>
+    <path d="M210,220 C330,240 420,225 528,220"/>
+    <path d="M210,340 C380,345 400,340 528,340"/>
+    <path d="M210,280 C380,290 420,292 528,290"/>
+    <path d="M210,165 L298,190" stroke-dasharray="5 3"/>
+    <path d="M442,200 L528,275" stroke-dasharray="5 3"/>
+    <path d="M442,195 L528,222" stroke-dasharray="5 3"/>
+  </g>
+  <text x="485" y="262" font-size="11" fill="#6a1b9a" text-anchor="middle">indexer</text>
+  <text x="485" y="200" font-size="11" fill="#6a1b9a" text-anchor="middle">fan-out</text>
+</svg>
+<div class="caption">Polyglot persistence in the Instagram architecture: each service uses the store that fits its access pattern. Dashed arrows are asynchronous: events on Kafka keep derived stores (search index, feed cache) up to date.</div>
+</div>
+
+<p>Benefits: each workload gets the right tool and scales independently; a problem in the search cluster doesn't take down sign-ups. Costs: more systems to operate, monitor, back up and secure; data is duplicated and only <em>eventually</em> consistent across stores; engineers must learn several modelling styles. A good principle: <strong>one store is the source of truth for each piece of data</strong>; every other copy is a derived, rebuildable view.</p>
+
+<h2>11. NewSQL: SQL + ACID + horizontal scale</h2>
+<p><strong>NewSQL</strong> databases keep the relational model and serializable/strong transactions but distribute data automatically across many machines. They split tables into ranges (shards), replicate each range with a consensus protocol (Paxos or Raft), and run distributed transactions under the hood.</p>
+<div class="cards">
+  <div class="card"><h4>Google Spanner</h4><p>Globally distributed, externally consistent (linearizable) transactions. Uses <strong>TrueTime</strong> — GPS and atomic clocks giving a bounded clock uncertainty — and "commit wait" to order transactions globally. Paxos per split. Available as Cloud Spanner.</p></div>
+  <div class="card"><h4>CockroachDB</h4><p>Open-source, Spanner-inspired, PostgreSQL wire-compatible. Data split into ~512 MB ranges, each a Raft group of 3+ replicas. <strong>Serializable</strong> by default. Uses hybrid logical clocks instead of atomic clocks.</p></div>
+  <div class="card"><h4>TiDB / YugabyteDB</h4><p>TiDB: MySQL-compatible, Raft-replicated TiKV storage. YugabyteDB: PostgreSQL-compatible query layer on a Raft-replicated document store.</p></div>
+  <div class="card"><h4>Vitess &amp; Citus (related)</h4><p>Not NewSQL engines but sharding layers over MySQL / PostgreSQL that give similar scale-out with the familiar engine. See <a href="sharding.html">Sharding</a>.</p></div>
+</div>
+<p><strong>Trade-offs:</strong> every write must reach a consensus majority (often across zones or regions), so write latency is higher than a single-node database — tens of ms cross-region instead of ~1 ms locally. Cross-range transactions cost extra round trips. Operations and cost are higher than a single PostgreSQL. They shine when you need relational semantics and global strong consistency at a scale beyond one machine (financial ledgers, inventory, global user directories) and don't want to build sharding yourself. Instagram's PostgreSQL sharding predates mature NewSQL options; a team designing from scratch today might evaluate one for the user/relationship core.</p>
+
+<h2>12. Example schemas: SQL and CQL</h2>
+
+<h3>12.1 Relational schema (PostgreSQL DDL)</h3>
+<pre><code>CREATE TABLE users (
+  id            BIGINT PRIMARY KEY,                 -- 64-bit time-sortable ID (see id-generation)
+  username      VARCHAR(30)  NOT NULL UNIQUE,
+  email         VARCHAR(255) NOT NULL UNIQUE,
+  password_hash TEXT         NOT NULL,
+  full_name     VARCHAR(100),
+  bio           VARCHAR(150),
+  is_private    BOOLEAN      NOT NULL DEFAULT false,
+  created_at    TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+
+CREATE TABLE posts (
+  id            BIGINT PRIMARY KEY,
+  user_id       BIGINT NOT NULL REFERENCES users(id),
+  caption       VARCHAR(2200),
+  location_id   BIGINT,
+  like_count    INTEGER NOT NULL DEFAULT 0 CHECK (like_count &gt;= 0),   -- denormalized
+  comment_count INTEGER NOT NULL DEFAULT 0 CHECK (comment_count &gt;= 0),
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at    TIMESTAMPTZ                                           -- soft delete
+);
+CREATE INDEX posts_user_recent ON posts (user_id, created_at DESC);  -- profile grid
+
+CREATE TABLE media (
+  id            BIGINT PRIMARY KEY,
+  post_id       BIGINT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+  position      SMALLINT NOT NULL,                  -- order inside a carousel
+  media_type    VARCHAR(10) NOT NULL CHECK (media_type IN ('photo', 'video')),
+  storage_key   TEXT NOT NULL,                      -- object-storage key, not the bytes
+  width         INTEGER, height INTEGER, duration_ms INTEGER,
+  UNIQUE (post_id, position)
+);
+
+CREATE TABLE likes (
+  post_id       BIGINT NOT NULL REFERENCES posts(id),
+  user_id       BIGINT NOT NULL REFERENCES users(id),
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (post_id, user_id)                    -- one like per user per post
+);
+CREATE INDEX likes_by_user ON likes (user_id, created_at DESC);
+
+CREATE TABLE comments (
+  id                BIGINT PRIMARY KEY,
+  post_id           BIGINT NOT NULL REFERENCES posts(id),
+  user_id           BIGINT NOT NULL REFERENCES users(id),
+  parent_comment_id BIGINT REFERENCES comments(id), -- replies
+  text              VARCHAR(2200) NOT NULL,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX comments_by_post ON comments (post_id, created_at DESC);
+
+CREATE TABLE follows (
+  follower_id   BIGINT NOT NULL REFERENCES users(id),
+  followee_id   BIGINT NOT NULL REFERENCES users(id),
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (follower_id, followee_id),           -- "whom do I follow?"
+  CHECK (follower_id &lt;&gt; followee_id)
+);
+CREATE INDEX follows_reverse ON follows (followee_id, follower_id);  -- "who follows me?"</code></pre>
+<p>A typical relational query — the 12 most recent posts for a profile grid, with a cover image each:</p>
+<pre><code>SELECT p.id, p.like_count, m.storage_key
+  FROM posts p
+  JOIN media m ON m.post_id = p.id AND m.position = 0
+ WHERE p.user_id = 42 AND p.deleted_at IS NULL
+ ORDER BY p.created_at DESC
+ LIMIT 12;</code></pre>
+<div class="callout warn"><span class="callout-title">⚠️ Once you shard, some of this goes away</span>
+If <code>users</code> and <code>posts</code> are <a href="sharding.html">sharded by user_id</a>, a like by user A (shard 3) on a post by user B (shard 812) can't have both foreign keys enforced by one database, and the <code>likes</code> table must live on <em>one</em> shard (usually the post's). Large systems keep FKs within a shard and enforce cross-shard references in application code.</div>
+
+<h3>12.2 Wide-column schema (Cassandra CQL), one table per query</h3>
+<pre><code>-- Q1: a user's posts, newest first (profile grid)
+CREATE TABLE posts_by_user (
+  user_id     bigint,
+  post_id     bigint,                     -- time-sortable, so DESC = newest first
+  caption     text,
+  media_keys  list&lt;text&gt;,
+  created_at  timestamp,
+  PRIMARY KEY ((user_id), post_id)
+) WITH CLUSTERING ORDER BY (post_id DESC);
+
+-- Q2: fetch one post by id (e.g. from a feed entry or a shared link)
+CREATE TABLE posts_by_id (
+  post_id     bigint PRIMARY KEY,
+  user_id     bigint,
+  caption     text,
+  media_keys  list&lt;text&gt;,
+  created_at  timestamp
+);
+
+-- Q3: who liked a post? / did user X like post P?  (single partition, clustering lookup)
+CREATE TABLE likes_by_post (
+  post_id     bigint,
+  user_id     bigint,
+  liked_at    timestamp,
+  PRIMARY KEY ((post_id), user_id)
+);
+
+-- Q4: counts shown under each post
+CREATE TABLE post_counters (
+  post_id        bigint PRIMARY KEY,
+  like_count     counter,
+  comment_count  counter
+);
+
+-- Q5: comments on a post, newest first
+CREATE TABLE comments_by_post (
+  post_id     bigint,
+  comment_id  bigint,
+  user_id     bigint,
+  text        text,
+  PRIMARY KEY ((post_id), comment_id)
+) WITH CLUSTERING ORDER BY (comment_id DESC);
+
+-- Q6 / Q7: following and followers lists (the same edge written twice)
+CREATE TABLE following_by_user (
+  user_id      bigint,  followee_id bigint,  since timestamp,
+  PRIMARY KEY ((user_id), followee_id)
+);
+CREATE TABLE followers_by_user (
+  user_id      bigint,  follower_id bigint,  since timestamp,
+  PRIMARY KEY ((user_id), follower_id)
+);
+
+-- Q8: a user's home-feed timeline (post IDs pushed by fan-out workers), bucketed by month
+CREATE TABLE feed_by_user (
+  user_id     bigint,
+  month       int,                         -- e.g. 202610
+  post_id     bigint,
+  author_id   bigint,
+  PRIMARY KEY ((user_id, month), post_id)
+) WITH CLUSTERING ORDER BY (post_id DESC)
+  AND default_time_to_live = 2592000;      -- keep 30 days of timeline</code></pre>
+<p>Notice the differences from the SQL version: there are <strong>no foreign keys</strong>, <strong>no joins</strong>, the follow edge is <strong>written twice</strong>, posts are <strong>written twice</strong>, and counters live in their own table. Every table is designed around exactly one query, and every query hits exactly one partition.</p>
+
+<h2>13. How Instagram uses databases</h2>
+<div class="callout instagram"><span class="callout-title">📸 What is publicly known</span>
+<ul>
+  <li><strong>PostgreSQL from day one.</strong> Instagram launched in 2010 as a Django application on PostgreSQL. Its engineering blog post on sharding and IDs describes splitting data into <strong>thousands of logical shards</strong>, each a PostgreSQL <em>schema</em>, mapped onto a smaller number of physical database servers, so shards can be moved between machines without re-hashing (details in <a href="sharding.html">Sharding</a>).</li>
+  <li><strong>64-bit IDs generated inside PostgreSQL.</strong> The same post describes IDs made of <strong>41 bits of milliseconds since a custom epoch, 13 bits of logical shard ID, and 10 bits of a per-shard sequence</strong>, generated by a PL/pgSQL function — so IDs are unique, roughly time-sortable and encode their shard. See <a href="id-generation.html">Unique ID Generation</a>.</li>
+  <li><strong>Read replicas</strong> for PostgreSQL to scale reads, and later multiple data centers (<a href="replication.html">Replication</a>, <a href="multi-region.html">Multi-Region</a>).</li>
+  <li><strong>Cassandra for high-write data.</strong> Public talks (e.g. at Cassandra Summit) describe Instagram moving workloads such as the <strong>feed, activity/news inbox and direct-messaging-related data</strong> to Cassandra for write scalability and lower cost, and Instagram engineers later built <em>Rocksandra</em>, swapping Cassandra's storage engine for RocksDB to cut tail latency.</li>
+  <li><strong>Redis and Memcached</strong> for caching and fast in-memory structures; <strong>Elasticsearch-style search</strong> for discovery; and media on blob storage behind the <a href="cdn.html">CDN</a>. After joining Facebook, Instagram also adopted parts of Facebook's infrastructure; Facebook's own social data famously lives in <strong>TAO</strong>, a graph-shaped cache over sharded MySQL.</li>
+</ul></div>
+
+<p>In this course's reference architecture, that becomes:</p>
+<div class="table-wrap"><table>
+  <tr><th>Data</th><th>Store</th><th>Why</th></tr>
+  <tr><td>Users, credentials, usernames, settings</td><td>PostgreSQL (sharded by user_id + read replicas)</td><td>Uniqueness constraints and ACID transactions; moderate write rate; rich queries for support/admin tools.</td></tr>
+  <tr><td>Post / comment / story metadata</td><td>Cassandra, partitioned by user_id (post_id for comments)</td><td>Very high write volume; reads are "by user, newest first" — perfect partition/clustering fit; TTL for stories.</td></tr>
+  <tr><td>Follow graph</td><td>Graph store (edge lists in sharded SQL or Cassandra, plus cache)</td><td>Two adjacency lists per user; fast "followers of X" for fan-out. See <a href="social-graph.html">Social Graph</a>.</td></tr>
+  <tr><td>Home timelines, counters</td><td>Redis (backed by Cassandra)</td><td>Sub-millisecond reads for the hottest path in the app.</td></tr>
+  <tr><td>Direct messages</td><td>Cassandra / HBase, partitioned by conversation</td><td>Append-heavy, time-ordered per conversation.</td></tr>
+  <tr><td>Search documents</td><td>Elasticsearch</td><td>Inverted index, fuzzy and prefix matching; rebuilt from events.</td></tr>
+  <tr><td>Photos, videos</td><td>Object storage + CDN</td><td>Large immutable blobs; never in a database row.</td></tr>
+</table></div>
+
+<h3>Rough numbers (assumptions)</h3>
+<p>Assume 500M daily active users; 100M new posts/day; each post gets an average of 40 likes and 2 comments; each active user generates 10 likes/day.</p>
+<pre><code>Likes:     500M × 10           = 5 B likes/day  ≈ 58,000 writes/s average, ~150,000/s peak
+Posts:     100M / 86,400       ≈ 1,160 posts/s
+Feed fan-out: 1,160 posts/s × ~200 followers each ≈ 232,000 timeline inserts/s
+Users table: 2 B rows × ~1 KB  ≈ 2 TB  → fits a few dozen PostgreSQL shards comfortably
+Likes rows: 5 B/day × ~40 B    ≈ 200 GB/day ≈ 73 TB/year → wide-column territory</code></pre>
+<p>The numbers tell the story: the user table is "small" and correctness-critical (SQL); likes and timelines are enormous and append-heavy (NoSQL). See <a href="capacity-estimation.html">Back-of-the-Envelope Estimation</a>.</p>
+
+<h2>14. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Relational (SQL) strengths</h4><ul>
+    <li>ACID transactions and enforced constraints</li>
+    <li>Flexible ad-hoc queries and joins</li>
+    <li>Mature tooling, well-known by every engineer</li>
+    <li>Normalised data — one source of truth per fact</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ NoSQL strengths (and SQL's weaknesses)</h4><ul>
+    <li>Horizontal scaling of writes is built in, not bolted on</li>
+    <li>Huge write throughput (LSM storage), multi-DC replication</li>
+    <li>Flexible schemas for evolving data</li>
+    <li>…but no joins, limited transactions, query-first modelling, eventual consistency to reason about</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Choosing NoSQL "for scale" at small scale.</strong> A single well-tuned PostgreSQL with replicas handles tens of thousands of transactions per second. Premature NoSQL costs you transactions and flexibility for nothing.</li>
+  <li><strong>Modelling Cassandra like SQL</strong> — normalised tables, then discovering you need <code>ALLOW FILTERING</code> (a full-cluster scan) for every real query.</li>
+  <li><strong>Unbounded partitions</strong> — partitioning by <code>post_id</code> alone for likes on a post that gets 50M likes. Bucket it.</li>
+  <li><strong>Read-modify-write in application code</strong> at read committed → lost updates. Use atomic updates, <code>SELECT … FOR UPDATE</code> or version checks.</li>
+  <li><strong>Assuming the default isolation is serializable.</strong> It almost never is (PostgreSQL: read committed; MySQL: repeatable read).</li>
+  <li><strong>Long transactions</strong> holding locks or old MVCC snapshots → lock waits, table bloat, replication lag.</li>
+  <li><strong>Storing blobs in the database.</strong> Images belong in object storage; store only the key.</li>
+  <li><strong>Dual writes without a plan</strong> — writing to PostgreSQL and Elasticsearch from the app, one fails, they diverge forever. Use events/CDC from a single source of truth.</li>
+  <li><strong>Queue-like tables in Cassandra</strong> (insert, process, delete) → tombstone accumulation and slow reads.</li>
+</ul>
+
+<h2>15. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>Type</th><th>When to use it</th></tr>
+  <tr><td>PostgreSQL</td><td>Relational</td><td>Default choice for most products; rich SQL, JSONB, extensions (PostGIS, Citus). Instagram's original and core store.</td></tr>
+  <tr><td>MySQL (InnoDB)</td><td>Relational</td><td>Battle-tested OLTP at huge scale (Facebook, YouTube via Vitess, Shopify).</td></tr>
+  <tr><td>Cassandra / ScyllaDB</td><td>Wide-column</td><td>Massive write rates, time-ordered data per key, multi-region active-active. ScyllaDB is a C++ re-implementation for lower latency.</td></tr>
+  <tr><td>HBase / Bigtable</td><td>Wide-column</td><td>Strongly consistent per-row, Hadoop/GCP ecosystems, messaging and analytics backends.</td></tr>
+  <tr><td>DynamoDB</td><td>Key-value / document</td><td>Fully managed, predictable single-digit-ms latency, pay-per-request on AWS.</td></tr>
+  <tr><td>MongoDB</td><td>Document</td><td>Aggregate-oriented apps with evolving schemas; built-in sharding.</td></tr>
+  <tr><td>Redis / Memcached</td><td>Key-value (in-memory)</td><td>Caching, counters, leaderboards, rate limiting, timelines.</td></tr>
+  <tr><td>Neo4j / Neptune / JanusGraph</td><td>Graph</td><td>Multi-hop traversals, recommendations, fraud detection.</td></tr>
+  <tr><td>Prometheus / InfluxDB / TimescaleDB</td><td>Time-series</td><td>Metrics, IoT, monitoring.</td></tr>
+  <tr><td>Elasticsearch / OpenSearch</td><td>Search</td><td>Full-text and fuzzy search, log analytics — as a derived index.</td></tr>
+  <tr><td>Spanner / CockroachDB / TiDB / YugabyteDB</td><td>NewSQL</td><td>Relational + strong consistency beyond one machine or across regions.</td></tr>
+</table></div>
+
+<h2>16. Interview corner</h2>
+<details class="qa"><summary>Which database(s) would you use for Instagram, and why?</summary>
+<p>Polyglot. <strong>Users and account data</strong> in sharded PostgreSQL: modest size (a few TB), needs uniqueness (usernames, emails) and transactions. <strong>Posts, comments, likes, activity and timelines</strong> in Cassandra: billions of writes per day, read by "entity, newest first", a natural partition-key/clustering-key fit, multi-region replication, eventual consistency acceptable. <strong>Hot timelines and counters</strong> in Redis. <strong>Search</strong> in Elasticsearch fed by Kafka events. <strong>Media</strong> in object storage behind a CDN. Each store has one source of truth; derived stores are rebuilt from events. This matches what Instagram has publicly described (sharded PostgreSQL + Cassandra).</p></details>
+<details class="qa"><summary>Explain the isolation levels and the anomalies each prevents.</summary>
+<p>Read uncommitted allows dirty reads. Read committed prevents dirty reads (you only see committed data) but a row can change between two reads in your transaction (non-repeatable read) and new rows can appear in a range (phantom). Repeatable read gives each transaction a stable snapshot, preventing non-repeatable reads; the SQL standard still allows phantoms, though snapshot-based engines like PostgreSQL prevent them. Serializable guarantees the outcome equals some serial execution, preventing all of these plus lost updates and write skew. Lost updates aren't formally in the standard's table: PostgreSQL's repeatable read detects them, MySQL's doesn't. In practice most apps use read committed and handle hot spots with atomic updates, <code>SELECT FOR UPDATE</code>, or optimistic version checks.</p></details>
+<details class="qa"><summary>Design a Cassandra table for "show the latest comments on a post". What about a post with 10 million comments?</summary>
+<p><code>PRIMARY KEY ((post_id), comment_id) WITH CLUSTERING ORDER BY (comment_id DESC)</code>, where <code>comment_id</code> is a time-sortable ID. The query <code>WHERE post_id = ? LIMIT 20</code> is a single-partition sequential read. For 10M comments (~2 GB) the partition is far too large and hot, so bucket it: <code>PRIMARY KEY ((post_id, bucket), comment_id)</code> where bucket is a time window (day) or <code>comment_id / N</code>. Read the newest bucket first and walk backwards. Optionally keep the top/most-relevant comments in a cache.</p></details>
+<details class="qa"><summary>How would you guarantee usernames are unique in a sharded or NoSQL system?</summary>
+<p>Uniqueness is a global invariant, so it needs a single authority per value. Options: (1) a dedicated <code>usernames</code> table sharded <em>by username</em> (not user_id) with a primary key on the username, so the uniqueness check is a single-shard insert that fails on conflict; (2) in Cassandra, <code>INSERT INTO usernames … IF NOT EXISTS</code> (a Paxos lightweight transaction) — slow but rare; (3) a NewSQL/consensus store. Then create the user record, and treat the claim as a reservation that is released if sign-up fails (compensation instead of 2PC).</p></details>
+<details class="qa"><summary>Normalize or denormalize the feed?</summary>
+<p>Denormalize. The feed is the most read path in the app and must render in tens of ms. Store per-user timeline entries (post_id, author_id, maybe author name/avatar and media key) so one read returns everything needed, avoiding cross-shard joins. Writes cost more (fan-out on post), and copies like the author's avatar can go stale; fix by keeping only IDs in the timeline and hydrating hot objects (posts, users) from a cache, or by propagating change events. Keep the normalised source of truth elsewhere.</p></details>
+<details class="qa"><summary>When would you choose a NewSQL database like Spanner or CockroachDB instead of sharded PostgreSQL?</summary>
+<p>When you need multi-row ACID transactions or strongly consistent secondary indexes across what would be multiple shards, data larger than one machine, and you'd rather not build and operate a sharding layer — e.g. a global user directory, billing, inventory. You pay higher write latency (consensus round trips, possibly cross-region), higher cost, and a less mature ecosystem. For simple, shard-local access patterns (everything keyed by user_id), app-level sharding of PostgreSQL is cheaper and faster.</p></details>
+<details class="qa"><summary>What does BASE mean, and is Cassandra "eventually consistent"?</summary>
+<p>Basically Available, Soft state, Eventual consistency: keep serving under failures and let replicas converge later. Cassandra is <em>tunably</em> consistent: with consistency level ONE it's eventually consistent; with QUORUM writes and QUORUM reads (R + W &gt; N) a read always overlaps the latest successful write, giving strong per-key read-after-write. It still lacks multi-partition transactions, and conflicts are resolved by last-write-wins timestamps.</p></details>
+
+<h2>17. Check your understanding</h2>
+<details class="quiz"><summary>Two requests try to register <code>@alice</code> at the same instant on a single PostgreSQL. What prevents both from succeeding, and which ACID letter is that?</summary>
+<p>The <code>UNIQUE</code> constraint on <code>username</code>, backed by a unique index. One insert commits; the other waits on the index entry and then fails with a unique-violation. Enforcing declared invariants is the <strong>C (consistency)</strong> in ACID, made safe under concurrency by <strong>I (isolation)</strong>.</p></details>
+<details class="quiz"><summary>At read committed, a job does <code>SELECT like_count</code>, adds 1 in Python, then <code>UPDATE … SET like_count = 101</code>. What anomaly can occur and give two fixes.</summary>
+<p>A <strong>lost update</strong>: two concurrent jobs read 100 and both write 101. Fixes: an atomic in-database increment <code>SET like_count = like_count + 1</code>; <code>SELECT … FOR UPDATE</code> to lock the row; or optimistic concurrency with a version column and retry.</p></details>
+<details class="quiz"><summary>In <code>PRIMARY KEY ((user_id, day), activity_id)</code>, what are the partition key and clustering key, and can you query "all activity of type 'like' for user 42"?</summary>
+<p>Partition key: <code>(user_id, day)</code>; clustering key: <code>activity_id</code>. Querying by type isn't efficient — <code>type</code> is neither in the partition key nor a clustering column, so it would require filtering every row of every day bucket. If that's a real query, create another table such as <code>activity_by_user_type ((user_id, type, day), activity_id)</code>.</p></details>
+<details class="quiz"><summary>A celebrity receives 3 million likes per day, each like row ~60 bytes. Is <code>likes_by_post ((post_id), user_id)</code> safe for a single viral post over a week?</summary>
+<p>3M × 7 × 60 B ≈ 1.26 GB in one partition — about 10× the commonly cited ~100 MB guideline, and all its traffic lands on the same 3 replicas. Not safe. Bucket the partition (e.g. <code>(post_id, bucket)</code> with bucket = hash(user_id) % 16 for membership checks), and serve the count from a separate counter/cache rather than counting rows.</p></details>
+<details class="quiz"><summary>Which isolation level is needed to prevent write skew, and what's an example in Instagram?</summary>
+<p><strong>Serializable</strong> (or explicit locks on the rows the decision depends on). Example: a group chat must always keep at least one admin; two admins simultaneously check "there are 2 admins" and both demote themselves, leaving zero. Snapshot isolation allows this because they wrote different rows.</p></details>
+<details class="quiz"><summary>Match each to a NoSQL family: (a) "accounts similar to <em>selna gomz</em>", (b) API p99 latency per minute, (c) a user's session token, (d) friends-of-friends who follow a hashtag.</summary>
+<p>(a) <strong>search engine</strong> (fuzzy matching over an inverted index); (b) <strong>time-series</strong>; (c) <strong>key-value</strong> (Redis/DynamoDB, with TTL); (d) <strong>graph</strong> (multi-hop traversal).</p></details>
+<details class="quiz"><summary>Why does the CQL schema store the follow edge in two tables, while the SQL schema uses one table plus an index?</summary>
+<p>In SQL, a secondary index on <code>(followee_id, follower_id)</code> answers "who follows me?" from the same table, maintained transactionally by the database. In Cassandra each table can only be queried efficiently by its own partition key, so "following of X" (partition = follower) and "followers of X" (partition = followee) need separate tables written together — classic query-first denormalisation.</p></details>
+<details class="quiz"><summary>Why might a durable COMMIT still lose data after a disk failure, and what fixes it?</summary>
+<p>Single-node durability only protects against crashes and power loss (WAL fsync'd to that disk). If the disk or machine dies, the data is gone unless the WAL was also shipped to another machine. <a href="replication.html">Synchronous or semi-synchronous replication</a> (and backups) extend durability across machines.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Relational databases give you <strong>schemas, joins, constraints and ACID</strong>; they scale reads with replicas but writes only via sharding.</li>
+    <li>Know the anomalies — <strong>dirty read, non-repeatable read, phantom, lost update, write skew</strong> — and which isolation level stops each. Defaults are weaker than serializable.</li>
+    <li><strong>Normalise for correctness, denormalise hot read paths</strong> and keep copies in sync with events.</li>
+    <li>NoSQL = six families (<strong>key-value, document, wide-column, graph, time-series, search</strong>); pick by access pattern, scale and consistency needs.</li>
+    <li>Cassandra modelling is <strong>query-first</strong>: partition key = where, clustering key = order; one table per query; bound partition size with buckets.</li>
+    <li>Instagram is <strong>polyglot</strong>: sharded PostgreSQL for the relational core, Cassandra for high-write feeds/activity, plus Redis, Elasticsearch and object storage.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="indexing.html">Database Indexing &amp; Storage Engines</a> — B-trees vs LSM-trees: why SQL reads and Cassandra writes are fast</li>
+  <li><a href="replication.html">Replication</a> — read replicas, quorums (R + W &gt; N) and durability across machines</li>
+  <li><a href="sharding.html">Sharding</a> — how Instagram splits PostgreSQL into thousands of logical shards</li>
+  <li><a href="consistent-hashing.html">Consistent Hashing</a> — how Cassandra maps partition keys to nodes</li>
+  <li><a href="cap-consistency.html">CAP Theorem &amp; Consistency Models</a> — the theory behind ACID vs BASE</li>
+  <li><a href="id-generation.html">Unique ID Generation</a> — Instagram's 64-bit time-sortable IDs used as clustering keys</li>
+  <li><a href="caching.html">Caching</a> — Redis in front of the databases for hot reads</li>
+  <li><a href="likes-comments.html">Likes, Comments &amp; Counters</a> — handling hot counters without lost updates</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

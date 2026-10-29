@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multi-Region Architecture &amp; Disaster Recovery — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="multi-region">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>Running in <strong>multiple regions</strong> (geographically separate data-center groups) gives lower latency for a global audience, survival of whole-region disasters, and a way to meet <strong>data-residency</strong> rules.</li>
+    <li><strong>Active-passive</strong> keeps a standby region ready to take over; <strong>active-active</strong> serves live traffic everywhere. The hard part is always <strong>data</strong>: replication lag, write routing and conflicts.</li>
+    <li>DR goals are stated as <strong>RPO</strong> (how much data you can lose) and <strong>RTO</strong> (how long you can be down). Strategies range from backup &amp; restore (hours, cheap) to multi-site active-active (seconds, expensive).</li>
+    <li>Common techniques: a <strong>home region per user</strong> for writes, async cross-region replication, <strong>GeoDNS/anycast</strong> traffic steering, <strong>cells</strong> to limit blast radius, and rehearsed <strong>failover/failback runbooks</strong> with regular drills.</li>
+    <li>Replication is not a backup: keep <strong>3-2-1 backups</strong> and actually test restores.</li>
+    <li>Instagram learned this the hard way: a 2012 single-region AWS outage took it down for hours; it later moved into Facebook's data centers (2014) and spread across multiple data centers (publicly described).</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why run in more than one region?</h2>
+<p>Imagine every Instagram server — all the <a href="microservices.html">application services</a>, the sharded PostgreSQL User DB, the Cassandra clusters, Redis caches, Kafka — lives in a single region in Virginia. Three things go wrong:</p>
+<ul>
+  <li><strong>Disasters take everything down.</strong> A region is a cluster of data centers within a few tens of km. Storms, floods, power-grid failures, fibre cuts, a bad network configuration push, or a software bug in a regional control plane can make the whole region unavailable. With one region, a regional outage <em>is</em> a global outage.</li>
+  <li><strong>Latency for distant users.</strong> The <a href="cdn.html">CDN</a> serves photos from nearby edges, but API calls — loading the feed JSON, posting a comment, sending a DM — still travel to the origin. A user in Singapore is ~230 ms round-trip from Virginia; a request needing several round trips (TCP, TLS, request, and the app's sequential API calls) feels sluggish.</li>
+  <li><strong>Law and regulation.</strong> Some countries and regulations restrict where personal data may be stored or transferred (e.g. the EU's GDPR rules on transfers). A single-country deployment can make compliance very hard.</li>
+</ul>
+<p>Multi-region architecture addresses all three, but it's one of the hardest things in system design because the <strong>speed of light makes cross-region coordination slow</strong> — and the <a href="cap-consistency.html">CAP theorem</a> says that during a partition between regions you must choose between consistency and availability.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  A bank with a single branch and a single vault is ruined if that building floods. So it opens branches in several cities (lower latency for customers, survives a flood in one city). But now an account can be touched in two cities at once — it needs rules about which branch "owns" each account (home region), how quickly other branches learn about deposits (replication lag), and what happens if two branches approve withdrawals at the same moment (conflicts). It also keeps <strong>off-site archives</strong> of the ledgers (backups) and periodically <strong>rehearses</strong> opening a branch with the archives (restore tests and DR drills).
+</div>
+
+<h2>2. Vocabulary: regions, zones, data centers, cells</h2>
+<div class="cards">
+  <div class="card"><h4>🏢 Data center</h4><p>One building (or campus) with power, cooling, and network. A single failure domain for power/cooling incidents.</p></div>
+  <div class="card"><h4>🧩 Availability zone (AZ)</h4><p>Cloud term: one or more data centers with independent power and networking, a few km from other AZs in the same region. Low-latency links (~1 ms) between AZs.</p></div>
+  <div class="card"><h4>🌍 Region</h4><p>A geographic area containing several AZs (e.g. us-east, eu-west). Regions are hundreds to thousands of km apart; latency between them is tens to hundreds of ms.</p></div>
+  <div class="card"><h4>🧱 Cell</h4><p>A complete, independent copy of a service stack serving a fixed subset of users. Limits the "blast radius" of failures and bad deploys (section 10).</p></div>
+</div>
+<p>Multi-AZ deployment (replicas in 2–3 zones of one region) protects against a data-center failure with almost no latency cost — synchronous replication is affordable at ~1 ms. Multi-<em>region</em> protects against region-wide events, but replication must usually be asynchronous. Most systems do both: multi-AZ inside each region, multi-region on top.</p>
+<div class="table-wrap"><table>
+  <tr><th>Route (approx., assumption)</th><th>Round-trip time</th></tr>
+  <tr><td>Same AZ</td><td>&lt; 0.5 ms</td></tr>
+  <tr><td>Between AZs in a region</td><td>~1–2 ms</td></tr>
+  <tr><td>US East ⇄ US West</td><td>~60–70 ms</td></tr>
+  <tr><td>US East ⇄ Western Europe</td><td>~75–90 ms</td></tr>
+  <tr><td>US East ⇄ Singapore</td><td>~200–240 ms</td></tr>
+</table></div>
+
+<h2>3. Active-passive vs active-active</h2>
+<div class="diagram">
+<svg viewBox="0 0 860 330" width="860" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-mr-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <text x="200" y="22" text-anchor="middle" font-weight="700">ACTIVE-PASSIVE</text>
+  <text x="640" y="22" text-anchor="middle" font-weight="700">ACTIVE-ACTIVE</text>
+  <line x1="430" y1="10" x2="430" y2="320" stroke="#ccc" stroke-dasharray="4 4"/>
+  <g font-weight="600">
+    <rect x="140" y="40" width="120" height="40" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="200" y="65" text-anchor="middle">📱 All users</text>
+    <rect x="30" y="130" width="170" height="70" rx="8" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/><text x="115" y="155" text-anchor="middle">Region A (active)</text><text x="115" y="173" text-anchor="middle" font-weight="400" font-size="11">serves 100% traffic</text><text x="115" y="189" text-anchor="middle" font-weight="400" font-size="11">primary DB (writes)</text>
+    <rect x="230" y="130" width="170" height="70" rx="8" fill="#eceff1" stroke="#455a64" stroke-dasharray="5 3"/><text x="315" y="155" text-anchor="middle">Region B (passive)</text><text x="315" y="173" text-anchor="middle" font-weight="400" font-size="11">idle / minimal</text><text x="315" y="189" text-anchor="middle" font-weight="400" font-size="11">replica DB</text>
+    <rect x="490" y="40" width="120" height="40" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="550" y="65" text-anchor="middle">📱 US users</text>
+    <rect x="670" y="40" width="130" height="40" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="735" y="65" text-anchor="middle">📱 EU users</text>
+    <rect x="460" y="130" width="170" height="70" rx="8" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/><text x="545" y="155" text-anchor="middle">Region US (active)</text><text x="545" y="173" text-anchor="middle" font-weight="400" font-size="11">serves US traffic</text><text x="545" y="189" text-anchor="middle" font-weight="400" font-size="11">writes for US-homed users</text>
+    <rect x="660" y="130" width="170" height="70" rx="8" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/><text x="745" y="155" text-anchor="middle">Region EU (active)</text><text x="745" y="173" text-anchor="middle" font-weight="400" font-size="11">serves EU traffic</text><text x="745" y="189" text-anchor="middle" font-weight="400" font-size="11">writes for EU-homed users</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-mr-1)">
+    <path d="M190,80 L130,128"/><path d="M215,80 L300,128" stroke-dasharray="3 4" stroke="#aaa"/>
+    <path d="M200,165 L228,165"/>
+    <path d="M550,80 L545,128"/><path d="M735,80 L745,128"/>
+    <path d="M630,155 L658,155"/><path d="M660,178 L632,178"/>
+  </g>
+  <g font-size="11" fill="#555">
+    <text x="275" y="100">only on failover</text>
+    <text x="215" y="225" text-anchor="middle">async replication →</text>
+    <text x="645" y="225" text-anchor="middle">replication both ways</text>
+  </g>
+  <g font-size="12" fill="#333">
+    <text x="215" y="260" text-anchor="middle">+ simple: one writer, no conflicts</text>
+    <text x="215" y="280" text-anchor="middle">− standby capacity mostly idle</text>
+    <text x="215" y="300" text-anchor="middle">− failover is rare, slow, scary</text>
+    <text x="645" y="260" text-anchor="middle">+ low latency everywhere, no idle capacity</text>
+    <text x="645" y="280" text-anchor="middle">+ failover = shift traffic (well-exercised)</text>
+    <text x="645" y="300" text-anchor="middle">− write routing, lag and conflicts</text>
+  </g>
+</svg>
+<div class="caption">Active-passive: one region does all the work while a standby waits. Active-active: every region serves live traffic and data is replicated between them.</div>
+</div>
+
+<div class="table-wrap"><table>
+  <tr><th></th><th>Active-passive</th><th>Active-active</th></tr>
+  <tr><td><b>Traffic</b></td><td>All in the primary region; standby gets none (or only read traffic, "hot standby").</td><td>All regions serve users, usually the nearest.</td></tr>
+  <tr><td><b>Writes</b></td><td>Single writer region — no conflicts.</td><td>Either partitioned (each record has one home region) or multi-writer (needs conflict resolution).</td></tr>
+  <tr><td><b>Failover</b></td><td>Promote standby DBs, scale up standby compute, flip DNS. Minutes to hours; rarely exercised so often goes wrong.</td><td>Shift traffic away from the failed region; surviving regions must have <strong>headroom</strong> to absorb it.</td></tr>
+  <tr><td><b>Cost</b></td><td>Paying for a standby that does nothing (unless kept small).</td><td>All capacity is useful, but each region needs spare headroom (e.g. 3 regions each run at ≤ 66% so any two can carry the full load).</td></tr>
+  <tr><td><b>Latency benefit</b></td><td>None for distant users.</td><td>Yes — users served nearby.</td></tr>
+  <tr><td><b>Complexity</b></td><td>Lower.</td><td>Much higher (data placement, routing, consistency).</td></tr>
+</table></div>
+<div class="callout tip"><span class="callout-title">💡 Headroom math</span>
+With N active regions, to survive the loss of one region the remaining N−1 must carry 100% of traffic. So each region must normally run at no more than <code>(N−1)/N</code> of capacity: 50% with 2 regions, 67% with 3, 80% with 5. More regions = less wasted headroom — one reason large companies run many.</div>
+
+<h2>4. RPO and RTO</h2>
+<p>Disaster-recovery requirements are written as two numbers:</p>
+<ul>
+  <li><strong>RPO — Recovery Point Objective</strong>: the maximum acceptable <em>data loss</em>, measured in time. "RPO = 5 minutes" means after a disaster you may lose at most the last 5 minutes of writes. It is determined by how often/how fast data is copied elsewhere (backup frequency or replication lag).</li>
+  <li><strong>RTO — Recovery Time Objective</strong>: the maximum acceptable <em>downtime</em> — how long until the service works again. It is determined by how quickly you can detect the failure, make a decision, and bring up or redirect to the recovery site.</li>
+</ul>
+<pre class="ascii">
+         last good copy                disaster                    service restored
+               │                          │                               │
+  ─────────────●══════════════════════════✖═══════════════════════════════●──────► time
+               │◄──── data lost (≤ RPO) ─►│◄────── downtime (≤ RTO) ─────►│
+
+  Async replication with 2 s lag        →  RPO ≈ seconds
+  Nightly backup at 02:00, crash 18:00  →  RPO = 16 hours
+  Automated DNS failover in 3 min       →  RTO ≈ minutes (+ DNS TTL)
+  Restore 50 TB from backup at 1 GB/s   →  RTO ≥ 14 hours just to copy data
+</pre>
+<p>Different data deserves different targets. For Instagram (assumptions): DMs and posts need RPO of seconds; the like counter can tolerate approximate recovery (rebuild from the likes table); the analytics lake can be hours behind; the feed cache needs RPO = ∞ — it can be rebuilt from source data and doesn't need backup at all.</p>
+
+<h2>5. Disaster-recovery strategies</h2>
+<p>Cloud providers popularised four standard DR strategies. They form a ladder: each step lowers RPO/RTO and raises cost.</p>
+<div class="table-wrap"><table>
+  <tr><th>Strategy</th><th>What's running in the recovery region</th><th>Typical RPO</th><th>Typical RTO</th><th>Cost</th></tr>
+  <tr><td><b>Backup &amp; restore</b></td><td>Nothing but backups (DB snapshots, object-storage copies). Infra is rebuilt from code (Terraform etc.) when disaster strikes.</td><td>Hours (time since last backup)</td><td>Hours to days</td><td>💲 lowest</td></tr>
+  <tr><td><b>Pilot light</b></td><td>Core data continuously replicated (DB replicas running); application servers defined but switched off or tiny.</td><td>Seconds–minutes (replication lag)</td><td>Tens of minutes to hours (start &amp; scale compute)</td><td>💲💲</td></tr>
+  <tr><td><b>Warm standby</b></td><td>A fully working but scaled-down copy of the whole stack; can serve some traffic immediately; scale up on failover.</td><td>Seconds–minutes</td><td>Minutes</td><td>💲💲💲</td></tr>
+  <tr><td><b>Multi-site active-active</b></td><td>Full production in every region, all serving traffic.</td><td>Near zero to seconds (depends on sync vs async)</td><td>Seconds to minutes (shift traffic)</td><td>💲💲💲💲 highest</td></tr>
+</table></div>
+<p>Choose per system, based on the business cost of downtime and data loss. An internal reporting tool can live with backup &amp; restore; the Instagram feed and DMs need active-active; the user DB might be active-passive per shard (one primary region per shard, replicas elsewhere) inside an overall active-active deployment.</p>
+
+<h2>6. Cross-region data replication and lag</h2>
+<p>Stateless services (the Feed, Upload and Search services) are easy to run in many regions — just deploy them. <strong>State is the hard part.</strong> Every stateful store needs a cross-region replication strategy (see <a href="replication.html">Replication</a> for the fundamentals).</p>
+
+<h3>6.1 Synchronous vs asynchronous</h3>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Synchronous cross-region</th><th>Asynchronous cross-region</th></tr>
+  <tr><td><b>Write acknowledged when</b></td><td>Committed in ≥ 2 regions (or a quorum across 3+).</td><td>Committed locally; shipped to other regions in the background.</td></tr>
+  <tr><td><b>Write latency</b></td><td>+ one cross-region RTT per write (e.g. +80 ms US⇄EU).</td><td>Unchanged (local).</td></tr>
+  <tr><td><b>RPO on region loss</b></td><td>0 — no acknowledged write is lost.</td><td>= replication lag at the moment of failure (usually ms–seconds; can be minutes under load).</td></tr>
+  <tr><td><b>Availability during partition</b></td><td>Writes stall if the quorum can't be reached (CP).</td><td>Writes continue (AP); regions diverge temporarily.</td></tr>
+  <tr><td><b>Examples</b></td><td>Google Spanner, CockroachDB, Cassandra with <code>EACH_QUORUM</code>, Raft/Paxos groups spanning regions.</td><td>PostgreSQL/MySQL streaming replicas in other regions, Cassandra <code>LOCAL_QUORUM</code> + async cross-DC, S3 Cross-Region Replication, Kafka MirrorMaker.</td></tr>
+</table></div>
+<p>A common middle ground is to spread a consensus group across <strong>three nearby regions</strong> (e.g. US-East, US-Central, US-West): each write waits for 2 of 3, adding ~20–40 ms rather than 80+, while surviving the loss of any one region with RPO = 0. Most social-media data, though, uses asynchronous replication and accepts a small RPO — losing the last second of likes in a once-a-decade disaster is acceptable; adding 80 ms to every like is not.</p>
+
+<h3>6.2 Living with replication lag</h3>
+<p><strong>Replication lag</strong> is how far behind a replica is — measured in seconds or in log position. It causes user-visible anomalies:</p>
+<ul>
+  <li><strong>Read-your-writes violation</strong>: you change your bio (written in the US region), refresh, and the EU replica still shows the old bio. Fix: route a user's reads to their home region for a few seconds after they write, or carry a "last write position" token and only read from replicas that have caught up.</li>
+  <li><strong>Monotonic reads violation</strong>: one refresh hits a fresh replica, the next hits a stale one — a comment appears then disappears. Fix: stick each user to one replica/region.</li>
+  <li><strong>Cache invalidation across regions</strong>: if the EU cache is invalidated before the EU DB replica receives the write, the next read re-caches the old value. Facebook's published memcache paper (NSDI 2013) describes driving invalidations from the database's own replication/commit stream in each region, so a remote cache is invalidated only once the remote replica has the new data.</li>
+</ul>
+<p>Monitor lag continuously and alert on it — it is literally your current RPO. A replica 10 minutes behind means a failover now loses 10 minutes of data.</p>
+
+<h2>7. Write routing and conflict handling</h2>
+
+<h3>7.1 Home region per user (partitioned writes)</h3>
+<p>The simplest way to be active-active without conflicts is to ensure each record has <strong>exactly one writable home</strong> at any time. Assign each user a <strong>home region</strong> (usually where they mostly connect from); all writes to data owned by that user go to that region's primary, and other regions hold read replicas.</p>
+<pre class="ascii">
+ user 184467 (home = EU)          user 99021 (home = US)
+ ─────────────────────────        ─────────────────────────
+ EU region:  PRIMARY  ✎           EU region:  replica  👁
+ US region:  replica  👁           US region:  PRIMARY  ✎
+
+ A US-homed user travelling in Europe:
+   reads  → EU region (local replicas, fast)
+   writes → forwarded to US primary (+~80 ms, rare enough to be fine)
+</pre>
+<ul>
+  <li>The mapping <code>user_id → home region</code> lives in a small, highly replicated directory (or is encoded in the shard ID — Instagram's public ID scheme embeds a logical shard ID in every 64-bit ID, see <a href="id-generation.html">ID generation</a>, and a shard → region map can be kept separately).</li>
+  <li>Users can be <strong>re-homed</strong> (move a shard's primary) when they move countries, or to rebalance load — a careful, online migration.</li>
+  <li>Data that involves two users (a like from an EU user on a US user's post; a DM between them) needs a rule: e.g. the like is owned by the post's shard, the DM thread by the thread's shard. Writes go to the owner's region.</li>
+</ul>
+
+<h3>7.2 When multiple regions can write the same data</h3>
+<p>Some systems allow writes to the same record in multiple regions (multi-leader / leaderless), for availability during partitions. Then conflicts are inevitable and need a resolution strategy:</p>
+<div class="table-wrap"><table>
+  <tr><th>Technique</th><th>How</th><th>Good for / caveat</th></tr>
+  <tr><td><b>Last-writer-wins (LWW)</b></td><td>Each write carries a timestamp; the highest wins everywhere.</td><td>Simple (Cassandra's default). Silently drops concurrent writes; clock skew can make an older write win.</td></tr>
+  <tr><td><b>Version vectors</b></td><td>Track per-region version counters to detect true concurrency, keep both "siblings", let the app merge.</td><td>Correct detection; app must implement merge.</td></tr>
+  <tr><td><b>CRDTs</b></td><td>Data types whose concurrent updates always merge deterministically (counters, sets, registers).</td><td>Like counts as a <em>PN-counter</em> (each region keeps its own +/− tallies; total = sum). Followers as an add/remove set.</td></tr>
+  <tr><td><b>Application-level rules</b></td><td>Domain logic, e.g. "a block always wins over a follow", "a delete wins over an edit".</td><td>Safest for security-sensitive data.</td></tr>
+  <tr><td><b>Avoid conflicts</b></td><td>Route all writes for a key to one home region (7.1).</td><td>Most common in practice.</td></tr>
+</table></div>
+<pre><code># PN-counter CRDT for a post's like count, replicated across regions
+state = {"US": {"inc": 1040, "dec": 12}, "EU": {"inc": 388, "dec": 3}, "APAC": {"inc": 905, "dec": 9}}
+value = sum(r["inc"] - r["dec"] for r in state.values())   # 2309
+merge(a, b) = per region: max(a.inc, b.inc), max(a.dec, b.dec)   # commutative, idempotent</code></pre>
+
+<h2>8. Global traffic management</h2>
+<p>How does a user's phone reach the right region, and how is traffic moved away from a failed one?</p>
+<ul>
+  <li><strong>GeoDNS / latency-based DNS</strong>: the authoritative <a href="dns.html">DNS</a> answers <code>i.instagram.com</code> with the IP of the closest healthy region (or edge), based on the resolver's location or measured latency. Failover = stop handing out the failed region's IPs. Caveat: resolvers and devices cache answers for the TTL (and some ignore it), so a full shift takes minutes; keep TTLs short (30–60 s) on failover-critical records.</li>
+  <li><strong>Anycast</strong>: many edge locations announce the same IP via BGP; packets go to the topologically nearest. Withdrawing a route shifts traffic within seconds, without waiting for DNS caches.</li>
+  <li><strong>Edge proxies + private backbone</strong>: the user's TLS connection terminates at a nearby edge PoP (fast handshake); the edge then forwards the request over the company's private backbone to a healthy region chosen by a global load balancer. The edge can change the backend region instantly, per request — the most flexible option, and the model used by large companies (Meta's edge PoPs serve this role).</li>
+  <li><strong>Weighted traffic control</strong>: the global load balancer sends e.g. 30/30/40% to three regions and can drain a region gradually (100% → 50% → 0%) for maintenance or drills.</li>
+  <li><strong>Health signals</strong>: per-region health is judged from many signals — synthetic probes, error rates, latency — not one ping, to avoid failing over on a false alarm.</li>
+</ul>
+<div class="flow">
+  <div class="fnode client">📱 App<small>Singapore</small></div><div class="farrow">→<small>anycast / GeoDNS</small></div>
+  <div class="fnode edge">Edge PoP<small>TLS termination</small></div><div class="farrow">→<small>private backbone</small></div>
+  <div class="fnode edge">Global LB<small>pick healthy region</small></div><div class="farrow">→</div>
+  <div class="fnode svc">Region APAC<small>or next-nearest if down</small></div>
+</div>
+
+<h2>9. Failover, failback and drills</h2>
+
+<h3>9.1 A failover runbook</h3>
+<p>A <strong>runbook</strong> is a written, rehearsed procedure. A regional failover for an Instagram-like active-active system might be:</p>
+<ol class="steps">
+  <li><strong>Detect &amp; declare.</strong> Alerts fire (error rate, health probes). The incident commander confirms it's a regional problem (not a bad deploy everywhere — failing over won't fix that) and declares a failover. Automation can do this for clear-cut cases; many organisations keep a human decision for full-region failover to avoid flapping on false positives.</li>
+  <li><strong>Check capacity.</strong> Confirm surviving regions have headroom; pre-emptively scale them up; shed low-priority load (background jobs, prefetch, batch analytics) to make room.</li>
+  <li><strong>Drain traffic.</strong> Set the failed region's weight to 0 in the global load balancer / withdraw anycast routes / update GeoDNS.</li>
+  <li><strong>Promote data.</strong> For shards whose primary was in the failed region, promote replicas in a surviving region to primary. <strong>Fence</strong> the old primaries (revoke their write permission/lease) so that if the failed region comes back unexpectedly it can't accept writes — otherwise you get <strong>split brain</strong>: two primaries diverging.</li>
+  <li><strong>Re-point async systems.</strong> Kafka producers/consumers, cron jobs, and batch pipelines that ran in the failed region are started elsewhere.</li>
+  <li><strong>Verify.</strong> Dashboards for error rates, latency, replication health; synthetic user journeys (log in, load feed, post, DM).</li>
+  <li><strong>Communicate.</strong> Status page, internal updates.</li>
+</ol>
+
+<h3>9.2 Failback</h3>
+<p><strong>Failback</strong> — returning to the original region — is often riskier than failover because it's done less urgently and with less practice. The recovered region's databases are stale and may contain <em>un-replicated writes</em> made just before the failure (the RPO window). Steps: rebuild the old primaries as replicas of the new primaries (don't just "turn them back on"); reconcile or discard the orphaned writes (log them for review); wait until lag is near zero; shift traffic back gradually (1% → 10% → 50% → 100%); move primaries back during a quiet period.</p>
+
+<h3>9.3 Drills</h3>
+<p>A failover plan that has never been executed will fail: credentials expire, scripts reference deleted hosts, a "stateless" service turns out to depend on a config store in the failed region, and surviving regions turn out to lack capacity. The only cure is <strong>regular drills</strong> in production:</p>
+<ul>
+  <li>Start with draining a single service from one region, then a whole region at low-traffic times, then at peak.</li>
+  <li>Measure actual RTO and RPO against the objectives; record every surprise and fix it.</li>
+  <li>Meta has publicly described running large-scale disaster-recovery exercises (internally called <em>Storm</em> in public talks) that disconnect entire data centers or regions from the network to verify that products, including Instagram, keep working. Netflix's "Chaos Kong" exercises do the same for AWS regions. See <a href="resilience-patterns.html">Chaos engineering</a>.</li>
+</ul>
+
+<h2>10. Cell-based architecture and blast radius</h2>
+<p><strong>Blast radius</strong> is how many users a single failure can affect. A region failover limits blast radius to "everyone in that region" — still tens or hundreds of millions of people. And many outages aren't regional disasters at all: they're a bad deploy, a poison request, or a runaway client that hits <em>every</em> replica of a service at once. <strong>Cells</strong> shrink the blast radius further.</p>
+<div class="diagram">
+<svg viewBox="0 0 860 300" width="860" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-mr-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600">
+    <rect x="330" y="15" width="200" height="44" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="430" y="42" text-anchor="middle">📱 Requests (user_id)</text>
+    <rect x="330" y="90" width="200" height="50" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="430" y="111" text-anchor="middle">Cell router</text><text x="430" y="128" text-anchor="middle" font-weight="400" font-size="11">user_id → cell map (thin)</text>
+  </g>
+  <g>
+    <rect x="20" y="175" width="190" height="110" rx="10" fill="#e8f5e9" stroke="#2e7d32"/>
+    <text x="115" y="197" text-anchor="middle" font-weight="700">Cell 1</text>
+    <rect x="35" y="207" width="160" height="30" rx="6" fill="#ffffff" stroke="#2e7d32"/><text x="115" y="227" text-anchor="middle" font-size="12">services (all)</text>
+    <rect x="35" y="245" width="160" height="30" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="115" y="265" text-anchor="middle" font-size="12">DB shards + cache</text>
+    <rect x="230" y="175" width="190" height="110" rx="10" fill="#e8f5e9" stroke="#2e7d32"/>
+    <text x="325" y="197" text-anchor="middle" font-weight="700">Cell 2</text>
+    <rect x="245" y="207" width="160" height="30" rx="6" fill="#ffffff" stroke="#2e7d32"/><text x="325" y="227" text-anchor="middle" font-size="12">services (all)</text>
+    <rect x="245" y="245" width="160" height="30" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="325" y="265" text-anchor="middle" font-size="12">DB shards + cache</text>
+    <rect x="440" y="175" width="190" height="110" rx="10" fill="#ffebee" stroke="#c62828" stroke-width="2"/>
+    <text x="535" y="197" text-anchor="middle" font-weight="700">Cell 3 ✖ bad deploy</text>
+    <rect x="455" y="207" width="160" height="30" rx="6" fill="#ffffff" stroke="#c62828"/><text x="535" y="227" text-anchor="middle" font-size="12">only its users hit</text>
+    <rect x="455" y="245" width="160" height="30" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="535" y="265" text-anchor="middle" font-size="12">DB shards + cache</text>
+    <rect x="650" y="175" width="190" height="110" rx="10" fill="#e8f5e9" stroke="#2e7d32"/>
+    <text x="745" y="197" text-anchor="middle" font-weight="700">Cell N</text>
+    <rect x="665" y="207" width="160" height="30" rx="6" fill="#ffffff" stroke="#2e7d32"/><text x="745" y="227" text-anchor="middle" font-size="12">services (all)</text>
+    <rect x="665" y="245" width="160" height="30" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="745" y="265" text-anchor="middle" font-size="12">DB shards + cache</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-mr-2)">
+    <path d="M430,59 L430,88"/>
+    <path d="M360,140 L130,173"/><path d="M410,140 L330,173"/><path d="M450,140 L530,173"/><path d="M500,140 L740,173"/>
+  </g>
+</svg>
+<div class="caption">Cells: each cell is a full, independent stack for a slice of users. A failure or bad deploy in one cell affects only that slice (here ~1/N of users).</div>
+</div>
+<ul>
+  <li><strong>What a cell contains</strong>: a complete set of services plus the data shards for its users. Cells don't call each other on the request path (or do so only through well-guarded interfaces).</li>
+  <li><strong>Cell router</strong>: a deliberately thin, simple, highly available layer mapping <code>user_id → cell</code> (often via the shard ID). It must be the most reliable part of the system because it's shared by all cells.</li>
+  <li><strong>Deploy cell by cell</strong>: new code goes to one canary cell first, then progressively to more. A bad release hurts 1–2% of users for minutes, not 100%.</li>
+  <li><strong>Fixed maximum cell size</strong>: growth adds new cells instead of growing cells, so every cell stays at a size that has been load-tested.</li>
+  <li><strong>Cross-cell data</strong>: social products are highly connected (your feed contains posts from users in every cell), so pure cells are easiest for per-user data (accounts, DMs, settings) and harder for global data (social graph, feed fan-out). Global services then get their own isolation (sharding, bulkheads).</li>
+</ul>
+<p>Regions, AZs, cells and shards are nested failure domains. A well-designed system asks, for each: "if this unit fails, what fraction of users is affected, and what happens to them?"</p>
+
+<h2>11. Backups: replication is not a backup</h2>
+<p>Replication protects against <em>losing a machine or region</em>. It does <strong>not</strong> protect against <em>bad writes</em>: if a bug or an attacker deletes or corrupts data, replication faithfully copies the damage to every replica within milliseconds. You need <strong>backups</strong> — point-in-time copies you can go back to.</p>
+
+<h3>11.1 The 3-2-1 rule</h3>
+<div class="cards">
+  <div class="card"><h4>3️⃣ copies</h4><p>Keep at least three copies of important data: production plus two backups.</p></div>
+  <div class="card"><h4>2️⃣ media / systems</h4><p>On at least two different storage systems or media types, so one bug or failure mode can't destroy both.</p></div>
+  <div class="card"><h4>1️⃣ off-site</h4><p>At least one copy in a different location (another region, another account) — ideally <strong>immutable</strong> (write-once, object lock) so ransomware or a compromised admin account can't delete it.</p></div>
+</div>
+
+<h3>11.2 Backup techniques</h3>
+<ul>
+  <li><strong>Snapshots</strong>: periodic full copies (or copy-on-write volume snapshots) of each database shard.</li>
+  <li><strong>Point-in-time recovery (PITR)</strong>: a base snapshot plus the continuous write-ahead log (PostgreSQL WAL archiving). Restore = load snapshot, replay the log up to <em>just before</em> the bad write (e.g. 14:31:59 before a 14:32 bad migration). RPO for corruption becomes seconds.</li>
+  <li><strong>Delayed replicas</strong>: a replica that intentionally applies changes 1 hour late — a quick way to recover from a recent accidental delete.</li>
+  <li><strong>Object storage</strong>: versioning plus cross-region replication for photos and videos; deletions create "delete markers" that can be undone within a retention window (balanced against privacy deletion obligations — see <a href="security.html">Security &amp; Privacy</a>).</li>
+  <li><strong>Encryption and access control</strong>: backups contain everything, so they must be encrypted and tightly access-controlled.</li>
+</ul>
+
+<h3>11.3 Restore testing</h3>
+<p>"Backups don't matter; restores do." Many organisations discover during a disaster that backups were incomplete, corrupt, missing a table, or would take days to restore. Practice:</p>
+<ul>
+  <li><strong>Automated restore tests</strong>: continuously restore random shards' backups into a sandbox, run integrity checks (row counts, checksums, application-level queries) and alert on failure.</li>
+  <li><strong>Measure restore time</strong>: a 40 TB shard restored at 500 MB/s takes ~22 hours — if your RTO is 4 hours, you need parallel restores, smaller shards, or a warm replica instead.</li>
+  <li><strong>Full-scale exercises</strong> periodically, including rebuilding derived stores (caches, search indexes) from restored sources.</li>
+</ul>
+
+<h2>12. Data residency and GDPR</h2>
+<p><strong>Data residency</strong> means keeping certain data within a geographic or legal boundary. The EU's <strong>GDPR</strong> does not, by itself, require that all EU data be stored in the EU; it restricts <em>transfers</em> of personal data outside the European Economic Area unless there's a legal basis (an adequacy decision, standard contractual clauses with extra safeguards, etc.). In practice, legal uncertainty around EU→US transfers (the 2020 "Schrems II" ruling invalidated the EU-US Privacy Shield; Meta was publicly fined €1.2 billion by the Irish regulator in 2023 over Facebook's EU-US transfers before a new EU-US Data Privacy Framework was adopted) has pushed many companies to localise more data. Other countries (e.g. Russia, China, India for some data categories) have their own localisation rules.</p>
+<p>Architectural techniques:</p>
+<ul>
+  <li><strong>Region pinning</strong>: use the home-region mechanism to keep a regulated user's primary data (and backups) in an in-boundary region; don't replicate those tables outside.</li>
+  <li><strong>Data classification</strong>: tag fields by sensitivity and residency requirement; replicate public content (posts visible worldwide must be served worldwide) differently from private data (DMs, contact lists, location history).</li>
+  <li><strong>Regional keys</strong>: encrypt data with keys held in a KMS inside the boundary, so copies elsewhere are unreadable without in-region access.</li>
+  <li><strong>Pseudonymised analytics</strong>: send only aggregated or pseudonymised data to global analytics pipelines (see <a href="analytics-ml.html">Analytics</a>).</li>
+  <li><strong>Deletion everywhere</strong>: GDPR's right to erasure applies to every regional copy, cache and backup — see <a href="security.html">Security &amp; Privacy</a>.</li>
+</ul>
+
+<h2>13. How Instagram does multi-region</h2>
+<p>Instagram's public history is a textbook progression up the DR ladder (dates and details as publicly reported; internal specifics are not public):</p>
+<ol class="steps">
+  <li><strong>2010–2012 — a single AWS region.</strong> The early Django + PostgreSQL + Redis + memcached stack ran on AWS in the US-East region. On 29 June 2012, severe storms caused a power failure in an AWS US-East data center; Instagram (along with Netflix and Pinterest) was widely reported to be down or degraded for many hours. With everything in one region and recovery depending on bringing that region back, the outage illustrated precisely the single-region risk in section 1, and it is often cited as a lesson in why critical services should not depend on a single data center or region.</li>
+  <li><strong>2013–2014 — migration into Facebook's data centers.</strong> After the 2012 acquisition, Instagram publicly described a large migration ("Instagration") from AWS into Facebook's own data centers, completed in 2014 — moving a live service with hundreds of millions of users, its sharded PostgreSQL and Cassandra data, without a user-visible outage. Being inside Facebook's infrastructure gave Instagram access to Meta's networks, edge PoPs, tooling and data-center fleet.</li>
+  <li><strong>2015 onwards — multiple data centers.</strong> Instagram's engineering blog publicly described expanding from one data center to several, and running across multiple regions: stateless Django application tiers deployed in each data center; Cassandra replicated across data centers with local-quorum reads/writes; PostgreSQL with a primary per shard in one location and replicas elsewhere, writes routed to the primary; and careful handling of cache invalidation across regions. This enabled serving traffic from multiple places and surviving the loss of a data center.</li>
+  <li><strong>Today — part of Meta's global infrastructure.</strong> Meta publicly describes running many data-center regions, a global edge network, and regular disaster-recovery drills (Storm) that take whole data centers offline — Instagram participates in these like other Meta products.</li>
+</ol>
+<div class="callout instagram"><span class="callout-title">📸 Mapping it to the main diagram</span>
+Every box in the architecture diagram exists in multiple regions. Stateless services (Upload, Feed, Search, DM, Stories) are deployed everywhere and are the easy part. The <strong>User DB</strong> (sharded PostgreSQL) has one writable primary per shard with cross-region replicas — writes for a shard go to its home. <strong>Cassandra</strong> stores (posts, comments, messages) replicate across regions with per-region quorums, accepting brief eventual consistency between regions. <strong>Redis feed caches</strong> are per-region and rebuildable — no cross-region backup needed. <strong>Object storage</strong> replicates photos and videos across regions, and the <strong>CDN</strong> keeps serving cached media even when an origin region is down. <strong>Kafka</strong> runs per region, with mirroring for streams that must be global (e.g. analytics). The numbers below are assumptions to reason with, not official figures.</div>
+
+<h3>Rough numbers (assumptions)</h3>
+<pre><code>3 active regions, peak 1M API req/s total → ~333k req/s each
+Survive loss of 1 region → each must handle 500k req/s → run at ≤ 67% of capacity
+Write rate 50k writes/s, avg 1 KB → 50 MB/s replicated to each other region (~400 Mbps)
+Async lag normally ~100–500 ms → RPO on sudden region loss ≈ 0.5 s × 50k = ~25k writes at risk
+Restoring a 2 TB shard from backup at 400 MB/s ≈ 1.4 h → per-shard RTO if no replica</code></pre>
+
+<h2>14. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Benefits</h4><ul>
+    <li>Survives data-center and region-wide disasters</li>
+    <li>Lower latency for users worldwide</li>
+    <li>Enables data-residency compliance</li>
+    <li>Maintenance and risky changes can be done region by region / cell by cell</li>
+    <li>Smaller blast radius for failures and bad deploys</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs</h4><ul>
+    <li>Much higher cost: duplicate infrastructure plus idle headroom</li>
+    <li>Consistency problems: replication lag, conflicts, read-your-writes</li>
+    <li>Cross-region bandwidth bills</li>
+    <li>Operational complexity: deploys, config, secrets, schema changes in many places</li>
+    <li>Failover itself is risky if not rehearsed (split brain, capacity shortfall)</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Hidden single-region dependencies</strong>: an auth service, config store, secrets manager, DNS provider or CI system that exists only in one region — discovered during the disaster.</li>
+  <li><strong>Insufficient headroom</strong>: surviving regions overload and fail in a cascade right after failover.</li>
+  <li><strong>Treating replication as backup</strong>: a bad migration deletes data everywhere.</li>
+  <li><strong>Never-tested restores and runbooks</strong>.</li>
+  <li><strong>Split brain</strong>: promoting a new primary without fencing the old one.</li>
+  <li><strong>Long DNS TTLs</strong> that make traffic shifts take hours.</li>
+  <li><strong>Assuming cross-region synchronous writes are cheap</strong> — 80+ ms per write adds up fast for chatty code.</li>
+  <li><strong>Forgetting async systems</strong> (cron jobs, queue consumers, batch) in the failover plan — jobs run twice or never.</li>
+</ul>
+
+<h2>15. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>Role</th><th>When to use</th></tr>
+  <tr><td>AWS Route 53, Azure Traffic Manager, Google Cloud DNS, NS1</td><td>GeoDNS, latency-based routing, health-checked failover records</td><td>DNS-level traffic steering between regions.</td></tr>
+  <tr><td>AWS Global Accelerator, Google Cloud Load Balancing, Cloudflare, Azure Front Door</td><td>Anycast front doors, global load balancing</td><td>Fast, DNS-independent region failover.</td></tr>
+  <tr><td>Google Spanner, CockroachDB, YugabyteDB</td><td>Globally distributed SQL with consensus replication</td><td>Strong consistency across regions, accepting higher write latency.</td></tr>
+  <tr><td>Cassandra / ScyllaDB (multi-DC), DynamoDB Global Tables, Cosmos DB</td><td>Multi-region, multi-writer NoSQL (LWW-style conflict resolution)</td><td>Highly available writes everywhere, eventual consistency.</td></tr>
+  <tr><td>PostgreSQL / MySQL streaming replication, Aurora Global Database</td><td>Single-writer primary with cross-region replicas</td><td>Active-passive or home-region designs.</td></tr>
+  <tr><td>S3 Cross-Region Replication, GCS dual/multi-region buckets</td><td>Object replication</td><td>Media durability across regions.</td></tr>
+  <tr><td>Kafka MirrorMaker 2, Confluent Cluster Linking</td><td>Cross-region stream replication</td><td>Global event streams, DR for Kafka.</td></tr>
+  <tr><td>pgBackRest, WAL-G, AWS Backup, Velero</td><td>Backups, PITR, Kubernetes backup</td><td>3-2-1 backups and restore automation.</td></tr>
+  <tr><td>Terraform, Pulumi</td><td>Infrastructure as code</td><td>Rebuilding a region from scratch reproducibly.</td></tr>
+</table></div>
+
+<h2>16. Interview corner</h2>
+<details class="qa"><summary>How would you make Instagram survive the loss of an entire region?</summary>
+<p>Run active-active in at least three regions with ≤ 67% utilisation so two can carry full load. Stateless services everywhere behind a global load balancer/anycast edge with health-based traffic steering. Data: user DB shards with a home region (single writer) and async replicas in other regions; Cassandra with cross-region replication and <code>LOCAL_QUORUM</code>; object storage replicated cross-region; per-region rebuildable caches. On failure: drain the region at the edge, promote replicas for shards homed there with fencing of old primaries, shed low-priority load, move async jobs. RPO = replication lag (seconds); RTO = minutes. Prove it with regular region-drain drills, and keep separate PITR backups for logical corruption.</p></details>
+<details class="qa"><summary>Define RPO and RTO and give appropriate values for Instagram's DMs, likes and analytics.</summary>
+<p>RPO = maximum tolerable data loss measured in time; RTO = maximum tolerable downtime. DMs: RPO seconds (or zero for messages acknowledged as sent, which might justify synchronous replication within a nearby region group), RTO minutes. Likes: RPO seconds-to-minutes is acceptable (counts can be recomputed from the likes table), RTO minutes (the app can hide counts meanwhile). Analytics: RPO hours (events can be replayed from Kafka/devices), RTO hours to a day.</p></details>
+<details class="qa"><summary>Active-active with multiple writers: how do you handle two regions updating the same profile concurrently?</summary>
+<p>Best: avoid it — give each user a home region and route all their writes there, so there's a single writer per record. If multi-writer is required: last-writer-wins with hybrid logical clocks for simple fields (accepting lost concurrent updates), CRDTs for counters and sets (PN-counter for likes, OR-set for follows), version vectors with application merge for complex objects, and domain rules for security-sensitive data (e.g. "block wins over follow", "private wins over public").</p></details>
+<details class="qa"><summary>What is a cell-based architecture and why use it in addition to multiple regions?</summary>
+<p>A cell is a complete independent stack serving a fixed subset of users, behind a thin router. Regions protect against regional disasters, but many outages are caused by deploys, poison requests or overload that hit all replicas of a service. Cells limit any such failure to ~1/N of users, enable progressive cell-by-cell deploys, and keep each cell at a tested maximum size. Trade-off: cross-cell data (social graph, feeds) needs separate handling, and the router becomes critical shared infrastructure that must be extremely simple.</p></details>
+<details class="qa"><summary>Why isn't replication enough? What's your backup strategy?</summary>
+<p>Replication copies bad writes (bugs, malicious deletes, bad migrations) instantly to all replicas. Backups give point-in-time recovery. Strategy: 3-2-1 — continuous WAL archiving plus daily snapshots per shard to object storage in another region and account, with object lock for immutability; encryption with KMS keys; versioned media buckets; automated daily restore tests of random shards with integrity checks; tracked restore times against RTO; and deletion/retention policies that honour GDPR erasure.</p></details>
+<details class="qa"><summary>Describe how you'd fail back after a region recovers.</summary>
+<p>Don't simply re-enable it. Treat the recovered region's databases as stale: rebuild them as replicas of the current primaries, and extract any writes that were committed there but never replicated (the RPO window) for reconciliation. Wait for lag ≈ 0, warm caches, then shift traffic gradually (1% → 10% → 50% → 100%) watching error rates, and move shard primaries back in batches during off-peak. Update the runbook with anything that surprised you.</p></details>
+
+<h2>17. Check your understanding</h2>
+<details class="quiz"><summary>You have 4 active regions. What is the maximum safe normal utilisation per region to survive the loss of one region?</summary>
+<p>(N−1)/N = 3/4 = <strong>75%</strong>. If one region fails, its 25% share is spread over the other three, each going from 75% to 100%. In practice you'd target a bit lower for safety margin.</p></details>
+<details class="quiz"><summary>Nightly backups run at 01:00. The database is corrupted by a bad script at 22:30 and you have no replicas or WAL archive. What is your effective RPO? How could you reduce it?</summary>
+<p>You must restore the 01:00 backup, losing <strong>21.5 hours</strong> of data. Add continuous WAL archiving (point-in-time recovery, RPO of seconds), more frequent snapshots, and/or a delayed replica.</p></details>
+<details class="quiz"><summary>A user in Germany (home region EU) edits their bio, then opens their profile and sees the old bio. What is this anomaly and how would you fix it?</summary>
+<p>A <strong>read-your-writes</strong> violation: the read hit a replica (or cache) that hadn't yet received the write. Fixes: route the user's reads of their own data to the home primary for a short window after a write; or include a replication position token from the write and only read from replicas that have caught up; or update the cache synchronously on write.</p></details>
+<details class="quiz"><summary>Which DR strategy fits each: (a) internal HR reporting tool, (b) Instagram feed API, (c) a payments ledger requiring zero data loss?</summary>
+<p>(a) <strong>Backup &amp; restore</strong> — hours of downtime are fine, cost matters. (b) <strong>Multi-site active-active</strong> — global users, minutes of downtime are costly. (c) Active-active or warm standby with <strong>synchronous/quorum replication</strong> across nearby regions (RPO = 0), accepting extra write latency.</p></details>
+<details class="quiz"><summary>During a failover you promote the EU replica to primary, but the old US primary comes back online 5 minutes later and starts accepting writes. What happened and how do you prevent it?</summary>
+<p><strong>Split brain</strong> — two primaries accepting divergent writes. Prevent it with fencing: leases or epoch/term numbers checked by the storage layer, revoking credentials or network access of the old primary, and STONITH-style shutdown before promotion; clients and proxies should only route to the primary recorded in a consensus-backed directory.</p></details>
+<details class="quiz"><summary>Cross-region async replication lag is normally 300 ms but grows to 4 minutes during a write spike. Why does this matter for DR, and what would you do?</summary>
+<p>Lag <em>is</em> your current RPO: a region loss during the spike would lose ~4 minutes of writes. Alert on lag thresholds, add replication bandwidth/parallel apply, throttle non-critical bulk writes (backfills, migrations) to protect replication, and consider synchronous/quorum replication for the most critical data.</p></details>
+<details class="quiz"><summary>Does GDPR require that EU users' data never leaves the EU?</summary>
+<p>Not literally — GDPR restricts <strong>transfers</strong> outside the EEA unless a legal mechanism and adequate safeguards apply. But legal uncertainty (e.g. Schrems II, the large 2023 fine against Meta) pushes companies toward keeping EU personal data in EU regions, encrypting with in-region keys, and minimising what crosses borders.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Multi-region is for <strong>disaster survival, latency and compliance</strong>; the hard part is always the <strong>data</strong>.</li>
+    <li>Express goals as <strong>RPO</strong> (data loss) and <strong>RTO</strong> (downtime); pick backup &amp; restore, pilot light, warm standby or active-active per system.</li>
+    <li>Async replication = small RPO and lag anomalies; sync/quorum = RPO 0 but slower writes. Avoid conflicts with a <strong>home region per user</strong>; otherwise use LWW, CRDTs or app rules.</li>
+    <li>Steer traffic with <strong>GeoDNS, anycast and edge proxies</strong>; keep <strong>(N−1)/N headroom</strong>; rehearse failover/failback with <strong>drills</strong>.</li>
+    <li><strong>Cells</strong> shrink blast radius; <strong>replication is not backup</strong> — keep 3-2-1 backups and test restores.</li>
+    <li>Instagram went from a single AWS region (2012 outage) to Facebook's data centers (2014) to multi-data-center active deployments.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="replication.html">Replication</a> — leader/follower, quorum and lag fundamentals</li>
+  <li><a href="cap-consistency.html">CAP, PACELC &amp; Consistency</a> — the theory behind cross-region trade-offs</li>
+  <li><a href="sharding.html">Sharding</a> — shards are the unit of placement and failover</li>
+  <li><a href="dns.html">DNS</a> and <a href="cdn.html">CDN</a> — global traffic steering and edge serving</li>
+  <li><a href="resilience-patterns.html">Resilience patterns</a> — chaos engineering, load shedding during failover</li>
+  <li><a href="security.html">Security &amp; Privacy</a> — GDPR rights, encryption keys and deletion across regions</li>
+  <li><a href="observability.html">Monitoring, Logging &amp; Tracing</a> — detecting regional failures and replication lag</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

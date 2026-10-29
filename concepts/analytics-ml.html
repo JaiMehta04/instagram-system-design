@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Analytics, Data Pipelines &amp; ML Ranking — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="analytics-ml">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>Every tap, scroll, like and video view becomes an <strong>event</strong>. Events flow through <a href="message-queues.html">Kafka</a> into a <strong>data lake / warehouse</strong>, where they power dashboards, experiments and machine-learning models.</li>
+    <li><strong>OLTP</strong> databases (PostgreSQL, Cassandra) serve the live app one row at a time; <strong>OLAP</strong> systems (columnar warehouses) answer questions over billions of rows. They are different tools for different jobs.</li>
+    <li><strong>Batch</strong> processing (Spark, Hive, Presto) computes exact answers over huge historical data hours later; <strong>stream</strong> processing (Flink, Kafka Streams) computes approximate-to-exact answers seconds later using <em>windows</em> and <em>watermarks</em>. Lambda runs both; Kappa runs only streams.</li>
+    <li>Product health is measured with <strong>DAU/MAU, retention cohorts</strong> and changes are proven with <strong>A/B tests</strong>, not opinions.</li>
+    <li>Feed and Explore ranking is a <strong>multi-stage funnel</strong>: candidate generation → lightweight ranking → heavy ranking → re-ranking, using features from a <strong>feature store</strong>, models trained <em>offline</em> and served <em>online</em> inside a tight latency budget.</li>
+    <li>Explore uses <strong>embeddings</strong>, <strong>two-tower models</strong> and <strong>approximate nearest-neighbour search</strong>; you must also handle <strong>cold start</strong>, <strong>feedback loops</strong>, <strong>filter bubbles</strong> and <strong>integrity</strong>.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why does Instagram need data pipelines and ML?</h2>
+<p>Everything you have seen so far in this guide — <a href="media-upload.html">uploads</a>, <a href="news-feed.html">feeds</a>, <a href="likes-comments.html">likes</a>, <a href="direct-messaging.html">messages</a> — is about <em>serving</em> users right now. But a product with billions of users also needs to <strong>learn</strong> from what those users do:</p>
+<ul>
+  <li><strong>"Is the product healthy?"</strong> How many people opened the app today? Are new users still around a month later?</li>
+  <li><strong>"Did our change help?"</strong> Does a bigger like button increase engagement or just annoy people? You need a controlled experiment on millions of users.</li>
+  <li><strong>"What should each person see?"</strong> Users follow hundreds of accounts that post far more than anyone can scroll, and Explore must pick a few dozen posts out of <em>billions</em>. Pure time order buries your best friend's wedding photo under 40 meme posts.</li>
+</ul>
+<p>The live databases can't answer these. The <a href="databases.html">User DB</a> and the Cassandra post store fetch <em>one user's</em> rows in a millisecond; "average session length per country over 90 days" would scan every row for hours and slow the app for everyone. So Instagram builds a <strong>parallel world</strong>: an analytics and ML platform fed by a copy of everything that happens. In the main diagram this is the <em>Analytics &amp; ML Training</em> consumer on Kafka, whose trained ranking models flow back into the <a href="news-feed.html">News Feed Service</a> and Explore.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  Think of a large supermarket chain. The <strong>checkout tills</strong> (OLTP) must process each customer's basket instantly and correctly. Every receipt is also copied to <strong>head office</strong> (the data warehouse), where analysts look at millions of receipts to answer "which products sell together?" and "did the new store layout increase sales?" (A/B tests). Finally, the head office uses those patterns to <strong>decide what to put at the end of each aisle</strong> for each store (ranking/recommendation). The tills never wait for head office — the analysis happens on a copy, slightly later.
+</div>
+
+<div class="diagram">
+<svg viewBox="0 0 860 300" width="860" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-aml-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600">
+    <rect x="15" y="40" width="120" height="44" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="75" y="67" text-anchor="middle">📱 App events</text>
+    <rect x="15" y="130" width="120" height="44" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="75" y="157" text-anchor="middle">Service events</text>
+    <rect x="15" y="220" width="120" height="44" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="75" y="240" text-anchor="middle">DB snapshots</text><text x="75" y="256" text-anchor="middle" font-weight="400" font-size="11">/ CDC</text>
+    <rect x="185" y="105" width="120" height="90" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="245" y="145" text-anchor="middle">Kafka</text><text x="245" y="163" text-anchor="middle" font-weight="400" font-size="11">event bus</text>
+    <rect x="360" y="40" width="150" height="50" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="435" y="61" text-anchor="middle">Stream processing</text><text x="435" y="78" text-anchor="middle" font-weight="400" font-size="11">Flink: seconds</text>
+    <rect x="360" y="200" width="150" height="50" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="435" y="221" text-anchor="middle">Data lake</text><text x="435" y="238" text-anchor="middle" font-weight="400" font-size="11">Parquet on S3/HDFS</text>
+    <rect x="560" y="200" width="140" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="630" y="221" text-anchor="middle">Batch (Spark)</text><text x="630" y="238" text-anchor="middle" font-weight="400" font-size="11">hours</text>
+    <rect x="560" y="40" width="140" height="50" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="630" y="61" text-anchor="middle">Feature store</text><text x="630" y="78" text-anchor="middle" font-weight="400" font-size="11">online + offline</text>
+    <rect x="740" y="20" width="105" height="44" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="792" y="40" text-anchor="middle" font-size="12">Feed/Explore</text><text x="792" y="56" text-anchor="middle" font-weight="400" font-size="11">online inference</text>
+    <rect x="740" y="120" width="105" height="44" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="792" y="140" text-anchor="middle">ML training</text><text x="792" y="156" text-anchor="middle" font-weight="400" font-size="11">GPU cluster</text>
+    <rect x="740" y="225" width="105" height="44" rx="8" fill="#eceff1" stroke="#455a64"/><text x="792" y="245" text-anchor="middle">Dashboards</text><text x="792" y="261" text-anchor="middle" font-weight="400" font-size="11">A/B results</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-aml-1)">
+    <path d="M135,62 L183,125"/><path d="M135,152 L183,152"/><path d="M135,242 L183,180"/>
+    <path d="M305,130 L358,70"/><path d="M305,170 L358,222"/>
+    <path d="M510,225 L558,225"/><path d="M510,65 L558,65"/>
+    <path d="M700,215 L738,155"/><path d="M700,240 L738,245"/><path d="M630,200 L630,92"/>
+    <path d="M700,55 L738,45"/><path d="M792,120 L792,66"/>
+  </g>
+  <text x="702" y="110" font-size="10.5" fill="#555">models</text>
+</svg>
+<div class="caption">The analytics &amp; ML world: events flow through Kafka into a stream path (seconds) and a lake/batch path (hours). Both feed features, dashboards and model training; trained models are served back to Feed and Explore.</div>
+</div>
+
+<h2>2. Event logging: the raw material</h2>
+
+<h3>2.1 What is an event?</h3>
+<p>An <strong>event</strong> is an immutable record that "something happened at time T". A database row holds <em>current</em> state ("post 42 has 1,203 likes"); events hold <em>history</em> ("user 7 liked post 42 at 10:03:11"). History can rebuild state, never the reverse — which is why analytics systems love events.</p>
+<pre><code>{
+  "event_id":    "8b1f0c2e-6a1d-4c3e-9e7a-2f6b1d9c0a11",   // UUID → lets consumers de-duplicate
+  "event_name":  "feed_media_impression",
+  "event_time":  "2026-10-23T09:12:44.318Z",              // when it happened on the device
+  "server_time": "2026-10-23T09:12:47.902Z",              // when the server received it
+  "user_id":     184467440737,
+  "device":      {"os": "android", "app_version": "312.0.0", "country": "IN"},
+  "session_id":  "s-55f1…",
+  "props":       {"media_id": 3192…, "author_id": 9921…, "position": 4,
+                  "surface": "home_feed", "view_ms": 2350, "experiment_ids": [881, 1204]}
+}</code></pre>
+
+<h3>2.2 Client events vs service events</h3>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Client (app/web) events</th><th>Server / service events</th></tr>
+  <tr><td><b>Examples</b></td><td>Impressions ("post was on screen for 2.3 s"), scrolls, taps, video watch time, app start time, crashes.</td><td>Post created, like written, follow added, login, API latency, ranking decisions ("these 500 candidates were scored").</td></tr>
+  <tr><td><b>Only knowable where?</b></td><td>Only the device knows what was actually <em>seen</em> and for how long.</td><td>Only the server knows authoritative outcomes (did the write succeed?).</td></tr>
+  <tr><td><b>Reliability</b></td><td>Lossy: phones go offline, apps get killed, clocks are wrong, events can be duplicated on retry.</td><td>Reliable: produced by our own code in the data center, published to <a href="message-queues.html">Kafka</a>.</td></tr>
+  <tr><td><b>Trust</b></td><td>Untrusted — can be forged by bots. Never use for billing or security decisions without validation.</td><td>Trusted.</td></tr>
+</table></div>
+
+<h3>2.3 How client events travel</h3>
+<div class="flow">
+  <div class="fnode client">📱 App<small>buffer on disk</small></div><div class="farrow">→<small>batch every ~30 s, gzip</small></div>
+  <div class="fnode edge">Logging endpoint<small>behind LB / gateway</small></div><div class="farrow">→<small>validate schema</small></div>
+  <div class="fnode async">Kafka<small>topic per event family</small></div><div class="farrow">→<small>consumers</small></div>
+  <div class="fnode store">Data lake<small>hourly partitions</small></div>
+</div>
+<ul>
+  <li><strong>Batch and compress on the device.</strong> One HTTP request per scroll event would drain batteries and flood the <a href="load-balancer.html">load balancers</a>; apps buffer events in a local file and upload batches.</li>
+  <li><strong>Persist before sending.</strong> Failed uploads stay on disk and are retried — so the pipeline is <em>at-least-once</em>, and <code>event_id</code> lets downstream jobs drop duplicates.</li>
+  <li><strong>Two timestamps.</strong> Analyse by <code>event_time</code>, but device clocks can be wrong by hours; <code>server_time</code> lets you detect skew. Events can arrive <em>days</em> late (a phone offline on a flight) — see watermarks below.</li>
+  <li><strong>Schemas.</strong> Every event type has a declared schema (Avro/Protobuf/Thrift) in a registry; malformed events are quarantined so one buggy app version can't poison every table. Evolution rule: only add optional fields, never change a field's meaning.</li>
+  <li><strong>Sampling.</strong> Ultra-high-volume, low-value telemetry may be sampled at 1% (multiply counts by 100); business-critical events are never sampled.</li>
+  <li><strong>Privacy at the source.</strong> Log IDs, not content; never log passwords or message bodies; tag fields by sensitivity for deletion/retention (see <a href="security.html">Security &amp; Privacy</a>).</li>
+</ul>
+<p>Rough volume (assumption): 500M daily users × ~1,000 events each (impressions are the bulk) = <strong>500 billion events/day</strong>. At ~200 bytes each after compression that's ~100 TB/day of raw logs, or ~1.2 GB/s on average. This is why the transport is <a href="message-queues.html">Kafka</a>-style partitioned logs and the storage is cheap <a href="object-storage.html">object storage</a>, not a relational database.</p>
+
+<div class="callout tip"><span class="callout-title">💡 Change data capture (CDC)</span>
+Not every analytical table comes from events. To get the <em>state</em> of the User DB into the warehouse, you either take nightly snapshots (dump each <a href="sharding.html">shard</a>, load it) or use <strong>CDC</strong>: tail the database's replication log (PostgreSQL WAL, MySQL binlog) and publish each row change to Kafka (e.g. with Debezium). CDC gives near-real-time copies without querying the production database.</div>
+
+<h2>3. OLTP vs OLAP and columnar storage</h2>
+
+<h3>3.1 Two very different workloads</h3>
+<div class="table-wrap"><table>
+  <tr><th></th><th>OLTP — Online Transaction Processing</th><th>OLAP — Online Analytical Processing</th></tr>
+  <tr><td><b>Typical query</b></td><td><code>SELECT * FROM users WHERE id = 42</code>; insert one like.</td><td><code>SELECT country, AVG(session_sec) FROM sessions WHERE day &gt;= … GROUP BY country</code></td></tr>
+  <tr><td><b>Rows touched</b></td><td>1 – 100</td><td>Millions to trillions</td></tr>
+  <tr><td><b>Columns touched</b></td><td>All columns of a few rows</td><td>A few columns of all rows</td></tr>
+  <tr><td><b>Latency target</b></td><td>Milliseconds</td><td>Seconds to minutes (hours for big batch jobs)</td></tr>
+  <tr><td><b>Storage layout</b></td><td>Row-oriented (B-tree / LSM), current state, frequent updates</td><td>Column-oriented, compressed, append-only history</td></tr>
+  <tr><td><b>Instagram examples</b></td><td>User DB (PostgreSQL), post/comment store (Cassandra), <a href="caching.html">Redis</a></td><td>Hive/Presto tables over the data lake, Spark jobs, real-time OLAP (Druid/Pinot-like)</td></tr>
+</table></div>
+<p>Running analytics on OLTP databases is a classic mistake: one analyst's full-table scan evicts the hot working set from the buffer cache and makes the live app slow. Keep them separate and copy data across (events, CDC, snapshots). See <a href="databases.html">Databases</a> and <a href="indexing.html">Indexing &amp; Storage Engines</a> for the OLTP side.</p>
+
+<h3>3.2 Row vs column layout</h3>
+<p>Imagine a <code>impressions</code> table with columns <code>(user_id, media_id, country, view_ms, ts)</code>. A row store keeps each row's fields together on disk; a column store keeps each column's values together:</p>
+<pre class="ascii">
+ROW-ORIENTED (good for "give me row 2")
+  [u1, m9, IN, 2350, t1] [u2, m4, BR, 800, t2] [u3, m9, IN, 4100, t3] ...
+
+COLUMN-ORIENTED (good for "average view_ms by country")
+  user_id : u1   u2   u3   u4   ...
+  media_id: m9   m4   m9   m7   ...
+  country : IN   BR   IN   IN   ...   → dictionary + run-length: {IN:0,BR:1} 0 1 0 0 ...
+  view_ms : 2350 800  4100 1200 ...   → delta / bit-packed integers
+  ts      : t1   t2   t3   t4   ...
+</pre>
+<p>Why columns win for analytics:</p>
+<ol>
+  <li><strong>Read only what you need.</strong> 2 of 5 columns here; real tables have 100+ columns, so savings are often 95%+.</li>
+  <li><strong>Dramatic compression.</strong> Similar, repeated values compress 5–20× with dictionary, run-length and bit-packing encodings.</li>
+  <li><strong>Skip whole blocks.</strong> Per-block min/max statistics let <code>day = '2026-10-22'</code> skip non-matching blocks.</li>
+  <li><strong>Vectorised execution.</strong> SIMD over tight arrays of one type is far faster than walking mixed rows.</li>
+</ol>
+<p><strong>Worked example (assumption):</strong> 1 trillion impression rows × 120 columns × ~8 bytes ≈ 960 TB raw. A query needs 3 columns → 24 TB; with 8× compression → 3 TB; with partition pruning to one day of 90 retained → ~33 GB actually read. Spread across 1,000 workers that's 33 MB each — seconds, not days. The cost: writing or updating a single row is awkward (you'd touch 120 column files), which is why columnar stores are append-heavy and batch-loaded.</p>
+
+<h2>4. Data lake vs data warehouse (and the lakehouse)</h2>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Data lake</th><th>Data warehouse</th></tr>
+  <tr><td><b>What it is</b></td><td>Cheap object storage (S3/HDFS) holding files in open formats (Parquet, ORC, Avro, JSON) — raw and processed.</td><td>A managed analytical database with its own optimised storage, SQL engine and catalog (Snowflake, BigQuery, Redshift).</td></tr>
+  <tr><td><b>Schema</b></td><td><em>Schema-on-read</em>: store anything, interpret when querying.</td><td><em>Schema-on-write</em>: data must fit table definitions on load.</td></tr>
+  <tr><td><b>Data types</b></td><td>Structured, semi-structured, unstructured (images, model checkpoints).</td><td>Mostly structured tables.</td></tr>
+  <tr><td><b>Cost / scale</b></td><td>Lowest $/TB; effectively unlimited. Risk: a "data swamp" without catalog and ownership.</td><td>Higher $/TB; compute often billed per query.</td></tr>
+</table></div>
+<p>The modern compromise is the <strong>lakehouse</strong>: Parquet on object storage plus a <em>table format</em> (Apache Iceberg, Delta Lake, Hudi) adding ACID commits, schema evolution, time travel and row-level deletes (essential for <a href="security.html">GDPR deletion</a>), readable by Spark, Trino and Flink alike.</p>
+<p><strong>Partitioning</strong> is the key lake design choice: <code>/impressions/ds=2026-10-22/hour=09/part-0001.parquet</code> lets date-filtered queries read only matching directories. Avoid too many tiny files (the "small files problem"); compaction jobs merge them. A common layering is <strong>raw/bronze</strong> (as received) → <strong>clean/silver</strong> (deduplicated, validated, bots filtered) → <strong>aggregated/gold</strong> (daily metrics, feature tables, experiment results).</p>
+
+<h2>5. Batch processing</h2>
+
+<h3>5.1 MapReduce intuition</h3>
+<p>Problem: count likes per post for yesterday from 20 TB of like events. One machine reading at 200 MB/s would take ~28 hours. Split the work across 1,000 machines and it takes under 2 minutes of reading — but you must combine partial counts correctly. <strong>MapReduce</strong> (Google, 2004; open-sourced as Hadoop) gave a simple recipe:</p>
+<ol class="steps">
+  <li><strong>Map:</strong> each worker reads a chunk of input and emits <code>(key, value)</code> pairs — here <code>(post_id, 1)</code> per like.</li>
+  <li><strong>Shuffle:</strong> the framework routes all pairs with the same key to the same reducer, by <code>hash(key) mod R</code> — the same idea as <a href="sharding.html">hash sharding</a>. This network-heavy step is usually the bottleneck.</li>
+  <li><strong>Reduce:</strong> each reducer sums the values for its keys and writes output files.</li>
+</ol>
+<pre><code>map(like_event):
+    emit(like_event.post_id, 1)
+
+combine(post_id, counts):          # optional local pre-aggregation on the mapper
+    emit(post_id, sum(counts))     # sends (p42, 917) instead of 917 × (p42, 1)
+
+reduce(post_id, counts):
+    emit(post_id, sum(counts))</code></pre>
+<p>Workers are stateless and inputs immutable, so failed tasks are simply re-run elsewhere — free fault tolerance. The weakness is <strong>skew</strong>: a celebrity post with 30M likes sends 30M pairs to one reducer, the straggler for the whole job. Fixes: combiners, "salting" hot keys (<code>p42#0…p42#9</code>, then re-aggregate), broadcast joins.</p>
+
+<h3>5.2 The modern batch engines</h3>
+<div class="table-wrap"><table>
+  <tr><th>Engine</th><th>Idea</th><th>When to use</th></tr>
+  <tr><td><b>Hadoop MapReduce</b></td><td>Map → shuffle → reduce, writing intermediates to disk between stages.</td><td>Historic; learn it for intuition.</td></tr>
+  <tr><td><b>Apache Hive</b></td><td>SQL compiled into batch jobs over HDFS/S3 files; introduced the metastore catalog. Created at Facebook.</td><td>Scheduled SQL ETL; its metastore is still the standard catalog.</td></tr>
+  <tr><td><b>Apache Spark</b></td><td>In-memory DAG of transformations; DataFrame/SQL API; MLlib.</td><td>The default for big ETL and ML data prep.</td></tr>
+  <tr><td><b>Presto / Trino</b></td><td>Pipelined in-memory MPP SQL, no intermediate disk writes. Created at Facebook for interactive queries.</td><td>Ad-hoc analysis over the lake in seconds–minutes.</td></tr>
+</table></div>
+<p>A typical daily pipeline is a DAG run by a scheduler such as Airflow: wait for yesterday's partitions → clean → join dimensions → compute metrics, experiment results, training sets. Each step is <strong>idempotent</strong> (re-running <code>ds=2026-10-22</code> overwrites that partition), making <strong>backfills</strong> after bug fixes safe.</p>
+
+<h2>6. Stream processing</h2>
+<p>Batch answers arrive hours later. Some questions can't wait: "Is this post going viral?" (pre-warm the <a href="cdn.html">CDN</a>), "Has this account liked 500 posts in 2 minutes?" (spam), trending hashtags for <a href="search.html">Search</a>, or fresh interest features for the next feed refresh. <strong>Stream processors</strong> consume Kafka topics continuously and update results incrementally.</p>
+
+<h3>6.1 Engines</h3>
+<ul>
+  <li><strong>Apache Flink</strong> — distributed stream processor with large managed state (RocksDB), event-time windows, watermarks and exactly-once state via checkpoints. The usual choice for serious real-time pipelines.</li>
+  <li><strong>Kafka Streams</strong> — a Java <em>library</em> embedded in your service, state in local RocksDB backed by Kafka changelog topics. Simple when input and output are both Kafka.</li>
+  <li><strong>Spark Structured Streaming</strong> — micro-batches every few hundred ms to seconds with the Spark API.</li>
+</ul>
+
+<h3>6.2 Event time vs processing time</h3>
+<p><strong>Event time</strong> = when it happened on the device; <strong>processing time</strong> = when the processor sees it. Counting likes per minute by processing time, a 5-minute consumer lag looks like likes dropping to zero then spiking — a lie. Group by event time — but how long do you wait for stragglers?</p>
+
+<h3>6.3 Windows</h3>
+<pre class="ascii">
+time ─────────────────────────────────────────────────────────────►
+events:   x  x   x x     x        x  x x x            x     x
+
+TUMBLING (fixed, non-overlapping, e.g. 1 min)
+          |── w1 ──|── w2 ──|── w3 ──|── w4 ──|── w5 ──|
+
+SLIDING / HOPPING (size 2 min, slide 1 min → overlapping)
+          |──── w1 ────|
+                   |──── w2 ────|
+                            |──── w3 ────|
+
+SESSION (gap-based: window closes after 30 s of inactivity per user)
+          |─ s1 ──────|       |─ s2 ───────|        |─ s3 ──────|
+</pre>
+<ul>
+  <li><strong>Tumbling</strong>: "likes per post per minute" — each event belongs to exactly one window.</li>
+  <li><strong>Sliding/hopping</strong>: "likes in the last 10 minutes, updated every minute" — smooth trending scores.</li>
+  <li><strong>Session</strong>: "how long was each app session?" — windows are defined by gaps in a user's activity.</li>
+</ul>
+
+<h3>6.4 Watermarks and late data</h3>
+<p>A <strong>watermark</strong> is the stream processor's declaration: "I believe I have now seen all events with event time ≤ W." It typically trails the maximum observed event time by an allowed lateness, e.g. <code>W = max_event_time_seen − 2 minutes</code>. When the watermark passes the end of a window, the window is <strong>closed</strong> and its result emitted.</p>
+<pre class="ascii">
+ window [09:00, 09:01)        watermark = max event time − 2 min
+ ─────────────────────────────────────────────────────────────────
+ 09:00:10 event (on time)          → added to window
+ 09:02:30 max seen → W = 09:00:30  → window still open
+ 09:03:05 max seen → W = 09:01:05  → W ≥ 09:01 → EMIT count, close window
+ 09:03:20 a 09:00:40 event arrives → LATE: drop, send to side output,
+                                     or update result if "allowed lateness"
+</pre>
+<p>The trade-off is explicit: a <em>larger</em> watermark delay gives more complete results but higher latency; a smaller one gives fast but less complete results. Very late events (hours) are typically left to the batch layer, which recomputes exact numbers later.</p>
+
+<h3>6.5 Exactly-once (really "effectively once")</h3>
+<p>Kafka delivers at-least-once. Flink achieves <em>exactly-once state</em> by checkpointing operator state together with the matching Kafka offsets and rewinding both on failure. External outputs also need transactional sinks or <strong>idempotent writes</strong> (<code>SET count[post][minute] = 917</code>, not <code>INCR</code>) — see <a href="resilience-patterns.html">Resilience</a>.</p>
+
+<h2>7. Lambda vs Kappa architectures</h2>
+<div class="diagram">
+<svg viewBox="0 0 860 330" width="860" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-aml-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <text x="20" y="22" font-weight="700">LAMBDA</text>
+  <text x="20" y="190" font-weight="700">KAPPA</text>
+  <g font-weight="600">
+    <rect x="20" y="70" width="110" height="44" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="75" y="97" text-anchor="middle">Kafka events</text>
+    <rect x="190" y="35" width="170" height="44" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="275" y="55" text-anchor="middle">Batch layer</text><text x="275" y="71" text-anchor="middle" font-weight="400" font-size="11">Spark over full history</text>
+    <rect x="190" y="105" width="170" height="44" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="275" y="125" text-anchor="middle">Speed layer</text><text x="275" y="141" text-anchor="middle" font-weight="400" font-size="11">Flink, recent data only</text>
+    <rect x="420" y="35" width="150" height="44" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="495" y="55" text-anchor="middle">Batch views</text><text x="495" y="71" text-anchor="middle" font-weight="400" font-size="11">exact, hours old</text>
+    <rect x="420" y="105" width="150" height="44" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="495" y="125" text-anchor="middle">Real-time views</text><text x="495" y="141" text-anchor="middle" font-weight="400" font-size="11">approx., seconds old</text>
+    <rect x="640" y="70" width="190" height="44" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="735" y="90" text-anchor="middle">Serving layer</text><text x="735" y="106" text-anchor="middle" font-weight="400" font-size="11">merge batch + real-time</text>
+    <rect x="20" y="240" width="110" height="44" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="75" y="260" text-anchor="middle">Kafka log</text><text x="75" y="276" text-anchor="middle" font-weight="400" font-size="11">long retention</text>
+    <rect x="190" y="240" width="170" height="44" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="275" y="260" text-anchor="middle">Stream job v1</text><text x="275" y="276" text-anchor="middle" font-weight="400" font-size="11">one code path</text>
+    <rect x="190" y="292" width="170" height="34" rx="8" fill="#f3e5f5" stroke="#6a1b9a" stroke-dasharray="5 3"/><text x="275" y="314" text-anchor="middle" font-weight="400" font-size="11">v2 replays from offset 0</text>
+    <rect x="420" y="240" width="150" height="44" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="495" y="267" text-anchor="middle">Serving table</text>
+    <rect x="640" y="240" width="190" height="44" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="735" y="260" text-anchor="middle">Queries</text><text x="735" y="276" text-anchor="middle" font-weight="400" font-size="11">switch to v2 when caught up</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-aml-2)">
+    <path d="M130,85 L188,60"/><path d="M130,100 L188,125"/>
+    <path d="M360,57 L418,57"/><path d="M360,127 L418,127"/>
+    <path d="M570,57 L638,85"/><path d="M570,127 L638,100"/>
+    <path d="M130,262 L188,262"/><path d="M130,275 L188,305"/>
+    <path d="M360,262 L418,262"/><path d="M360,308 L418,272"/><path d="M570,262 L638,262"/>
+  </g>
+</svg>
+<div class="caption">Lambda runs two pipelines (batch for correctness, speed for freshness) and merges them. Kappa runs a single streaming pipeline and handles reprocessing by replaying the retained log.</div>
+</div>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Lambda</th><th>Kappa</th></tr>
+  <tr><td><b>Pipelines</b></td><td>Two: batch + streaming, merged at query time.</td><td>One: streaming; reprocess by replaying the log into a new job version.</td></tr>
+  <tr><td><b>Strength</b></td><td>Batch is simple, exact, can recompute anything.</td><td>One codebase and semantics; no drift.</td></tr>
+  <tr><td><b>Weakness</b></td><td>Same logic written twice (Spark + Flink) — they diverge.</td><td>Needs long log retention and a stream engine strong enough for huge replays.</td></tr>
+</table></div>
+<p>Most large companies run hybrids: streaming for fresh features and counters, batch for canonical daily metrics, training and backfills.</p>
+
+<h2>8. ETL vs ELT</h2>
+<div class="table-wrap"><table>
+  <tr><th></th><th>ETL — Extract, Transform, Load</th><th>ELT — Extract, Load, Transform</th></tr>
+  <tr><td><b>Order</b></td><td>Transform on a separate tier, then load clean data.</td><td>Load raw data into the lake/warehouse, then transform there with SQL (e.g. dbt).</td></tr>
+  <tr><td><b>Raw data kept?</b></td><td>Often not — a buggy transform may lose the original.</td><td>Yes — re-transform history any time.</td></tr>
+  <tr><td><b>Good when</b></td><td>Sensitive fields must be removed <em>before</em> landing, or storage is expensive.</td><td>Storage is cheap and compute elastic (the modern default).</td></tr>
+</table></div>
+<p>Instagram-like systems mostly do ELT into the lake — but drop or pseudonymise unneeded personal fields at ingestion (a little "T" before the "L").</p>
+
+<h2>9. Product metrics: measuring health</h2>
+
+<h3>9.1 Active users and stickiness</h3>
+<ul>
+  <li><strong>DAU</strong> (daily active users): distinct users who did a precisely defined qualifying action on a day ("opened the app" vs "viewed a post" can differ by tens of millions).</li>
+  <li><strong>MAU</strong> (monthly active users): distinct users active at least once in the trailing 28/30 days.</li>
+  <li><strong>Stickiness = DAU / MAU.</strong> Assume DAU = 500M and MAU = 800M → 62.5%: the average monthly user shows up ~19 of 30 days. Social apps aim for 50%+.</li>
+</ul>
+<p>Exact distinct counts come from daily batch jobs; real-time dashboards use <strong>HyperLogLog</strong> sketches (~12 KB each, ~1–2% error, mergeable across days).</p>
+
+<h3>9.2 Retention and cohorts</h3>
+<p><strong>Retention</strong> asks "of the users who signed up (or were active) in period X, what fraction is still active N days later?" Group users into <strong>cohorts</strong> by signup week and track each cohort:</p>
+<div class="table-wrap"><table>
+  <tr><th>Signup cohort (assumed data)</th><th>Users</th><th>D1</th><th>D7</th><th>D30</th></tr>
+  <tr><td>Week of 1 Sep</td><td>2.0M</td><td>58%</td><td>41%</td><td>30%</td></tr>
+  <tr><td>Week of 8 Sep</td><td>2.1M</td><td>57%</td><td>40%</td><td>29%</td></tr>
+  <tr><td>Week of 15 Sep (new onboarding)</td><td>2.2M</td><td>63%</td><td>46%</td><td>34%</td></tr>
+</table></div>
+<p>A flattening curve (D30 ≈ D60 ≈ D90) means the product has found users who stay. Cohorts prevent a classic trap: total DAU can grow (marketing brings new users) while every cohort retains worse than the last. Other common metrics: time spent, sessions per user, % of users who post (the supply side of a social network), and crash-free sessions (see <a href="observability.html">Observability</a>).</p>
+<p>Teams usually pick a <strong>north-star metric</strong> that captures long-term value (e.g. "meaningful daily engagement") plus <strong>guardrail metrics</strong> that must not get worse (crash rate, reports of bad content, latency, unfollows). A change that increases time spent by showing more outrage-bait but also increases "hide"/"report" rates fails its guardrails.</p>
+
+<h2>10. A/B testing and experimentation</h2>
+<p>An <strong>A/B test</strong> (online controlled experiment) randomly splits users into a <strong>control</strong> group (current product, A) and one or more <strong>treatment</strong> groups (B). Because assignment is random, the only systematic difference between groups is the change — so a metric difference beyond random noise is <em>caused</em> by the change. This is how you answer "did the bigger like button help?" without guessing.</p>
+
+<h3>10.1 Assigning users</h3>
+<pre><code>def assign(user_id, experiment):
+    # deterministic: same user always lands in the same bucket, no DB lookup needed
+    bucket = murmurhash(f"{experiment.salt}:{user_id}") % 1000      # 0..999
+    if bucket &lt; experiment.control_buckets:   return "control"      # e.g. 0..49   = 5%
+    if bucket &lt; experiment.treatment_buckets: return "treatment"    # e.g. 50..99  = 5%
+    return "not_in_experiment"</code></pre>
+<ul>
+  <li><strong>Randomisation unit</strong>: usually the user (consistent experience across sessions), not the request.</li>
+  <li><strong>Per-experiment salt</strong>: experiments shuffle users independently, so many can run on overlapping users ("layers").</li>
+  <li><strong>Exposure logging</strong>: log when the user actually encounters the change (the <code>experiment_ids</code> field above) and join metrics to exposures.</li>
+</ul>
+
+<h3>10.2 Reading the result: significance, power, sample size</h3>
+<p>Suppose control users comment on 10.0% of days and treatment users on 10.1%. Is +1% relative real, or noise? Statistics answers with a <strong>p-value</strong>: the probability of seeing a difference at least this big if the change truly did nothing. By convention p &lt; 0.05 is "statistically significant". <strong>Power</strong> (often 80%) is the probability you detect a real effect of a given size.</p>
+<p>A handy rule of thumb for 80% power at α = 0.05 is <code>n per group ≈ 16 × σ² / δ²</code>, where σ² is the metric's variance and δ the absolute effect you want to detect. For a yes/no metric with p = 0.10, σ² = p(1−p) = 0.09:</p>
+<pre><code>Detect δ = 0.001 (10.0% → 10.1%, a 1% relative lift):
+  n ≈ 16 × 0.09 / 0.001² = 1,440,000 users per group
+Detect δ = 0.0001 (0.1% relative lift):
+  n ≈ 144,000,000 users per group   ← 100× more, because n ∝ 1/δ²</code></pre>
+<p>That 1/δ² is why Instagram-scale companies can measure tiny improvements that a startup never could — and why even they need variance-reduction techniques like <strong>CUPED</strong> (using each user's pre-experiment behaviour to cancel out noise).</p>
+
+<h3>10.3 Experimentation pitfalls</h3>
+<ul>
+  <li><strong>Peeking</strong>: stopping the moment p &lt; 0.05 inflates false positives. Fix the duration up front (or use sequential tests).</li>
+  <li><strong>Multiple comparisons</strong>: test 40 metrics and ~2 will be "significant" by chance. Pre-register a primary metric.</li>
+  <li><strong>Novelty effects</strong>: users click a shiny new button for a week, then stop. Run 2+ weeks and check the trend.</li>
+  <li><strong>Sample ratio mismatch (SRM)</strong>: configured 50/50, got 50.6/49.4 over millions of users → something (crash, logging bug) drops users from one arm; results are untrustworthy.</li>
+  <li><strong>Network effects</strong>: treatment users interact with control users (more comments sent → control receives more), shrinking the measured difference. Fix with <em>cluster randomisation</em> (friend-clusters or countries).</li>
+  <li><strong>Holdouts</strong>: keep ~1% of users without a quarter's launches to measure the cumulative long-term effect.</li>
+</ul>
+
+<h2>11. ML ranking: the multi-stage pipeline</h2>
+<p>For each feed request, the <a href="news-feed.html">News Feed Service</a> has a candidate pool of perhaps a few thousand unseen posts from accounts the user follows (plus, today, suggested posts). For Explore and Reels, the pool is effectively <em>all public content</em> — billions of items. Running a large neural network that takes ~1 ms of compute per item over billions of items for every request is impossible. The solution is a <strong>funnel</strong>: cheap methods shrink the pool, expensive methods order the survivors.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 860 330" width="860" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-aml-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600">
+    <rect x="30" y="20" width="560" height="56" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="310" y="43" text-anchor="middle">1. Candidate generation (retrieval)</text><text x="310" y="62" text-anchor="middle" font-weight="400" font-size="11.5">followed accounts' posts, ANN on embeddings, trending, graph walks</text>
+    <rect x="80" y="96" width="460" height="56" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="310" y="119" text-anchor="middle">2. Lightweight ranking (first pass)</text><text x="310" y="138" text-anchor="middle" font-weight="400" font-size="11.5">small model / distilled model, few features</text>
+    <rect x="130" y="172" width="360" height="56" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="310" y="195" text-anchor="middle">3. Heavy ranking</text><text x="310" y="214" text-anchor="middle" font-weight="400" font-size="11.5">big multi-task neural net, 1000s of features</text>
+    <rect x="180" y="248" width="260" height="56" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="310" y="271" text-anchor="middle">4. Re-ranking &amp; rules</text><text x="310" y="290" text-anchor="middle" font-weight="400" font-size="11.5">diversity, integrity, ads, seen</text>
+  </g>
+  <g font-size="12" fill="#333">
+    <text x="610" y="45">billions → ~1,000s</text><text x="610" y="62" fill="#666" font-size="11">cost per item: ~nanoseconds</text>
+    <text x="610" y="121">~1,000s → ~500</text><text x="610" y="138" fill="#666" font-size="11">cost per item: ~microseconds</text>
+    <text x="610" y="197">~500 → ~50–100 scored</text><text x="610" y="214" fill="#666" font-size="11">cost per item: ~0.1–1 ms of compute</text>
+    <text x="610" y="273">→ final ordered page (~10–25)</text><text x="610" y="290" fill="#666" font-size="11">cheap logic over a short list</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-aml-3)">
+    <path d="M310,76 L310,94"/><path d="M310,152 L310,170"/><path d="M310,228 L310,246"/>
+  </g>
+</svg>
+<div class="caption">The ranking funnel. Each stage is more expensive per item but sees far fewer items, keeping the total cost and latency bounded. (Numbers are illustrative assumptions.)</div>
+</div>
+
+<h3>11.1 Stage 1 — Candidate generation (retrieval)</h3>
+<p>Goal: high <strong>recall</strong> cheaply — don't miss good items; precision comes later. Typically several <em>sources</em> run in parallel and their results are unioned:</p>
+<ul>
+  <li><strong>Graph-based</strong>: recent posts from accounts you follow (read from your precomputed timeline in the <a href="caching.html">Redis feed cache</a>, plus pulled celebrity posts — see <a href="news-feed.html">fan-out</a>); posts liked by accounts similar to ones you engage with.</li>
+  <li><strong>Embedding-based</strong>: nearest neighbours of your user embedding in item-embedding space (section 12).</li>
+  <li><strong>Heuristic</strong>: trending in your country, popular in topics you like, fresh posts needing exposure (cold start).</li>
+</ul>
+
+<h3>11.2 Stage 2 — Lightweight ranking</h3>
+<p>A small model (logistic regression, a small gradient-boosted tree, or a <em>distilled</em> neural net trained to mimic the heavy model) scores thousands of candidates using a handful of cheap, precomputed features and keeps the top few hundred. Its job is to be roughly right, very fast.</p>
+
+<h3>11.3 Stage 3 — Heavy ranking</h3>
+<p>A large deep neural network with thousands of features — often a <strong>multi-task</strong> model that predicts several probabilities at once for each (user, post) pair:</p>
+<pre><code>P(like), P(comment), P(share), P(save), P(tap profile), E[watch time], P(follow author),
+P(hide / "not interested"), P(report)</code></pre>
+<p>These predictions are combined by a <strong>value model</strong> — a weighted formula that encodes what the product wants to optimise:</p>
+<pre><code>score = w1·P(like) + w2·P(comment) + w3·P(share) + w4·P(save)
+      + w5·E[watch_time] − w6·P(hide) − w7·P(report)</code></pre>
+<p>The weights are a <em>product decision</em> tuned by A/B tests. Predicting components separately makes the system debuggable and lets you change goals (value comments and shares over passive likes) without retraining.</p>
+
+<h3>11.4 Stage 4 — Re-ranking for diversity, integrity and business rules</h3>
+<p>Sorting purely by score produces bad pages — five carousels from the same meme account in a row, or three near-duplicate posts about the same news. The final stage applies list-level logic:</p>
+<ul>
+  <li><strong>Diversity</strong>: no more than N consecutive items from one author or one topic; mix photos, carousels and videos; techniques include MMR (maximal marginal relevance) — penalise items too similar to those already chosen.</li>
+  <li><strong>Integrity</strong>: demote or remove content that classifiers flag as borderline (misinformation, spam, clickbait), content from accounts under enforcement, or items the user has already seen.</li>
+  <li><strong>Business rules</strong>: insert ads at allowed slots (with their own auction), boost "close friends" or new posts from accounts you frequently interact with, respect user controls (muted accounts, "not interested", sensitive-content settings).</li>
+</ul>
+
+<h3>11.5 Features: what the models look at</h3>
+<p>A <strong>feature</strong> is a numeric input to a model. Ranking quality comes far more from good features than from clever model architectures.</p>
+<div class="cards">
+  <div class="card"><h4>🤝 Affinity (user × author)</h4><p>How often and how recently you like, comment on, DM or view this author; close friends; mutual follows. Usually the strongest feed signal.</p></div>
+  <div class="card"><h4>🖼️ Content / post</h4><p>Media type, age, engagement so far (likes per impression), content embeddings, topic, quality flags.</p></div>
+  <div class="card"><h4>👤 Viewer</h4><p>Your preferences (finish videos? like carousels?), interest embeddings, device, network, country.</p></div>
+  <div class="card"><h4>📍 Context</h4><p>Time of day, surface (feed vs Explore), position in session, what you just saw.</p></div>
+  <div class="card"><h4>🎯 Predictions as features</h4><p>Outputs of other models, e.g. the light model's engagement probability or a spam score.</p></div>
+</div>
+<p>Freshness varies: "likes in the last 5 minutes" needs stream jobs; "90-day watch completion" can be daily batch. Feature computation is often the most expensive part of the system.</p>
+
+<h3>11.6 The feature store</h3>
+<p>A <strong>feature store</strong> computes, stores and serves features consistently for training and serving: an <strong>offline store</strong> (full timestamped history in the lake, for training sets) and an <strong>online store</strong> (latest value per user/post/user×author in a low-latency KV store such as Redis or Cassandra, read in a few ms). It prevents two notorious bugs:</p>
+<ol>
+  <li><strong>Training–serving skew</strong>: training computes "likes in last 7 days" in Spark SQL, serving computes it in C++ slightly differently (time zones, dedup, defaults) — the model quietly underperforms. Define each feature <em>once</em> and materialise it to both stores.</li>
+  <li><strong>Label leakage</strong>: a training example "did the user like post P shown at 10:00?" must use feature values <em>as of 10:00</em>. Using today's "likes on this author" includes the very like being predicted — brilliant offline, useless online. Feature stores do <em>point-in-time joins</em>.</li>
+</ol>
+
+<h3>11.7 Offline training vs online inference</h3>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Offline training</th><th>Online inference (serving)</th></tr>
+  <tr><td><b>Where</b></td><td>GPU/accelerator training clusters reading the lake.</td><td>Ranking service fleets (CPU or GPU) next to the Feed/Explore services.</td></tr>
+  <tr><td><b>Input</b></td><td>Logged impressions joined with outcomes (labels: liked? watched 80%?) and point-in-time features. Billions of examples.</td><td>One request: a user and ~500 candidates, features fetched from the online store.</td></tr>
+  <tr><td><b>Latency</b></td><td>Hours to days per training run.</td><td>Tens of milliseconds per request.</td></tr>
+  <tr><td><b>Cadence</b></td><td>Retrain daily/hourly, or continuously fine-tune (online learning) so the model keeps up with new trends and content.</td><td>Every feed load, 100,000s of requests/s.</td></tr>
+  <tr><td><b>Validation</b></td><td>Offline metrics on held-out data (AUC, log-loss, NDCG).</td><td>Shadow mode → small A/B test → gradual rollout; watch online metrics and guardrails.</td></tr>
+</table></div>
+<p>The release flow: train → evaluate offline → model registry → <em>shadow</em> scoring (output not shown; compare distributions) → 1% A/B test → ramp up. Offline gains often don't translate online, so the A/B test is the final judge.</p>
+
+<h3>11.8 Latency budgets</h3>
+<p>The user expects the feed in a few hundred ms end-to-end, so ranking might get ~100–200 ms of server time. An illustrative budget (assumption):</p>
+<div class="table-wrap"><table>
+  <tr><th>Step</th><th>Budget (p99)</th><th>How it stays within budget</th></tr>
+  <tr><td>Candidate generation (parallel sources)</td><td>~30 ms</td><td>Precomputed timelines in Redis; ANN indexes in memory; sources run concurrently with per-source <a href="resilience-patterns.html">timeouts</a> (a slow source is simply skipped).</td></tr>
+  <tr><td>Feature fetch</td><td>~20 ms</td><td>Batched multi-get from online store; per-request caches; precomputed user features fetched once.</td></tr>
+  <tr><td>Lightweight ranking</td><td>~10 ms</td><td>Tiny model, vectorised scoring of thousands of items.</td></tr>
+  <tr><td>Heavy ranking</td><td>~50 ms</td><td>Batch all candidates into one model call; split across workers; GPUs/accelerators; quantised models.</td></tr>
+  <tr><td>Re-ranking &amp; hydration</td><td>~15 ms</td><td>Simple rules over a short list; fetch post metadata and signed CDN URLs.</td></tr>
+</table></div>
+<p>When ranking is overloaded or down, the feed must still work: fall back to a cheaper model or to the chronological/cached timeline. That is covered in <a href="resilience-patterns.html">Resilience patterns</a> (graceful degradation).</p>
+
+<h3>11.9 Feedback loops</h3>
+<p>Ranking models learn from data the ranker itself produced: items ranked high get more impressions, so more likes, so rank even higher — "we showed it a lot" looks like "people love it". Remedies:</p>
+<ul>
+  <li><strong>Position bias</strong>: position 1 gets more clicks just for being first. Log position as a training feature (fixed at serving time) or use inverse-propensity weighting.</li>
+  <li><strong>Exploration</strong>: reserve a few slots for items the model is uncertain about (epsilon-greedy, Thompson sampling) so it keeps learning about new content.</li>
+  <li><strong>Selection bias</strong>: you only have labels for items you showed; a small randomised traffic slice yields unbiased data.</li>
+  <li><strong>Goodhart's law</strong>: optimising raw clicks rewards clickbait. Balance with surveys ("worth your time?"), negative signals (hide, report) and integrity demotions.</li>
+</ul>
+
+<h2>12. Explore recommendations: embeddings, two towers, ANN</h2>
+<p>Feed ranks posts from accounts you chose. Explore (and Reels) must <em>discover</em> content from accounts you've never heard of — retrieval over billions of items. The core tool is the <strong>embedding</strong>.</p>
+
+<h3>12.1 Embeddings</h3>
+<p>An <strong>embedding</strong> is a vector (e.g. 128 floats) representing an entity so that <em>similar entities get nearby vectors</em> (by dot product or cosine). It's learned from behaviour: if users who engage with account A also engage with B, training pulls A and B together — word2vec's idea applied to "accounts appearing in the same sessions".</p>
+<pre class="ascii">
+         ▲ dim 2                      (2-D toy; real embeddings have ~128+ dims)
+         │     • latte art
+         │   • coffee shop  • barista reels          ← "coffee" region
+         │
+         │                       • road bike
+         │                    • cycling tours        ← "cycling" region
+         │  ★ you
+         │
+         └──────────────────────────────────────► dim 1
+  Your user vector ★ lies near coffee content → nearest neighbours = coffee posts
+</pre>
+
+<h3>12.2 Two-tower models</h3>
+<div class="diagram">
+<svg viewBox="0 0 820 310" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-aml-4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600">
+    <rect x="40" y="240" width="250" height="50" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="165" y="261" text-anchor="middle">User features</text><text x="165" y="278" text-anchor="middle" font-weight="400" font-size="11">history, follows, country, recent views</text>
+    <rect x="70" y="140" width="190" height="60" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="165" y="165" text-anchor="middle">User tower</text><text x="165" y="183" text-anchor="middle" font-weight="400" font-size="11">neural net layers</text>
+    <rect x="95" y="60" width="140" height="40" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="165" y="85" text-anchor="middle">u (128 floats)</text>
+    <rect x="530" y="240" width="250" height="50" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="655" y="261" text-anchor="middle">Item features</text><text x="655" y="278" text-anchor="middle" font-weight="400" font-size="11">author, image/text embedding, topic</text>
+    <rect x="560" y="140" width="190" height="60" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="655" y="165" text-anchor="middle">Item tower</text><text x="655" y="183" text-anchor="middle" font-weight="400" font-size="11">neural net layers</text>
+    <rect x="585" y="60" width="140" height="40" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="655" y="85" text-anchor="middle">v (128 floats)</text>
+    <rect x="320" y="15" width="180" height="50" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="410" y="36" text-anchor="middle">score = u · v</text><text x="410" y="53" text-anchor="middle" font-weight="400" font-size="11">dot product</text>
+    <rect x="330" y="140" width="160" height="60" rx="8" fill="#eceff1" stroke="#455a64"/><text x="410" y="163" text-anchor="middle">ANN index</text><text x="410" y="181" text-anchor="middle" font-weight="400" font-size="11">all item vectors v</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-aml-4)">
+    <path d="M165,240 L165,202"/><path d="M165,140 L165,102"/><path d="M655,240 L655,202"/><path d="M655,140 L655,102"/>
+    <path d="M235,72 L318,45"/><path d="M585,72 L502,45"/>
+    <path d="M590,110 L492,160" stroke-dasharray="5 3"/>
+  </g>
+  <text x="520" y="128" font-size="10.5" fill="#555">precomputed offline</text>
+</svg>
+<div class="caption">A two-tower model: user and item features are encoded <em>separately</em>, and relevance is just a dot product. Item vectors can therefore be precomputed and indexed; at request time only the user tower runs, followed by a nearest-neighbour lookup.</div>
+</div>
+<p>Training uses positive pairs (user, item they engaged with) and negatives (random or other in-batch items); the loss pushes <code>u·v</code> up for positives and down for negatives. The key property: the towers <em>don't interact</em> until the dot product. That costs some accuracy versus a heavy ranker, but makes retrieval over billions of items feasible — item vectors are computed offline, and per request you compute one user vector and look up the highest dot products.</p>
+
+<h3>12.3 Approximate nearest-neighbour (ANN) search</h3>
+<p>Brute force is too slow: 1 billion items × 128 dims = 128 billion multiply-adds per request. <strong>ANN</strong> algorithms trade a little recall (finding ~95% of the true top-100) for 100–1000× speed:</p>
+<ul>
+  <li><strong>IVF (clustering)</strong>: k-means splits vectors into, e.g., 65,536 cells; a query searches only the few dozen cells whose centroids are closest — ~0.1% of the data.</li>
+  <li><strong>Product quantisation (PQ)</strong>: compresses each 512-byte vector to ~16–64 bytes of codebook IDs, so a billion vectors fit in tens of GB of RAM.</li>
+  <li><strong>HNSW</strong>: a multi-layer neighbour graph; a greedy walk from the top layer reaches the query's neighbourhood in ~log(N) hops. Excellent recall/latency, memory-hungry.</li>
+</ul>
+<p>Libraries include <strong>FAISS</strong> (open-sourced by Meta), ScaNN and hnswlib. Indexes are rebuilt periodically, updated incrementally as new posts arrive, and <a href="sharding.html">sharded</a> across machines — the query fans out to every shard and results are merged.</p>
+
+<h3>12.4 Cold start</h3>
+<p>Collaborative signals need history. Three cold-start cases:</p>
+<div class="table-wrap"><table>
+  <tr><th>Case</th><th>Problem</th><th>Techniques</th></tr>
+  <tr><td><b>New user</b></td><td>No engagement history.</td><td>Onboarding (interests, contacts, suggested accounts); context (country, language); popular high-quality content; learn fast from the first session; explore more early.</td></tr>
+  <tr><td><b>New post</b></td><td>"Engagement so far" features are zero.</td><td>Content embeddings and the author's track record; a small exploration budget of impressions; Bayesian smoothing of early rates.</td></tr>
+  <tr><td><b>New creator</b></td><td>No followers → never surfaced → never gains followers.</td><td>Reserved exploration traffic; content-based retrieval; boosts for original content.</td></tr>
+</table></div>
+
+<h3>12.5 Filter bubbles and integrity</h3>
+<p>A recommender that only exploits learned preferences narrows over time — three fitness reels lead to only fitness reels — a <strong>filter bubble</strong>. Worse, engagement optimisation can amplify sensational or harmful content. Mitigations:</p>
+<ul>
+  <li><strong>Diversity and exploration</strong> in re-ranking (topic caps, novelty bonuses).</li>
+  <li><strong>Recommendation eligibility</strong>: some content may stay on the platform but <em>not be recommended</em> to non-followers; Meta has publicly published recommendation guidelines of this kind.</li>
+  <li><strong>Integrity classifiers</strong> (spam, nudity, violence, misinformation) in the <a href="media-processing.html">media pipeline</a> and in ranking.</li>
+  <li><strong>User controls</strong>: "not interested", sensitive-content settings, a non-personalised/chronological view (the EU Digital Services Act requires a non-profiling option for very large platforms).</li>
+  <li><strong>Long-term metrics and surveys</strong>, not only short-term clicks.</li>
+</ul>
+
+<h2>13. How Instagram uses analytics &amp; ML</h2>
+<div class="flow">
+  <div class="fnode client">📱 App<small>impressions, taps, watch time</small></div><div class="farrow">→<small>batched logs</small></div>
+  <div class="fnode async">Kafka<small>events + domain events</small></div><div class="farrow">→</div>
+  <div class="fnode store">Lake / warehouse<small>Hive-style tables</small></div><div class="farrow">→<small>training data</small></div>
+  <div class="fnode svc">Model training<small>PyTorch on GPUs</small></div><div class="farrow">→<small>model artifacts</small></div>
+  <div class="fnode svc">Feed / Explore ranking<small>online inference</small></div>
+</div>
+<ol>
+  <li><strong>Logging.</strong> The apps log impressions (which post was on screen, for how long), interactions and performance telemetry; services log domain events (the same <em>post created / like / follow</em> events that drive <a href="message-queues.html">Kafka</a> consumers in the main diagram) and ranking decisions.</li>
+  <li><strong>Lake &amp; warehouse.</strong> Events land in partitioned, columnar tables. Facebook created Hive and Presto for this workload and has publicly described Scribe (log transport) and Scuba (real-time analytics); Instagram, inside Meta's infrastructure since its migration (see <a href="multi-region.html">Multi-Region</a>), is described as using this shared platform.</li>
+  <li><strong>Metrics &amp; experiments.</strong> Daily pipelines compute DAU/MAU, retention and creator metrics; an experimentation platform evaluates every launch.</li>
+  <li><strong>Ranking.</strong> Feed became ranked (not chronological) in 2016. Instagram's leadership has publicly explained that Feed, Stories, Explore and Reels each have their own ranking system predicting actions such as time spent, like, comment, share/save and profile tap, combined into a score with integrity rules applied. Chronological "Following" and "Favorites" views were added in 2022.</li>
+  <li><strong>Explore.</strong> Instagram's engineering blog (2019) publicly described Explore as multi-stage: account embeddings learned from interaction sequences (<em>ig2vec</em>), candidate retrieval, then a few hundred candidates funnelled through a distilled lightweight model and heavier neural networks — the funnel of section 11.</li>
+</ol>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram (publicly described + assumptions)</span>
+A feed request in the main diagram: the <a href="news-feed.html">News Feed Service</a> reads candidate post IDs from the precomputed Redis timeline, fetches online features, calls ranking, applies diversity/integrity rules, and hydrates the page with metadata and signed <a href="cdn.html">CDN</a> URLs. Every logged impression becomes tomorrow's training data. Meta has open-sourced <strong>PyTorch</strong>, <strong>FAISS</strong> and <strong>DLRM</strong> (a reference recommendation-model architecture), which show the general shape of these systems; exact model sizes and weights are not public.</div>
+
+<h3>Rough numbers (assumptions)</h3>
+<pre><code>Feed requests:   500M DAU × ~20 feed loads/day ≈ 10B requests/day ≈ 115k/s avg (~300k/s peak)
+Heavy scoring:   ~300 candidates per request → ~35M model evaluations/s on average
+                 → this is why stages 1–2 exist, and why scoring runs batched on accelerators
+Training data:   500B impression events/day; even a 1% sample = 5B labelled examples/day
+Event storage:   ~100 TB/day compressed raw logs → ~36 PB/year before retention/aggregation</code></pre>
+
+<h2>14. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Benefits</h4><ul>
+    <li>Decisions backed by controlled experiments, not opinions</li>
+    <li>Ranking surfaces the posts people care about first</li>
+    <li>OLAP answers huge questions without harming the live app</li>
+    <li>Immutable logs let you recompute anything after a bug fix</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs</h4><ul>
+    <li>Huge storage and compute bills (petabytes, GPU fleets)</li>
+    <li>Complexity: two pipelines, feature stores, model registries</li>
+    <li>Data-quality issues silently corrupt metrics and models</li>
+    <li>Opaque ranking; feedback loops and filter bubbles</li>
+    <li>Privacy burden: deletion, consent, retention</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Analytics on the production database</strong> — scans that evict the hot cache and slow the app. Use CDC/events into a separate store.</li>
+  <li><strong>Grouping by processing time</strong> instead of event time; or no watermark strategy, so late events vanish or windows never close.</li>
+  <li><strong>Not de-duplicating</strong> at-least-once events → inflated counts.</li>
+  <li><strong>Training–serving skew and label leakage</strong> — use a feature store with point-in-time joins.</li>
+  <li><strong>Trusting offline metrics</strong> — always confirm with an online A/B test.</li>
+  <li><strong>Forgetting deletion</strong> — user data must also leave the lake and feature stores (see <a href="security.html">Security &amp; Privacy</a>).</li>
+</ul>
+
+<h2>15. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>Category</th><th>When to use</th></tr>
+  <tr><td>Kafka + Schema Registry, Debezium</td><td>Events, CDC</td><td>Replayable event streams; DB changes out of OLTP stores.</td></tr>
+  <tr><td>S3 / HDFS + Parquet; Iceberg / Delta / Hudi</td><td>Lake storage, table formats</td><td>Cheap columnar storage; ACID, time travel and row-level deletes.</td></tr>
+  <tr><td>Snowflake, BigQuery, Redshift</td><td>Cloud warehouses</td><td>Managed SQL analytics.</td></tr>
+  <tr><td>Spark, Hive; Presto / Trino</td><td>Batch; interactive SQL</td><td>Large ETL and training data; ad-hoc queries over the lake.</td></tr>
+  <tr><td>Flink, Kafka Streams</td><td>Stream processing</td><td>Windows, fresh features, spam signals.</td></tr>
+  <tr><td>Druid, Pinot, ClickHouse</td><td>Real-time OLAP</td><td>Sub-second dashboards on fresh events.</td></tr>
+  <tr><td>Airflow; Feast / Tecton</td><td>Orchestration; feature store</td><td>Scheduling batch DAGs and backfills; consistent online/offline features.</td></tr>
+  <tr><td>PyTorch, XGBoost; FAISS, ScaNN, Milvus</td><td>Training; vector search</td><td>Deep and tree-based ranking models; ANN retrieval over billions of items.</td></tr>
+</table></div>
+
+<h2>16. Interview corner</h2>
+<details class="qa"><summary>Design the pipeline that computes "likes per post per minute" for a real-time creator dashboard.</summary>
+<p>Like Service publishes <code>like_created</code> events (<code>event_id</code>, <code>post_id</code>, <code>event_time</code>) to Kafka partitioned by <code>post_id</code>. A Flink job keys by post, uses 1-minute <em>tumbling event-time windows</em> with watermark = max event time − 30 s, and de-duplicates by <code>event_id</code>. On window close it upserts <code>(post_id, minute) → count</code> into Redis/Cassandra or Pinot — idempotent, so replays don't double count. Late events go to a side output and a nightly batch job recomputes exact counts (lambda-style). Hot celebrity posts are pre-aggregated per partition; unlikes are −1 events.</p></details>
+<details class="qa"><summary>Why not just run analytics queries against the Cassandra and PostgreSQL clusters?</summary>
+<p>OLTP stores are tuned for key lookups and production latency. Analytical scans compete for disk/CPU and evict caches, slowing the live app; data is <a href="sharding.html">sharded</a> by user_id so cross-shard joins are impractical; and they hold current state, not history. Replicate via events/CDC into a columnar lake where scans are cheap and compute scales independently.</p></details>
+<details class="qa"><summary>Walk me through how Instagram's feed ranking works at a high level.</summary>
+<p>Multi-stage funnel. (1) Candidates: unseen posts from the Redis timeline, pulled celebrity posts, and recommended posts from ANN retrieval — a few thousand. (2) A light/distilled model narrows to a few hundred. (3) A heavy multi-task network predicts P(like), P(comment), P(share), P(save), expected time, P(hide) from online feature-store features (author affinity, engagement so far, content embeddings, context); a value model combines them. (4) Re-ranking applies diversity caps, integrity demotions, seen-state and ads. The page is hydrated with metadata and CDN URLs; impressions are logged for retraining; changes ship via A/B tests. If ranking is down, serve the cached chronological timeline.</p></details>
+<details class="qa"><summary>How would you build retrieval for Explore over billions of posts?</summary>
+<p>Train a two-tower model on (user, engaged-item) pairs with in-batch negatives. Precompute item embeddings (new posts as soon as media processing finishes) into a sharded ANN index (IVF-PQ or HNSW via FAISS). Per request, run the user tower, query each shard for top-K by dot product, merge, union with trending and graph-based sources, filter for eligibility (recommendable, unseen, not blocked), and hand a few thousand candidates to the ranking stages. Monitor ANN recall against exact search on samples.</p></details>
+<details class="qa"><summary>Lambda or Kappa — which would you choose and why?</summary>
+<p>Lambda gives exact batch recomputation but duplicates logic across two engines, which drift. Kappa has one code path and reprocesses by replaying the log, but needs long retention and a strong stream engine. For Instagram I'd run a hybrid: Flink for fresh features and real-time counters, batch for canonical daily metrics, training sets and backfills, with shared definitions (same SQL/engine) to avoid divergence.</p></details>
+<details class="qa"><summary>How do you know a new ranking model is actually better?</summary>
+<p>Offline: evaluate on a time-split holdout (train days 1–28, test day 29) with AUC/log-loss and NDCG. Shadow-deploy to compare score distributions and latency. Then an A/B test with a pre-registered primary metric, guardrails (hides, reports, latency, creator metrics), a sample size computed for the minimum effect you care about, 1–2+ weeks to wash out novelty, and an SRM check. Ramp gradually; keep a long-term holdout.</p></details>
+
+<h2>17. Check your understanding</h2>
+<details class="quiz"><summary>A table has 200 columns; a query reads 4 of them across one day out of 365 stored days. Roughly what fraction of the raw data does a partitioned columnar store read, before compression?</summary>
+<p>(4 / 200) × (1 / 365) ≈ 0.02 × 0.0027 ≈ <strong>0.0055%</strong> — about 1/18,000 of the data. Compression then reduces it further. A row store without partitioning would read all of it. This is why OLAP uses columnar, partitioned storage.</p></details>
+<details class="quiz"><summary>DAU is 300M and MAU is 1B. What is stickiness and what does it mean?</summary>
+<p>300M / 1B = <strong>30%</strong>. The average monthly user is active on about 9 of 30 days. Compared with a social app at 50–60%, this suggests many monthly users are casual; you'd look at retention cohorts to see whether new users are failing to form a habit.</p></details>
+<details class="quiz"><summary>Your Flink job counts likes per minute with watermark = max event time − 1 min. A phone that was offline for 10 minutes uploads its likes. What happens, and how do you get correct numbers?</summary>
+<p>Late data: their windows already closed, so they're dropped or sent to a side output — real-time numbers are slightly low. Correct numbers come from the batch layer recomputing from the lake (lambda), or from longer allowed lateness with result updates (more latency/state). A completeness vs latency trade-off.</p></details>
+<details class="quiz"><summary>Control commenting rate is 5%. How many users per group do you roughly need to detect an absolute lift of 0.1 percentage points (5.0% → 5.1%) with 80% power?</summary>
+<p>σ² = 0.05 × 0.95 ≈ 0.0475; δ = 0.001. n ≈ 16 × 0.0475 / 0.000001 ≈ <strong>760,000 per group</strong>. Halving δ would need 4× as many users.</p></details>
+<details class="quiz"><summary>You assigned 50/50 but the experiment shows 10.2M users in control and 9.8M in treatment. Ship it if the metric is positive?</summary>
+<p>No. A 2% imbalance over 20M users is a <strong>sample ratio mismatch</strong> — far outside random chance. Likely the treatment crashes or fails to log for some users, so the remaining treatment users are a biased subset. Investigate and fix before trusting any metric.</p></details>
+<details class="quiz"><summary>A new model shows +3% AUC offline but the A/B test shows no improvement. Give three plausible reasons.</summary>
+<p>(1) <strong>Label leakage</strong> — offline features contained future information. (2) <strong>Training–serving skew</strong> — features computed differently in production. (3) <strong>Offline ≠ product metric</strong> — better like-prediction doesn't mean a better final page after the value model and re-ranking. Also: added latency, or an under-powered test.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Events (client + service + CDC) are the raw material; log them with IDs, two timestamps and schemas, and expect duplicates and late arrivals.</li>
+    <li>Keep <strong>OLTP</strong> (serve the app) and <strong>OLAP</strong> (analyse history) separate; analytics lives on <strong>columnar, partitioned</strong> storage in a lake/warehouse/lakehouse.</li>
+    <li><strong>Batch</strong> = exact and cheap but late; <strong>stream</strong> = fresh but must handle event time, windows and watermarks. Lambda runs both; Kappa runs one replayable stream.</li>
+    <li>Measure with DAU/MAU, cohorts and guardrails; prove changes with properly powered <strong>A/B tests</strong> (n ∝ 1/δ²).</li>
+    <li>Ranking is a <strong>funnel</strong> (retrieval → light → heavy → re-rank) under a strict latency budget, with a <strong>feature store</strong> preventing skew and leakage.</li>
+    <li>Explore = <strong>embeddings + two-tower + ANN</strong>; design deliberately for cold start, feedback loops, filter bubbles and integrity.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="message-queues.html">Message Queues, Pub/Sub &amp; Kafka</a> — the event bus that feeds every pipeline here</li>
+  <li><a href="news-feed.html">News Feed: Fan-out &amp; Ranking</a> — where the ranking funnel is served</li>
+  <li><a href="search.html">Search &amp; Inverted Indexes</a> — retrieval and trending signals for search</li>
+  <li><a href="databases.html">Databases: SQL vs NoSQL</a> — the OLTP side of the OLTP/OLAP split</li>
+  <li><a href="caching.html">Caching</a> — Redis timelines and online feature serving</li>
+  <li><a href="observability.html">Monitoring, Logging &amp; Tracing</a> — operational telemetry vs product analytics</li>
+  <li><a href="security.html">Security &amp; Privacy</a> — deletion and minimisation across analytical stores</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

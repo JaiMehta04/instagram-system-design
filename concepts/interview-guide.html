@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Instagram Design: Full Interview Walkthrough — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="interview-guide">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>This lesson is a <strong>complete, simulated 45-minute "Design Instagram" interview</strong>, minute by minute, with the interviewer's prompts and a strong candidate's answers.</li>
+    <li>The time split that works: <strong>~5 min</strong> clarifying, <strong>~3</strong> requirements, <strong>~4</strong> estimation, <strong>~4</strong> API, <strong>~5</strong> data model, <strong>~7</strong> high-level design, <strong>~12</strong> deep dives, <strong>~3</strong> bottlenecks and trade-offs, <strong>~2</strong> wrap-up.</li>
+    <li>The deep dives interviewers almost always reach are the <strong>hybrid feed fan-out</strong>, <strong>media upload &amp; processing</strong>, <strong>sharding &amp; Instagram's 64-bit ID scheme</strong>, <strong>caching</strong>, the <strong>celebrity / hot-key problem</strong> and <strong>DMs</strong>.</li>
+    <li>It ends with 12+ follow-up questions with model answers, a <strong>junior / senior / staff rubric</strong>, common mistakes, and how the design changes for <strong>Twitter/X, TikTok, Facebook, Pinterest and YouTube</strong>.</li>
+    <li>What gets you hired is not knowing the "right" answer but <strong>driving the conversation</strong>: state assumptions, quantify, name the trade-offs, and go deep where the interviewer pushes.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why a script for "Design Instagram"?</h2>
+<p>"Design Instagram" (or its cousins "design a photo-sharing app" and "design a news feed") is one of the most frequently asked system design questions, because it touches almost everything: a read-heavy feed, a write-heavy engagement layer, huge blobs, a social graph, search, real-time messaging and async pipelines. It is also <em>open-ended</em>. Without structure, candidates spend 20 minutes on login screens or draw boxes without numbers. Then the clock runs out before the interesting part, the feed.</p>
+<p>Every concept in this walkthrough has its own lesson in this guide. Here we practise <strong>assembling them under time pressure</strong>, in the order and at the depth an interviewer expects. The framework is the one from <a href="how-to-approach.html">How to Approach a System Design Problem</a>; the numbers come from <a href="capacity-estimation.html">Back-of-the-Envelope Estimation</a>; the request paths come from <a href="request-flows.html">End-to-End Request Flows</a>.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  A system design interview is like an architect's first meeting with a client who says "build me a house". A good architect doesn't start drawing bricks. They ask how many people will live there, the budget and the climate, sketch a floor plan, and then go deep on whatever the client cares about most (the kitchen, the stairs, the solar panels). The interviewer is that client. The first ten minutes decide whether you build the right house.
+</div>
+
+<h2>2. The 45-minute plan</h2>
+<div class="diagram">
+<svg viewBox="0 0 820 130" width="820" xmlns="http://www.w3.org/2000/svg" font-size="11">
+  <g stroke="#fff" stroke-width="1.5">
+    <rect x="20" y="30" width="87" height="40" fill="#e1f5fe"/>
+    <rect x="107" y="30" width="52" height="40" fill="#b3e5fc"/>
+    <rect x="159" y="30" width="69" height="40" fill="#fff3e0"/>
+    <rect x="228" y="30" width="69" height="40" fill="#ffe0b2"/>
+    <rect x="297" y="30" width="87" height="40" fill="#fff8e1"/>
+    <rect x="384" y="30" width="121" height="40" fill="#e8f5e9"/>
+    <rect x="505" y="30" width="208" height="40" fill="#c8e6c9"/>
+    <rect x="713" y="30" width="52" height="40" fill="#f3e5f5"/>
+    <rect x="765" y="30" width="35" height="40" fill="#eceff1"/>
+  </g>
+  <g text-anchor="middle" font-weight="600">
+    <text x="63" y="54">Clarify</text>
+    <text x="133" y="54">Reqs</text>
+    <text x="193" y="54">Estimate</text>
+    <text x="262" y="54">API</text>
+    <text x="340" y="54">Data model</text>
+    <text x="444" y="54">High-level design</text>
+    <text x="609" y="54">Deep dives (2–3 topics)</text>
+    <text x="739" y="54">Risks</text>
+    <text x="782" y="54">Wrap</text>
+  </g>
+  <g fill="#555" text-anchor="middle" font-size="10">
+    <text x="20" y="88">0</text><text x="107" y="88">5</text><text x="159" y="88">8</text><text x="228" y="88">12</text><text x="297" y="88">16</text><text x="384" y="88">21</text><text x="505" y="88">28</text><text x="713" y="88">40</text><text x="765" y="88">43</text><text x="800" y="88">45</text>
+  </g>
+  <text x="410" y="18" text-anchor="middle" font-size="12" font-weight="700">Minutes →</text>
+  <text x="410" y="115" text-anchor="middle" font-size="11" fill="#555">Roughly the first third clarifies and scopes the problem, the middle third builds the design, and the last third is deep dives and trade-offs.</text>
+</svg>
+<div class="caption">A time budget for a 45-minute interview (about 40 minutes of design after introductions). Adjust it live: if the interviewer jumps to a deep dive early, follow them.</div>
+</div>
+
+<div class="table-wrap"><table>
+  <tr><th>Minutes</th><th>Phase</th><th>Goal</th><th>Output on the whiteboard</th></tr>
+  <tr><td>0–5</td><td>Clarifying questions</td><td>Agree on scope and scale</td><td>Bullet list of in/out of scope features and user numbers</td></tr>
+  <tr><td>5–8</td><td>Requirements</td><td>Functional + non-functional targets</td><td>FRs, NFRs (latency, availability, consistency)</td></tr>
+  <tr><td>8–12</td><td>Capacity estimation</td><td>Size the system; find what's hard</td><td>QPS, storage, bandwidth, cache size</td></tr>
+  <tr><td>12–16</td><td>API design</td><td>Define the contract</td><td>5–8 endpoints with key params</td></tr>
+  <tr><td>16–21</td><td>Data model</td><td>Entities, keys, DB choices</td><td>Tables with partition and clustering keys</td></tr>
+  <tr><td>21–28</td><td>High-level design</td><td>End-to-end boxes and arrows</td><td>The architecture diagram</td></tr>
+  <tr><td>28–40</td><td>Deep dives</td><td>Show depth on the hard parts</td><td>Feed fan-out, media, sharding, caching, hot keys, DMs</td></tr>
+  <tr><td>40–43</td><td>Bottlenecks &amp; trade-offs</td><td>Show judgement</td><td>SPOFs, failure modes, what you'd change at 10×</td></tr>
+  <tr><td>43–45</td><td>Wrap-up</td><td>Summarise; leave a strong last impression</td><td>3–4 sentence summary plus future work</td></tr>
+</table></div>
+
+<h2>3. Minutes 0–5: Clarifying questions</h2>
+<p>Never start designing immediately. Ask a <em>few, high-leverage</em> questions, and propose answers yourself when the interviewer turns the question back to you ("What do you think?"), which they often will.</p>
+
+<div class="callout interview"><span class="callout-title">🎤 Dialogue: opening</span>
+<p><b>Interviewer:</b> Let's design Instagram.</p>
+<p><b>Candidate:</b> Great. Instagram is big, so let me scope it first. I'm thinking of the core loop: users upload photos and short videos, follow other users, and see a home feed of posts from the people they follow, with likes and comments. Should I also cover Stories, Reels, Explore, search and Direct Messages, or focus on the core?</p>
+<p><b>Interviewer:</b> Focus on posting and the feed. Include likes and comments. Mention Stories, search and DMs at a high level; we may go deeper on one if there's time.</p>
+<p><b>Candidate:</b> Got it. What scale should I design for? I'll assume something like today's Instagram: around 2 billion monthly users and 500 million daily active users, unless you'd like a different number.</p>
+<p><b>Interviewer:</b> 500 million DAU is fine.</p>
+<p><b>Candidate:</b> Is the feed chronological or ranked? And is it global or do we care about multiple regions?</p>
+<p><b>Interviewer:</b> Ranked, but you don't need to design the ML model. Users are global.</p>
+</div>
+
+<div class="table-wrap"><table>
+  <tr><th>Question</th><th>Why it matters</th><th>Answer assumed in this walkthrough</th></tr>
+  <tr><td>Which features are in scope?</td><td>Prevents designing everything shallowly</td><td>Upload photo/video posts, follow, home feed, like, comment. Stories, search and DMs at a high level.</td></tr>
+  <tr><td>How many users? DAU?</td><td>Drives every number</td><td>~2B MAU, 500M DAU</td></tr>
+  <tr><td>Read/write ratio?</td><td>Read-optimised vs write-optimised design</td><td>Heavily read-skewed, ~100:1 views to posts</td></tr>
+  <tr><td>Photos only, or video too? Max size?</td><td>Storage, transcoding, streaming</td><td>Both. Photos ≤ ~10 MB original; video ≤ 60–90 s.</td></tr>
+  <tr><td>Feed: chronological or ranked?</td><td>Changes the read path (ranking stage)</td><td>Ranked (treat the model as a black box)</td></tr>
+  <tr><td>How fresh must the feed be?</td><td>Allows eventual consistency</td><td>A few seconds of delay is fine</td></tr>
+  <tr><td>Global users? Regions?</td><td>CDN, multi-region, data residency</td><td>Global. Assume multiple regions plus a CDN.</td></tr>
+  <tr><td>Private accounts? Blocking?</td><td>Authorization on every read</td><td>Yes. They must be enforced on feed, profile and search.</td></tr>
+  <tr><td>Any celebrities with huge followings?</td><td>Hot keys, fan-out explosion</td><td>Yes. Top accounts have hundreds of millions of followers.</td></tr>
+</table></div>
+<div class="callout tip"><span class="callout-title">💡 Tip</span>
+Spend no more than ~5 minutes here. Asking 30 questions looks like stalling. Ask the 5–8 that change the design, and state your own sensible assumptions for the rest out loud.</div>
+
+<h2>4. Minutes 5–8: Requirements</h2>
+<p>Write these on the board. They are the contract you'll check your design against at the end (see <a href="requirements.html">requirements</a>).</p>
+<div class="cards">
+  <div class="card"><h4>✅ Functional</h4><p>1) Upload a photo/video post with a caption. 2) Follow / unfollow users. 3) View a ranked home feed of followed accounts' posts. 4) Like and comment on posts. 5) View a user's profile grid. <em>High level:</em> Stories (24 h), search users/hashtags, 1:1 DMs, push notifications.</p></div>
+  <div class="card"><h4>📏 Non-functional</h4><p>High availability (99.99% for feed and read paths). Feed p99 &lt; ~300 ms server time. Media loads fast worldwide (CDN). Durable: never lose an uploaded photo (11 nines object durability). Eventual consistency OK for feeds and counters; read-your-writes for your own posts. Scales horizontally.</p></div>
+  <div class="card"><h4>🚫 Out of scope</h4><p>Ads, payments, the internals of the ML ranking model, Reels recommendation, live video, content-moderation policy details, the account recovery UX.</p></div>
+</div>
+<div class="callout interview"><span class="callout-title">🎤 Dialogue: priorities</span>
+<p><b>Candidate:</b> The key trade-off I see is availability and latency over strict consistency. If a follower sees a new post five seconds late, or a like count is off by a few, nobody is harmed. But I won't relax <em>durability</em> of uploads, or <em>privacy</em> checks: a blocked user must never see your content. Does that match your expectations?</p>
+<p><b>Interviewer:</b> Yes, that's reasonable.</p>
+</div>
+<p>This is a direct application of <a href="cap-consistency.html">CAP/PACELC</a>. During a partition we choose availability for the feed. In normal operation we choose latency over consistency for everything except auth, privacy and DMs ordering.</p>
+
+<h2>5. Minutes 8–12: Capacity estimation</h2>
+<p>State assumptions, round aggressively, and focus on numbers that <em>change the design</em>. Full derivations are in <a href="capacity-estimation.html">capacity estimation</a>; here is the summary a candidate would put on the board.</p>
+<pre><code>Assumptions: 500M DAU · 100M new posts/day · each DAU opens feed ~10×/day
+             each DAU likes ~10 posts/day · avg original photo 2 MB, renditions +0.5 MB
+             avg follower count ~200 (heavy skew: a few accounts have 100M+)
+
+Writes  (posts):   100M / 86,400 s        ≈ 1,200 posts/s     (peak ~3–5k/s)
+Reads   (feed):    500M × 10 / 86,400     ≈ 58,000 feed req/s (peak ~150k/s)
+Likes:             500M × 10 / 86,400     ≈ 58,000 likes/s
+Fan-out writes:    1,200 posts/s × 200    ≈ 240,000 timeline inserts/s (avg)
+
+Media storage:     100M × 2.5 MB          = 250 TB/day ≈ 90 PB/year (before replication/EC)
+Metadata:          100M × ~1 KB           = 100 GB/day ≈ 36 TB/year
+Timeline cache:    500M users × 500 IDs × 8 B = 2 TB raw (~5–6 TB with Redis overhead)
+                   → ~100 Redis nodes × 64 GB, plus replicas
+Media egress:      500M × 100 images × 200 KB = 10 PB/day ≈ 1 Tbps avg (CDN absorbs 95%+)</code></pre>
+<div class="table-wrap"><table>
+  <tr><th>Number</th><th>Value</th><th>Design consequence</th></tr>
+  <tr><td>Read : write</td><td>~50–100 : 1</td><td>Optimise reads: precompute feeds, cache aggressively, CDN</td></tr>
+  <tr><td>Feed QPS</td><td>~60k avg, ~150k peak</td><td>Stateless feed service, timeline in memory (Redis)</td></tr>
+  <tr><td>Fan-out writes</td><td>~240k/s average, bursty</td><td>Async workers via Kafka; can't be in the request path</td></tr>
+  <tr><td>Media storage</td><td>~90 PB/year</td><td>Object storage with tiering and erasure coding; never a DB</td></tr>
+  <tr><td>Egress</td><td>~1 Tbps</td><td>CDN is mandatory</td></tr>
+  <tr><td>Metadata</td><td>~36 TB/year, high write rate</td><td>Sharded DBs (PostgreSQL for users, Cassandra for posts/likes)</td></tr>
+</table></div>
+<div class="callout interview"><span class="callout-title">🎤 Dialogue: keep it moving</span>
+<p><b>Interviewer:</b> Good. You don't need more precision than that.</p>
+<p><b>Candidate:</b> The two things these numbers tell me: the feed must be served from memory, not computed from the database on each request, and the fan-out of ~240k writes per second has to be asynchronous. Let me define the API.</p>
+</div>
+
+<h2>6. Minutes 12–16: API design</h2>
+<p>Keep it to the endpoints that matter, and show you know the details that separate good APIs from naive ones: cursor pagination, idempotency keys, pre-signed uploads and authentication (see <a href="api-design.html">API design</a>).</p>
+<pre><code># All calls: HTTPS, Authorization: Bearer &lt;JWT&gt;, JSON. Versioned under /v1.
+
+POST /v1/media/uploads            {type, size_bytes, sha256}
+  → 200 {media_id, upload_url (pre-signed PUT, expires 15 min)}
+
+POST /v1/posts                    {media_ids[], caption, location_id?, user_tags[]}
+  Headers: Idempotency-Key: &lt;uuid&gt;
+  → 201 {post_id, created_at, status: "PROCESSING"}
+
+GET  /v1/feed?cursor=&lt;opaque&gt;&amp;limit=20
+  → 200 {posts:[{post_id, author, caption, media:[{url_640, url_1080, w, h}],
+                 like_count, comment_count, viewer_has_liked}], next_cursor}
+
+GET  /v1/users/{user_id}/posts?cursor=...&amp;limit=30     # profile grid
+
+PUT    /v1/posts/{post_id}/like                    → 204   (idempotent)
+DELETE /v1/posts/{post_id}/like                    → 204
+POST   /v1/posts/{post_id}/comments {text, reply_to?}  Idempotency-Key → 201 {comment_id}
+GET    /v1/posts/{post_id}/comments?cursor=...
+
+POST   /v1/users/{user_id}/follow                  → 200 {state: following|requested}
+DELETE /v1/users/{user_id}/follow                  → 204
+
+GET    /v1/search/typeahead?q=sel                  # users, hashtags, places
+GET    /v1/stories/tray                            # high level
+WS     /v1/realtime                                # DMs, typing, receipts (WebSocket)</code></pre>
+<div class="callout interview"><span class="callout-title">🎤 Dialogue: API probes</span>
+<p><b>Interviewer:</b> Why a cursor rather than <code>page=3</code>?</p>
+<p><b>Candidate:</b> The feed changes constantly. With offsets, new posts arriving at the top shift everything down, so the user sees duplicates or skips posts. Offsets are also slow on large tables. An opaque cursor encodes the position, for example the last post's ID or score plus a snapshot token, so the next page continues exactly where the last one ended.</p>
+<p><b>Interviewer:</b> And the idempotency key?</p>
+<p><b>Candidate:</b> Mobile networks drop responses. If the app times out on <code>POST /posts</code> and retries, the server sees the same key, finds the stored result and returns the original <code>post_id</code> instead of creating a duplicate post. Likes don't need a key because <code>PUT</code> on a (post, user) pair is naturally idempotent.</p>
+</div>
+<p>Protocol choices: REST/JSON for the public mobile API (simple, cacheable, debuggable), gRPC between internal services (fast binary, deadlines, streaming), and a WebSocket for real-time DMs. The <a href="api-gateway.html">API Gateway</a> handles authentication via <a href="authentication.html">JWTs</a> and <a href="rate-limiting.html">rate limiting</a> in front of all of them.</p>
+
+<h2>7. Minutes 16–21: Data model</h2>
+<p>Pick the store per dataset based on its access pattern, and say <strong>why</strong>. A strong candidate names partition keys and explains how each query maps to exactly one partition (see <a href="databases.html">databases</a>, <a href="indexing.html">indexing</a>).</p>
+<div class="table-wrap"><table>
+  <tr><th>Data</th><th>Store</th><th>Why</th></tr>
+  <tr><td>Users, profiles, settings, auth</td><td>PostgreSQL, sharded by <code>user_id</code>, with read replicas</td><td>Relational, modest size, needs constraints (unique username) and transactions</td></tr>
+  <tr><td>Posts, comments, likes, stories</td><td>Cassandra (wide-column)</td><td>Huge write volume, simple key-based access, linear horizontal scale, TTL support</td></tr>
+  <tr><td>Follow graph</td><td>Sharded KV/wide-column (both directions) plus a graph cache</td><td>Two adjacency lists: followers and following</td></tr>
+  <tr><td>Timelines, counters, hot objects</td><td>Redis</td><td>Sub-millisecond reads of precomputed data</td></tr>
+  <tr><td>Photos and videos</td><td>Object Storage (S3) + CDN</td><td>Cheap, durable blobs; never store blobs in a DB</td></tr>
+  <tr><td>Search</td><td>Elasticsearch</td><td>Inverted index for prefix and full-text search</td></tr>
+  <tr><td>DMs</td><td>Cassandra/HBase, partitioned by <code>thread_id</code></td><td>Append-heavy, ordered per conversation</td></tr>
+</table></div>
+
+<h3>7.1 User DB (PostgreSQL)</h3>
+<pre><code>CREATE TABLE users (
+  user_id        BIGINT PRIMARY KEY,          -- 64-bit time-sortable ID (see deep dive)
+  username       VARCHAR(30) NOT NULL,
+  full_name      VARCHAR(64),
+  email          VARCHAR(255),
+  password_hash  TEXT NOT NULL,               -- argon2/bcrypt
+  bio            TEXT,
+  avatar_key     TEXT,                        -- object-storage key, not the image
+  is_private     BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Global uniqueness of username needs its own lookup table, sharded by username:
+CREATE TABLE usernames (username VARCHAR(30) PRIMARY KEY, user_id BIGINT NOT NULL);</code></pre>
+
+<h3>7.2 Posts, likes and comments (Cassandra CQL)</h3>
+<pre><code>-- One post by ID (for hydration)
+CREATE TABLE posts_by_id (
+  post_id     bigint PRIMARY KEY,
+  user_id     bigint,
+  caption     text,
+  media       list&lt;frozen&lt;media_ref&gt;&gt;,   -- rendition keys, width, height
+  location_id bigint,
+  status      text,                      -- PROCESSING | READY | REMOVED
+  created_at  timestamp
+);
+
+-- Profile grid: all posts of a user, newest first (one partition per user, bucketed by month)
+CREATE TABLE posts_by_user (
+  user_id  bigint,
+  bucket   int,                          -- e.g. 202610, keeps partitions bounded
+  post_id  bigint,
+  PRIMARY KEY ((user_id, bucket), post_id)
+) WITH CLUSTERING ORDER BY (post_id DESC);
+
+-- Who liked a post (idempotent: primary key = post + user)
+CREATE TABLE likes_by_post (
+  post_id  bigint,
+  bucket   smallint,                     -- spreads mega-viral posts over N partitions
+  user_id  bigint,
+  liked_at timestamp,
+  PRIMARY KEY ((post_id, bucket), user_id)
+);
+
+CREATE TABLE comments_by_post (
+  post_id    bigint,
+  comment_id bigint,                     -- time-sortable → natural ordering
+  user_id    bigint,
+  text       text,
+  PRIMARY KEY (post_id, comment_id)
+) WITH CLUSTERING ORDER BY (comment_id DESC);</code></pre>
+
+<h3>7.3 Social graph and timelines</h3>
+<pre><code>CREATE TABLE following (follower_id bigint, followee_id bigint, created_at timestamp,
+                        PRIMARY KEY (follower_id, followee_id));
+CREATE TABLE followers (followee_id bigint, follower_id bigint, created_at timestamp,
+                        PRIMARY KEY (followee_id, follower_id));
+
+# Redis
+timeline:{user_id}          ZSET  score = created_at (or rank), member = post_id   (cap 500)
+like_count:{post_id}:{n}    STRING counter shards, summed on read
+post:{post_id}              HASH  cached hydrated post object (TTL hours)</code></pre>
+<div class="callout interview"><span class="callout-title">🎤 Dialogue: data model probes</span>
+<p><b>Interviewer:</b> Why store the follow edge twice?</p>
+<p><b>Candidate:</b> The two queries are partitioned differently. "Whom do I follow?" is needed when building my feed and is partitioned by follower. "Who follows Bob?" is needed for fan-out and is partitioned by followee. With one table, one of those queries becomes a scatter-gather across all shards. Denormalising into two tables makes both single-partition reads. The cost is keeping them in sync, which I'd do with an idempotent async writer driven by the follow event, plus a repair job.</p>
+<p><b>Interviewer:</b> Why not put posts in PostgreSQL too?</p>
+<p><b>Candidate:</b> We could. Public talks describe Instagram doing exactly that early on, with sharded PostgreSQL. At ~1,200 posts/s, ~60k likes/s and petabyte-scale history, Cassandra's leaderless writes, easy horizontal scaling and built-in TTL are a better fit for append-heavy, key-based data. I keep PostgreSQL where I want relational constraints, like unique usernames and account settings.</p>
+</div>
+
+<h2>8. Minutes 21–28: High-level design</h2>
+<p>Draw the boxes, then <strong>walk two requests through them</strong>: a write (post a photo) and a read (load the feed). That proves the diagram works.</p>
+<div class="diagram">
+<svg viewBox="0 0 820 440" width="820" xmlns="http://www.w3.org/2000/svg" font-size="12">
+  <defs><marker id="ar-iv-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <rect x="10" y="20" width="95" height="36" rx="7" fill="#fff3e0" stroke="#ef6c00"/><text x="57" y="43" text-anchor="middle" font-weight="600">CDN</text>
+  <rect x="10" y="90" width="70" height="36" rx="7" fill="#fff3e0" stroke="#ef6c00"/><text x="45" y="113" text-anchor="middle" font-weight="600">DNS</text>
+  <rect x="10" y="170" width="95" height="50" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="57" y="192" text-anchor="middle" font-weight="600">📱 Clients</text><text x="57" y="208" text-anchor="middle" font-size="10.5">Mobile · Web</text>
+  <rect x="125" y="172" width="95" height="46" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="172" y="199" text-anchor="middle" font-weight="600">Load Balancer</text>
+  <rect x="235" y="172" width="95" height="46" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="282" y="193" text-anchor="middle" font-weight="600">API Gateway</text><text x="282" y="209" text-anchor="middle" font-size="10">JWT · rate limit</text>
+  <g>
+    <rect x="350" y="20" width="180" height="30" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="440" y="40" text-anchor="middle">Upload Service</text>
+    <rect x="350" y="56" width="180" height="30" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="440" y="76" text-anchor="middle">Stories Service</text>
+    <rect x="350" y="92" width="180" height="30" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="440" y="112" text-anchor="middle">Like &amp; Comment</text>
+    <rect x="350" y="128" width="180" height="30" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="440" y="148" text-anchor="middle">Follow/Graph</text>
+    <rect x="350" y="164" width="180" height="30" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="440" y="184" text-anchor="middle">News Feed Service</text>
+    <rect x="350" y="200" width="180" height="30" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="440" y="220" text-anchor="middle">Search Service</text>
+    <rect x="350" y="236" width="180" height="30" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="440" y="256" text-anchor="middle">Direct Messaging (WS)</text>
+    <rect x="350" y="272" width="180" height="30" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="440" y="292" text-anchor="middle">User/Auth Service</text>
+  </g>
+  <g font-size="11.5">
+    <rect x="560" y="20" width="250" height="34" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="685" y="42" text-anchor="middle">Object Storage (S3)</text>
+    <rect x="560" y="61" width="250" height="34" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="685" y="83" text-anchor="middle">Post/Comment/Story (Cassandra)</text>
+    <rect x="560" y="102" width="250" height="34" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="685" y="124" text-anchor="middle">Social Graph store</text>
+    <rect x="560" y="143" width="250" height="34" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="685" y="165" text-anchor="middle">Feed Cache (Redis)</text>
+    <rect x="560" y="184" width="250" height="34" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="685" y="206" text-anchor="middle">Search Index (Elasticsearch)</text>
+    <rect x="560" y="225" width="250" height="34" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="685" y="247" text-anchor="middle">Messages Store (Cassandra/HBase)</text>
+    <rect x="560" y="266" width="250" height="34" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="685" y="288" text-anchor="middle">User DB (PostgreSQL, sharded)</text>
+  </g>
+  <rect x="125" y="325" width="685" height="30" rx="7" fill="#f3e5f5" stroke="#6a1b9a"/><text x="467" y="345" text-anchor="middle" font-weight="600">Kafka (event bus)</text>
+  <g font-size="11.5">
+    <rect x="125" y="375" width="128" height="40" rx="7" fill="#f3e5f5" stroke="#6a1b9a"/><text x="189" y="399" text-anchor="middle">Search Indexer</text>
+    <rect x="263" y="375" width="128" height="40" rx="7" fill="#f3e5f5" stroke="#6a1b9a"/><text x="327" y="399" text-anchor="middle">Fan-out Workers</text>
+    <rect x="401" y="375" width="128" height="40" rx="7" fill="#f3e5f5" stroke="#6a1b9a"/><text x="465" y="399" text-anchor="middle">Media Workers</text>
+    <rect x="539" y="375" width="128" height="40" rx="7" fill="#f3e5f5" stroke="#6a1b9a"/><text x="603" y="399" text-anchor="middle">Notification Svc</text>
+    <rect x="677" y="375" width="128" height="40" rx="7" fill="#f3e5f5" stroke="#6a1b9a"/><text x="741" y="399" text-anchor="middle">Analytics &amp; ML</text>
+  </g>
+  <rect x="10" y="375" width="100" height="40" rx="7" fill="#eceff1" stroke="#455a64"/><text x="60" y="399" text-anchor="middle" font-weight="600">APNs / FCM</text>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-iv-1)">
+    <path d="M105,195 L123,195"/><path d="M220,195 L233,195"/><path d="M330,195 L348,195"/>
+    <path d="M530,160 L558,160"/>
+    <path d="M45,168 L45,128"/><path d="M95,168 L95,58"/>
+  </g>
+  <g stroke="#6a1b9a" stroke-width="1.5" fill="none" stroke-dasharray="5 3" marker-end="url(#ar-iv-1)">
+    <path d="M440,302 L440,323"/>
+    <path d="M189,355 L189,373"/><path d="M327,355 L327,373"/><path d="M465,355 L465,373"/><path d="M603,355 L603,373"/><path d="M741,355 L741,373"/>
+    <path d="M603,415 L603,430 L60,430 L60,417"/>
+    <path d="M60,375 L60,222"/>
+  </g>
+  <path d="M685,20 L685,8 L57,8 L57,18" stroke="#ef6c00" stroke-width="1.5" fill="none" stroke-dasharray="5 3" marker-end="url(#ar-iv-1)"/>
+  <text x="230" y="24" text-anchor="middle" font-size="10.5" fill="#ef6c00">origin pull</text>
+</svg>
+<div class="caption">The high-level design to draw on the whiteboard: a synchronous path (Clients → LB → API Gateway → stateless services → data stores), an async path (services → Kafka → workers), and a media path (Object Storage → CDN → Clients).</div>
+</div>
+
+<div class="callout interview"><span class="callout-title">🎤 Dialogue: walking the diagram</span>
+<p><b>Candidate:</b> Let me trace a <em>write</em>. Alice posts a photo. The app asks the Upload Service for a pre-signed URL and uploads the bytes straight to object storage, so the media never touches our app servers. Then it calls <code>POST /posts</code>. The Upload Service writes the post row to Cassandra, publishes <code>post.created</code> to Kafka and returns 201. Asynchronously, media workers generate renditions and run moderation. Fan-out workers look up Alice's followers in the graph store and push the post ID into each follower's Redis timeline. The search indexer indexes hashtags, and the notification service tells anyone she tagged.</p>
+<p><b>Candidate:</b> Now a <em>read</em>. Bob opens the app. DNS sends him to the nearest region, and the LB forwards to the gateway, which validates his JWT and rate-limits. The News Feed Service reads <code>timeline:bob</code> from Redis (~500 post IDs), merges in recent posts from any celebrities he follows (pulled, not pushed; I'll explain in the deep dive), ranks them, hydrates the top 20 from the post cache and returns JSON with CDN URLs. The app then fetches images from the nearest CDN edge.</p>
+<p><b>Interviewer:</b> Where's the single point of failure?</p>
+<p><b>Candidate:</b> There shouldn't be one. The LBs are redundant pairs with a floating VIP or Anycast. The gateway and all services are stateless and horizontally scaled behind the LB. Every data store is replicated: PostgreSQL has a leader with followers and automated failover, Cassandra uses RF=3, Redis has replicas, Kafka uses RF=3. The region itself is a failure domain, so we run multiple regions with GeoDNS failover (see <a href="multi-region.html">multi-region</a>).</p>
+</div>
+<p>More detailed hop-by-hop walkthroughs of all nine core flows are in <a href="request-flows.html">End-to-End Request Flows</a>.</p>
+
+<h2>9. Minutes 28–40: Deep dives</h2>
+<p>The interviewer will now pick, or let you pick, two or three areas. Lead with the one that's most central: <strong>the feed</strong>. Have all six below ready; in a real interview you'll cover two or three in depth and mention the rest.</p>
+
+<h3>9.1 Feed generation: fan-out on write, on read, or hybrid</h3>
+<div class="callout interview"><span class="callout-title">🎤 Dialogue</span>
+<p><b>Interviewer:</b> How exactly do posts get into people's feeds?</p>
+<p><b>Candidate:</b> There are two basic models. <em>Fan-out on read</em> (pull): when Bob opens the app, fetch the latest posts of everyone he follows and merge them. Writes are cheap, but each read touches hundreds of partitions, and at 150k feed requests/s that's tens of millions of DB reads per second, so it's too slow and expensive. <em>Fan-out on write</em> (push): when Alice posts, write the post ID into every follower's precomputed timeline. Reads become one Redis lookup, which is ideal for a read-heavy app. But a celebrity with 300M followers would trigger 300M writes per post, taking many minutes and causing massive write amplification. So I'd use a <strong>hybrid</strong>: push for normal accounts, pull for celebrities, merged at read time.</p>
+</div>
+<pre class="ascii">
+ WRITE PATH (post.ready event)                 READ PATH (GET /feed for Bob)
+
+ author has &lt; ~1M followers?                   timeline:bob (Redis ZSET) ---------+
+   YES -&gt; PUSH: page through followers,          ~500 post IDs pushed earlier      |
+          ZADD timeline:{f} ts post_id                                             +--&gt; merge
+          (skip inactive followers)             celebrities Bob follows (~0-50)    |    filter (blocked,
+   NO  -&gt; nothing (celebrity)                     -&gt; PULL recent posts of each ----+    deleted, seen)
+                                                     (hot, heavily cached)              rank -&gt; top 20
+                                                                                        hydrate -&gt; JSON
+</pre>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Fan-out on write (push)</th><th>Fan-out on read (pull)</th><th>Hybrid ⭐</th></tr>
+  <tr><td><b>Read cost</b></td><td>1 Redis read</td><td>N partition reads (N = followees)</td><td>1 Redis read + a few cached celebrity reads</td></tr>
+  <tr><td><b>Write cost</b></td><td>F writes (F = followers)</td><td>1 write</td><td>F writes only for normal accounts</td></tr>
+  <tr><td><b>Celebrity post</b></td><td>Catastrophic (100M+ writes)</td><td>Fine</td><td>Fine (pulled)</td></tr>
+  <tr><td><b>Inactive users</b></td><td>Wasted writes</td><td>No waste</td><td>Skip inactive followers; rebuild on return</td></tr>
+  <tr><td><b>Freshness</b></td><td>Seconds of lag</td><td>Real-time</td><td>Seconds of lag for push, real-time for celebrities</td></tr>
+</table></div>
+<p>Details a senior candidate adds: the threshold is a tunable (follower count and posting rate). Timelines are capped (~500 IDs), because nobody scrolls further and older content can be pulled. Timelines store <em>IDs only</em>, so edits and deletes don't need fan-out; hydration reads the current post object. Ranking happens at read time over the merged candidates. Unfollows are filtered at read time instead of being purged eagerly. Full treatment: <a href="news-feed.html">news feed</a>.</p>
+
+<h3>9.2 Media upload &amp; processing</h3>
+<pre class="ascii">
+  Clients     API     Upload    Object    Cassandra   Kafka    Workers
+            Gateway   Service   Storage
+     |         |         |         |          |         |         |
+     | 1 POST /media/uploads       |          |         |         |
+     |--------&gt;|         |         |          |         |         |
+     |         | 2 route |         |          |         |         |
+     |         |--------&gt;|         |          |         |         |
+     | 3 media_id + pre-signed URL |          |         |         |
+     |&lt;..................|         |          |         |         |
+     | 4 PUT bytes       |         |          |         |         |
+     |----------------------------&gt;|          |         |         |
+     | 5 POST /posts (via gateway) |          |         |         |
+     |------------------&gt;|         |          |         |         |
+     |         |         | 6 INSERT post      |         |         |
+     |         |         |-------------------&gt;|         |         |
+     |         |         | 7 post.created     |         |         |
+     |         |         |~~~~~~~~~~~~~~~~~~~~~~~~~~~~~&gt;|         |
+     | 8 201 {post_id}   |         |          |         |         |
+     |&lt;..................|         |          |         |         |
+     |         |         |         |          |         | 9 resize, fan-out, index, notify
+     |         |         |         |          |         |~~~~~~~~&gt;|
+     |         |         |         |          |         |         |
+
+legend:  ----&gt; synchronous call    ....&gt; response    ~~~~&gt; asynchronous event (Kafka)    -- local work
+</pre>
+<ul>
+  <li><strong>Pre-signed URLs</strong> let clients upload directly to object storage. App servers never proxy bytes, and the URL is scoped to one key, size and content type and expires in minutes (see <a href="media-upload.html">media upload</a>).</li>
+  <li><strong>Resumable / multipart</strong> uploads for video: 5–8 MB chunks, so a dropped connection costs one chunk instead of the whole file.</li>
+  <li><strong>Client-side resize and compression</strong> before upload, which saves 80–90% of bytes for photos.</li>
+  <li><strong>Async processing</strong> via Kafka → media workers: renditions (150/320/640/1080 px, WebP/AVIF), video transcoding to HLS/DASH at several bitrates, thumbnails, EXIF stripping, moderation classifiers and perceptual-hash matching. Workers are idempotent, with a dead-letter queue for poison files (see <a href="media-processing.html">media processing</a>).</li>
+  <li><strong>Content-addressed, versioned keys</strong> (<code>p/{media_id}/{hash}_1080.webp</code>) let the <a href="cdn.html">CDN</a> cache with <code>max-age=1 year, immutable</code>.</li>
+  <li><strong>Storage tiering:</strong> renditions of old, rarely viewed posts move to cheaper storage classes. Erasure coding gives ~1.4× overhead instead of 3× replication (see <a href="object-storage.html">object storage</a>). Public papers describe Facebook's Haystack and f4 systems doing exactly this kind of hot/warm split for photos.</li>
+</ul>
+
+<h3>9.3 Sharding &amp; Instagram's ID scheme</h3>
+<div class="callout interview"><span class="callout-title">🎤 Dialogue</span>
+<p><b>Interviewer:</b> Your User DB and post tables are sharded. How do you generate IDs, and how do you shard?</p>
+<p><b>Candidate:</b> I need IDs that are unique without a central coordinator, 64-bit so they fit in a <code>BIGINT</code> and index well, and roughly <em>time-sortable</em>, so that sorting by ID equals sorting by time. Then feeds and comment lists don't need a separate timestamp index. Instagram's engineering blog describes exactly this. Each ID packs a timestamp, a logical shard number and a per-shard sequence, and is generated inside PostgreSQL.</p>
+</div>
+<pre class="ascii">
+ bit 63                                   23 22               10 9              0
+    +--------------------------------------+-------------------+----------------+
+    |  41 bits: milliseconds since a       |  13 bits: logical |  10 bits:      |
+    |  custom epoch  (~69 years of range)  |  shard ID (8,192) |  sequence      |
+    +--------------------------------------+-------------------+----------------+
+                                                                (1,024 IDs per ms per shard)
+
+ id = (now_ms - EPOCH) &lt;&lt; 23  |  shard_id &lt;&lt; 10  |  (seq % 1024)
+
+ example: (500,000,000,000 &lt;&lt; 23) | (1341 &lt;&lt; 10) | 7  =  4,194,304,000,001,373,191
+          → created 500 billion ms (~15.8 years) after the epoch, lives on logical shard 1341
+</pre>
+<pre><code>-- One schema per logical shard; this function is created in each schema (shard 1341 shown)
+CREATE SEQUENCE shard_1341.id_seq;
+
+CREATE OR REPLACE FUNCTION shard_1341.next_id(OUT result bigint) AS $$
+DECLARE
+  our_epoch bigint := 1293840000000;          -- 2011-01-01T00:00:00Z in ms
+  shard_id  int    := 1341;
+  seq_id    bigint;
+  now_ms    bigint;
+BEGIN
+  SELECT nextval('shard_1341.id_seq') % 1024 INTO seq_id;
+  now_ms := floor(extract(epoch FROM clock_timestamp()) * 1000);
+  result := ((now_ms - our_epoch) &lt;&lt; 23) | (shard_id &lt;&lt; 10) | seq_id;
+END;
+$$ LANGUAGE plpgsql;</code></pre>
+<ul>
+  <li><strong>Logical vs physical shards:</strong> create thousands of <em>logical</em> shards (PostgreSQL schemas) up front, and map many of them onto each physical server. To scale, move whole logical shards to new machines. Nothing needs re-hashing, only a mapping-table update (see <a href="sharding.html">sharding</a>).</li>
+  <li><strong>Shard key = <code>user_id</code></strong> for users and their posts. A post's ID embeds its shard, so given any post ID you can find its shard without a lookup.</li>
+  <li><strong>Hot shards</strong> (one shard holding several celebrities) are handled by moving logical shards and by the caching and hot-key techniques below.</li>
+  <li><strong>Alternatives:</strong> Twitter's Snowflake (timestamp + machine ID + sequence, generated by a service), UUIDv4 (random, 128-bit, not sortable, poor index locality), UUIDv7/ULID (sortable 128-bit), and DB auto-increment (needs a central coordinator). Compared in <a href="id-generation.html">ID generation</a>.</li>
+  <li>Cassandra tables use <a href="consistent-hashing.html">consistent hashing</a> with virtual nodes on the partition key, so they need no manual shard map.</li>
+</ul>
+
+<h3>9.4 Caching strategy</h3>
+<div class="table-wrap"><table>
+  <tr><th>Layer</th><th>What's cached</th><th>Pattern</th><th>Invalidation / TTL</th></tr>
+  <tr><td>Client (app)</td><td>Last feed, images, profile</td><td>Stale-while-revalidate</td><td>Refresh on open / pull-to-refresh</td></tr>
+  <tr><td>CDN</td><td>Media renditions, video segments, avatars</td><td>Pull-through, origin shield</td><td>Versioned URLs, long TTL; purge on delete</td></tr>
+  <tr><td>Redis: timelines</td><td>Post IDs per user</td><td>Write-through by fan-out workers</td><td>Capped size; rebuilt on miss; evict inactive users</td></tr>
+  <tr><td>Redis/Memcache: objects</td><td>Hydrated posts, user profiles</td><td>Cache-aside</td><td>Delete on update (via events); TTL hours</td></tr>
+  <tr><td>Redis: counters</td><td>Likes, comments, followers</td><td>Write-back (flushed periodically)</td><td>Reconciled with durable store</td></tr>
+  <tr><td>Graph cache</td><td>Following lists, block lists</td><td>Read-through</td><td>Invalidate on follow/unfollow event</td></tr>
+  <tr><td>Search prefix cache</td><td>Typeahead results per prefix</td><td>Cache-aside</td><td>Short TTL (minutes)</td></tr>
+</table></div>
+<p>Three issues to name before the interviewer does. First, <strong>cache stampede</strong>: when a hot key expires, thousands of requests miss at once. Fix it with request coalescing, a lock or lease so one request refills, and early probabilistic refresh. Second, <strong>invalidation races</strong>: delete the cache entry rather than updating it, and use versioning or leases (Facebook's Memcache paper describes leases for exactly this). Third, <strong>cold start</strong> after a cache node dies: warm it gradually and have consistent-hashed clients spread the misses. See <a href="caching.html">caching</a>.</p>
+
+<h3>9.5 The celebrity / hot-key problem</h3>
+<div class="callout interview"><span class="callout-title">🎤 Dialogue</span>
+<p><b>Interviewer:</b> A celebrity with 400M followers posts. Walk me through everything that gets hot.</p>
+<p><b>Candidate:</b> Five things. (1) <em>Fan-out</em>: already handled, because celebrities are on the pull path, so their post is a single write. (2) <em>The post object</em>: tens of millions of feed requests hydrate the same <code>post:{id}</code> key, so one Redis shard melts. I'd replicate hot keys across several cache nodes (append a random suffix <code>post:{id}#k</code> and read a random replica) and add a tiny in-process LRU cache on every News Feed Service instance, with a TTL of a few seconds. (3) <em>The like counter</em>: one key with millions of increments per minute, so I'd shard it into N sub-counters, batch increments in the service, and sum on read. Showing "4.1M likes" doesn't need exact accuracy. (4) <em>The likes partition</em> in Cassandra: bucket it by <code>(post_id, bucket)</code>. (5) <em>The media</em>: every CDN PoP misses at once, so pre-warm major PoPs after processing, and rely on request collapsing and the origin shield. Plus the notification service must <em>not</em> push 400M notifications at once; post notifications are opt-in and rate-limited.</p>
+</div>
+<p>Hot keys are a recurring theme across <a href="caching.html">caching</a>, <a href="likes-comments.html">likes &amp; counters</a>, <a href="sharding.html">sharding</a> and <a href="cdn.html">CDN</a>. The general toolkit is <strong>replicate, split, batch, cache locally, and smooth over time</strong>.</p>
+
+<h3>9.6 Direct messages</h3>
+<ul>
+  <li><strong>Transport:</strong> persistent WebSocket (or MQTT) connections terminated on a fleet of connection servers. A <strong>presence registry</strong> in Redis maps <code>user_id → connection host</code> with a heartbeat TTL. HTTP polling would waste battery and server capacity. See <a href="direct-messaging.html">direct messaging</a>.</li>
+  <li><strong>Ordering:</strong> a per-thread monotonically increasing sequence number assigned by the DM service. There's no global ordering, since conversations are independent.</li>
+  <li><strong>Storage:</strong> a Messages table partitioned by <code>thread_id</code> and clustered by <code>seq</code>. One conversation is one partition; very long conversations are bucketed by time.</li>
+  <li><strong>Delivery:</strong> persist first, then ack the sender. If the recipient is online, push over their socket; if offline, send an event to the Notification Service and APNs/FCM. On reconnect the client syncs <code>after_seq = N</code>. Client-generated <code>client_msg_id</code>s dedupe retries.</li>
+  <li><strong>Receipts:</strong> sent (server persisted), delivered (recipient device acked), read (recipient opened the thread). These are small, idempotent state updates.</li>
+  <li><strong>Group chats:</strong> fan out to members on send (small groups) and cap group size. End-to-end encryption changes the server's role to storing ciphertext blobs.</li>
+</ul>
+
+<h2>10. Minutes 40–43: Bottlenecks &amp; trade-offs</h2>
+<div class="callout interview"><span class="callout-title">🎤 Dialogue</span>
+<p><b>Interviewer:</b> We have a few minutes left. What would break first, and what trade-offs did you make?</p>
+<p><b>Candidate:</b> Here are the risks I'd monitor, in order:</p>
+<p>1) <em>Fan-out backlog</em> during peaks. Kafka absorbs it, and I'd autoscale workers on consumer lag. Feeds get slightly stale but nothing fails.<br>
+2) <em>Hot keys</em> in Redis and Cassandra from viral content, mitigated as discussed.<br>
+3) <em>Ranking latency</em>: it's the biggest server-side cost, so I'd give it a strict deadline and a chronological fallback.<br>
+4) <em>Cross-shard consistency</em>: follow edges and counters are written to multiple shards without distributed transactions. I accepted eventual consistency plus repair jobs instead of two-phase commit, which would hurt availability and latency.<br>
+5) <em>Regional failure</em>: active-active regions with GeoDNS failover. User data has a home region for writes, so there's some RPO risk for the last few seconds of asynchronously replicated data.</p>
+<p>The big trade-offs were: consistency → availability and latency for the feed and counters; storage and write amplification (fan-out, denormalised tables) → read speed; operational complexity (Kafka, many stores) → independent scaling and failure isolation.</p>
+</div>
+<p>Related lessons: <a href="resilience-patterns.html">resilience patterns</a>, <a href="multi-region.html">multi-region &amp; DR</a>, <a href="observability.html">observability</a>, <a href="core-principles.html">core principles</a>.</p>
+
+<h2>11. Minutes 43–45: Wrap-up</h2>
+<div class="callout interview"><span class="callout-title">🎤 Dialogue: closing summary</span>
+<p><b>Candidate:</b> To summarise: a stateless service tier behind a load balancer and API gateway. Media goes directly to object storage via pre-signed URLs and is served through a CDN. Metadata lives in sharded PostgreSQL and Cassandra, with time-sortable 64-bit IDs. Feeds are precomputed in Redis using hybrid fan-out, with pull for celebrities. Every write publishes an event to Kafka, which drives media processing, fan-out, search indexing, notifications and analytics. It meets the latency goals because reads are mostly cache lookups, and it stays available because every tier is replicated and failures degrade gracefully. With more time I'd go deeper on the ranking pipeline, multi-region data placement, abuse and spam prevention, and cost optimisation for cold media.</p>
+<p><b>Interviewer:</b> Thanks, that was great.</p>
+</div>
+
+<h2>12. How Instagram actually does it (public information)</h2>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+<p>Public engineering posts and conference talks describe several facts worth citing in an interview, carefully hedged:</p>
+<ul>
+  <li>Instagram began as a <strong>Python/Django</strong> monolith and famously scaled to tens of millions of users with a very small engineering team.</li>
+  <li>It used <strong>sharded PostgreSQL</strong> with thousands of logical shards mapped to fewer physical servers, and the <strong>64-bit ID scheme</strong> above (41-bit time, 13-bit shard, 10-bit sequence) generated in PL/pgSQL.</li>
+  <li>It adopted <strong>Cassandra</strong> for write-heavy datasets such as feeds, activity and fraud data, and contributed to Cassandra performance work.</li>
+  <li>It relied heavily on <strong>Memcache</strong> and <strong>Redis</strong> caches and asynchronous task queues, and after the Facebook acquisition it moved into Meta's data centers and infrastructure (Facebook's papers on <strong>TAO</strong>, <strong>Memcache</strong> and <strong>Haystack</strong> describe the graph cache, cache fleet and photo storage ideas used at that scale).</li>
+  <li>The home feed moved from chronological to <strong>ML-ranked</strong> in 2016.</li>
+</ul>
+<p>Present these as "public talks describe…", never as insider detail. The interviewer cares that you can <em>reason</em> about the design, not that you've memorised Instagram's internals.</p>
+</div>
+
+<h2>13. Evaluation rubric: junior vs senior vs staff</h2>
+<p>Interviewers typically score communication, requirements, high-level design, deep dives, trade-offs and operational thinking. Here is what each level tends to look like on this exact question.</p>
+<div class="table-wrap"><table>
+  <tr><th>Dimension</th><th>Junior / entry (L3–L4)</th><th>Senior (L5)</th><th>Staff+ (L6+)</th></tr>
+  <tr><td><b>Scoping</b></td><td>Asks a few questions; may try to design every feature</td><td>Scopes to the core loop crisply; states NFRs with numbers</td><td>Also frames the business goal (engagement, cost) and what would change the scope</td></tr>
+  <tr><td><b>Estimation</b></td><td>Computes QPS/storage with some help</td><td>Fast, rounded numbers that drive decisions ("so the feed must be in memory")</td><td>Adds cost (e.g. CDN and storage spend), peak vs average, growth, and capacity headroom</td></tr>
+  <tr><td><b>High-level design</b></td><td>Reasonable boxes; may route media through app servers or use one DB for everything</td><td>Clean separation of sync/async and API/media paths; right store per dataset</td><td>Same, plus multi-region topology, failure domains and the evolution path from MVP to scale</td></tr>
+  <tr><td><b>Feed</b></td><td>Pull or push, without the trade-off</td><td>Hybrid fan-out with a celebrity threshold, capped timelines, IDs-only timelines</td><td>Also inactive-user optimisation, ranking pipeline stages, feature freshness, experimentation (A/B)</td></tr>
+  <tr><td><b>Data &amp; sharding</b></td><td>"Shard by user_id"</td><td>Partition and clustering keys per query; denormalisation; ID scheme; hot partitions</td><td>Resharding strategy (logical shards), cross-shard consistency, migrations without downtime</td></tr>
+  <tr><td><b>Reliability</b></td><td>Mentions replication</td><td>Timeouts, retries with idempotency, DLQs, graceful degradation, outbox</td><td>SLOs and error budgets, blast-radius reduction, load shedding, regional evacuation drills</td></tr>
+  <tr><td><b>Trade-offs</b></td><td>Lists pros and cons when asked</td><td>Volunteers trade-offs and justifies choices against requirements</td><td>Weighs organisational and operational cost; knows when <em>not</em> to build (buy a CDN, etc.)</td></tr>
+  <tr><td><b>Communication</b></td><td>Needs prompting to move forward</td><td>Drives the session, checks in with the interviewer, manages time</td><td>Teaches; structures ambiguity; adapts depth to the interviewer's interest</td></tr>
+</table></div>
+
+<h2>14. Trade-offs &amp; common mistakes</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ What this design optimises for</h4><ul>
+    <li>Fast, cheap reads (feed served from memory, media from the CDN)</li>
+    <li>Writes that return quickly regardless of follower count</li>
+    <li>Independent scaling of each service and store</li>
+    <li>Failure isolation: background failures don't break user requests</li>
+    <li>Easy extension by adding Kafka consumers</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ What it gives up</h4><ul>
+    <li>Strong consistency for feeds, counts and search</li>
+    <li>Storage efficiency (denormalised tables, per-user timelines)</li>
+    <li>Simplicity: many datastores, Kafka, worker fleets to operate</li>
+    <li>Atomic cross-shard updates (replaced by idempotent retries and repair)</li>
+  </ul></div>
+</div>
+<h4>Common mistakes candidates make</h4>
+<ul>
+  <li><strong>Jumping into boxes before scoping.</strong> You'll design the wrong system, or all of it shallowly.</li>
+  <li><strong>Estimation without conclusions.</strong> Numbers are only useful if you say what they imply ("~150k QPS → must precompute and cache").</li>
+  <li><strong>Media through app servers, or blobs in the database.</strong> Use pre-signed uploads, object storage and a CDN.</li>
+  <li><strong>Pure fan-out on write</strong> with no celebrity handling, or pure pull with no answer for read latency.</li>
+  <li><strong>"Just add a cache"</strong> without saying what's cached, the pattern, the invalidation and the hot-key behaviour.</li>
+  <li><strong>A single SQL database for everything</strong> with no sharding plan, or NoSQL for everything without reasons.</li>
+  <li><strong>Ignoring failure:</strong> no timeouts, retries, idempotency or degradation story.</li>
+  <li><strong>Sync calls for async work,</strong> like resizing images or notifying followers inside the request.</li>
+  <li><strong>Monologuing.</strong> Not checking in with the interviewer, missing their hints, running out of time before the deep dive.</li>
+  <li><strong>Over-engineering</strong> things that weren't asked for, like a custom consensus protocol or blockchain, while the feed is still undesigned.</li>
+</ul>
+
+<h2>15. How the design changes for similar products</h2>
+<div class="table-wrap"><table>
+  <tr><th>Product</th><th>What's different</th><th>Design changes vs Instagram</th></tr>
+  <tr><td><b>Twitter / X</b></td><td>Text-first, tiny payloads; extreme celebrity skew; real-time trends; retweets</td><td>Hybrid fan-out is even more critical (timelines in Redis, celebrity pull). Media is optional, so the CDN matters less. Heavy real-time search and trend counting (stream processing). Snowflake IDs. Retweets fan out references, not copies.</td></tr>
+  <tr><td><b>TikTok</b></td><td>The For You feed is <em>interest-graph</em>, not follow-graph; video-only</td><td>Little need for follow-based fan-out. The feed is a <strong>recommendation pipeline</strong> (candidate retrieval → ranking → re-ranking) over a global video pool, driven by real-time watch signals. Heavy transcoding, ABR streaming and CDN pre-positioning of trending videos.</td></tr>
+  <tr><td><b>Facebook News Feed</b></td><td>Mixed content (posts, links, groups, pages), bidirectional friendships, heavy ranking</td><td>Historically leans more towards <strong>pull at read time</strong> with aggressive caching (TAO graph cache, aggregators that gather candidates from many leaf servers), because candidate sets are large and ranking is heavy. Privacy checks per item are complex.</td></tr>
+  <tr><td><b>Pinterest</b></td><td>Saving and organising images into boards; discovery and visual search</td><td>The home feed mixes follows and interest-based recommendations. A pin is shared across many boards (store references). Visual similarity search with image embeddings and vector indexes. Long-lived content, so long CDN TTLs pay off.</td></tr>
+  <tr><td><b>YouTube</b></td><td>Long videos, creators, search-first and recommendation-first; uploads are big</td><td>Upload and transcoding pipelines dominate (many resolutions and codecs, hours of compute per video). Huge storage tiers. The CDN is critical (ISP-embedded caches). Watch-time-based recommendations. Comments and likes resemble Instagram's.</td></tr>
+</table></div>
+
+<h2>16. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Component</th><th>Typical choices</th><th>When to mention</th></tr>
+  <tr><td>Edge</td><td>GeoDNS (Route 53, NS1), CDN (Akamai, Cloudflare, CloudFront, Fastly), Anycast</td><td>Global latency and media egress</td></tr>
+  <tr><td>LB / gateway</td><td>Envoy, NGINX, HAProxy, AWS ALB/NLB, Kong</td><td>Routing, TLS, auth, rate limiting</td></tr>
+  <tr><td>Services</td><td>Python/Django, Go, Java/Kotlin, C++; gRPC/Thrift</td><td>Stateless business logic</td></tr>
+  <tr><td>Relational</td><td>PostgreSQL, MySQL (Vitess, Citus for sharding)</td><td>Users, settings, constraints</td></tr>
+  <tr><td>Wide-column</td><td>Cassandra, ScyllaDB, HBase, Bigtable, DynamoDB</td><td>Posts, likes, comments, messages, timelines-on-disk</td></tr>
+  <tr><td>Cache</td><td>Redis, Memcached, TAO-like graph caches</td><td>Timelines, counters, hot objects</td></tr>
+  <tr><td>Blob</td><td>S3, GCS, Azure Blob, Ceph, Haystack/f4-style systems</td><td>Photos and videos</td></tr>
+  <tr><td>Streaming</td><td>Kafka, Pulsar, Kinesis; Flink, Spark Streaming</td><td>Events, fan-out, real-time aggregates</td></tr>
+  <tr><td>Search</td><td>Elasticsearch/OpenSearch, Solr</td><td>Users, hashtags, places</td></tr>
+  <tr><td>Analytics / ML</td><td>Spark, Presto/Trino, Hive, data warehouse; PyTorch; feature stores</td><td>Ranking, Explore, metrics</td></tr>
+</table></div>
+
+<h2>17. Interview corner: follow-up questions</h2>
+<p>These are the follow-ups interviewers use to probe depth after the main design. Try answering each before opening it.</p>
+<details class="qa"><summary>1. How do you pick the follower threshold for switching a user from push to pull?</summary>
+<p>Make it a tunable driven by cost, not a magic number. Fan-out cost per post ≈ followers × posting rate, and pull cost ≈ number of feed reads that touch that author. Push is cheaper while followers × posts/day is below what we'd pay in extra read work. In practice choose something like 100k–1M followers, adjusted by activity (an account with 2M followers that posts once a month can still be pushed). Apply hysteresis so accounts near the boundary don't flip-flop, and measure Redis write throughput and feed p99 to tune it.</p></details>
+<details class="qa"><summary>2. A user deletes a post. What has to happen across the system?</summary>
+<p>Synchronously: mark the post <code>REMOVED</code> (a soft delete) in Cassandra and invalidate the post-object cache, so hydration returns nothing and the post vanishes from every feed immediately, without touching millions of timelines. Asynchronously, via a <code>post.deleted</code> event: remove it from the search index, purge CDN URLs (signed URLs also expire), delete likes and comments in the background, remove it from the analytics serving tables, and after a retention period hard-delete the blobs in object storage for privacy/GDPR compliance. Timeline entries that still hold the ID are filtered out at read time and age out.</p></details>
+<details class="qa"><summary>3. How do you show the correct "viewer_has_liked" flag for 20 posts efficiently?</summary>
+<p>Batch it. One multi-get against a per-user "recent likes" structure, such as a Redis set of post IDs liked in the last N days, or a Bloom filter for fast negatives backed by an exact lookup in <code>likes_by_user</code> for positives. That's 20 lookups in one round trip, not 20 queries. Older posts fall back to a Cassandra lookup on <code>(post_id, user_id)</code>, which is a single-partition read.</p></details>
+<details class="qa"><summary>4. How would you implement the Explore page?</summary>
+<p>It's a recommendation problem, not a follow-graph one. Candidate generation retrieves thousands of posts from many sources (accounts similar to ones you engage with, embedding nearest-neighbour search, trending in your region). A lightweight model filters to hundreds, a heavy model ranks them, and then re-ranking adds diversity and integrity filters. It's served from precomputed candidate pools plus real-time features, and trained offline in Analytics &amp; ML Training on engagement logs (see <a href="analytics-ml.html">analytics &amp; ML</a>).</p></details>
+<details class="qa"><summary>5. How do you enforce privacy (private accounts, blocks) in the feed and search?</summary>
+<p>Defence in depth. At write time, fan-out only goes to approved followers. At read time, the feed filters candidates against the viewer's block and mute lists (cached sets) and the author's privacy state. Hydration re-checks visibility on the post object. Search filters results by visibility, and profile views go through an authorization check in the service. Media URLs are signed and short-lived so leaked links expire. Privacy checks are the one place where we don't accept stale caches for long: block events invalidate caches immediately.</p></details>
+<details class="qa"><summary>6. How do you migrate from one database shard layout to another with zero downtime?</summary>
+<p>Use logical shards so a migration moves whole units. For each logical shard: start replicating it to the new server (snapshot plus change stream), let it catch up, briefly pause writes for that one shard (milliseconds to seconds), flip the shard map entry, then resume. Alternatively, dual-write with backfill and verification before switching reads. Do it shard by shard with feature flags and rollback. Never do a big-bang migration.</p></details>
+<details class="qa"><summary>7. What happens if the Redis timeline cluster loses a node?</summary>
+<p>Replicas are promoted (Redis Cluster failover takes seconds). If data is lost anyway, affected users' timelines are rebuilt on demand via fan-out-on-read from the graph and <code>posts_by_user</code>, then written back. To avoid a thundering herd, rebuilds are rate-limited and coalesced per user, and the feed service may serve the most recent posts chronologically while rebuilding. Timelines are a cache of derivable data, so no data is permanently lost.</p></details>
+<details class="qa"><summary>8. How do you count views on Reels accurately at huge scale?</summary>
+<p>Clients send view events in batches to an ingestion endpoint that writes them to Kafka. A stream processor (Flink or Spark Streaming) deduplicates per (viewer, reel, time window), aggregates per reel per minute, and updates counters in a fast store. Displayed counts are approximate and slightly delayed. Exact counts for billing or creator analytics come from batch jobs over the warehouse. HyperLogLog gives cheap unique-viewer estimates.</p></details>
+<details class="qa"><summary>9. How would you design for multiple regions? Where does a user's data live?</summary>
+<p>Active-active regions behind GeoDNS. Stateless services run everywhere. Each user has a <strong>home region</strong> for writes to their own data (avoiding multi-leader conflicts), and data replicates asynchronously to other regions for local reads. Cassandra can replicate per keyspace with <code>NetworkTopologyStrategy</code>. Media is in object storage replicated across regions and served via the CDN. On a regional outage, GeoDNS moves traffic away and a standby region takes over home-region duties, accepting a small RPO. Data residency laws may pin some users' data to specific regions (see <a href="multi-region.html">multi-region</a>).</p></details>
+<details class="qa"><summary>10. How do you protect the system from abuse such as spam accounts, fake likes and scraping?</summary>
+<p>Layers. Rate limits at the gateway per user, IP and device, on sensitive actions like follow, like, comment and search. Device and account reputation scores. ML classifiers on the event stream that detect bursts and coordinated behaviour. CAPTCHA and phone verification challenges. Shadow-limiting suspicious actions so they don't count. Signed, short-lived media URLs. WAF and bot detection at the edge. Engagement from flagged accounts is excluded from counts and ranking signals (see <a href="security.html">security</a>, <a href="rate-limiting.html">rate limiting</a>).</p></details>
+<details class="qa"><summary>11. Why Kafka instead of a simple task queue like RabbitMQ or SQS?</summary>
+<p>We need <em>one event, many independent consumers</em> (fan-out, search, notifications, analytics, media), each with its own pace and the ability to <em>replay</em> history, for example to rebuild a search index or backfill a new feature. Kafka's durable, partitioned log with consumer groups gives that, plus per-key ordering and very high throughput. A classic queue deletes messages after consumption and suits per-task work distribution. You might still use one inside a component, such as a transcoding job queue (see <a href="message-queues.html">message queues</a>).</p></details>
+<details class="qa"><summary>12. How do you know the system is healthy? What would you alert on?</summary>
+<p>Define SLOs on user-facing outcomes: feed p99 latency and error rate, upload success rate, time from post to visibility for followers, DM delivery latency, push success rate. Alert on burn rates of those error budgets, not on CPU. Supporting metrics include Kafka consumer lag per group, cache hit ratios, DB p99 and replication lag, CDN hit ratio and origin load, and DLQ growth. Distributed tracing finds which hop regressed, and structured logs carrying trace IDs explain why (see <a href="observability.html">observability</a>).</p></details>
+<details class="qa"><summary>13. The interviewer says "now support 10× the users". What changes?</summary>
+<p>Mostly nothing structural, which is the point of horizontal scaling: add service instances, Cassandra nodes, Redis shards, Kafka partitions and CDN capacity. What needs attention: raise the celebrity threshold logic and fan-out capacity (write amplification grows with average follower count, not just users), add logical-to-physical shard moves, add regions to keep latency down, apply tiered and erasure-coded storage for cost, push more work to the client (resizing, caching), and review hot-key mitigations. Then re-run the estimates to find the new first bottleneck.</p></details>
+<details class="qa"><summary>14. How do comments with replies work, and how are they ordered?</summary>
+<p>Store comments in <code>comments_by_post</code>, partitioned by post and clustered by time-sortable <code>comment_id</code>. Replies carry a <code>parent_id</code> and are stored in <code>replies_by_comment</code> so a thread loads with one partition read. Display order is ranked: the author's replies, friends' comments and highly liked comments first, using a cached "top comments" list per post, with chronological pagination for the rest. Comment counts use the same sharded-counter approach as likes, and a <code>comment.created</code> event triggers moderation (spam/abuse classifiers) and notifications.</p></details>
+
+<h2>18. Check your understanding</h2>
+<details class="quiz"><summary>You have 45 minutes. At minute 25 you haven't drawn the high-level design yet. What do you do?</summary>
+<p>Stop refining earlier sections and draw the end-to-end design immediately, even if it's rough: clients, LB/gateway, core services, stores, Kafka, CDN. Walk one write and one read through it, then ask the interviewer which area to deep-dive. A complete, simple design beats a perfect API with no architecture.</p></details>
+<details class="quiz"><summary>With 500M DAU each loading the feed 10×/day, what's the average feed QPS, and roughly what peak would you design for?</summary>
+<p>500M × 10 = 5B requests/day ÷ 86,400 s ≈ 58k QPS on average. With a 2–3× peak factor, design for ~150k QPS, plus headroom for a regional failover that shifts another region's traffic.</p></details>
+<details class="quiz"><summary>Decode this Instagram-style ID: <code>(t &lt;&lt; 23) | (s &lt;&lt; 10) | q</code>. How many IDs per millisecond can one logical shard generate, and how many logical shards are possible?</summary>
+<p>The sequence field has 10 bits, giving 2^10 = 1,024 IDs per millisecond per shard (about 1 million per second per shard). The shard field has 13 bits, giving 2^13 = 8,192 logical shards. The 41-bit timestamp covers 2^41 ms ≈ 69.7 years from the custom epoch.</p></details>
+<details class="quiz"><summary>A candidate proposes pure fan-out on write. Give the interviewer's best counter-question and the expected answer.</summary>
+<p>"What happens when an account with 300M followers posts?" With pure push, that's 300M timeline writes per post. At, say, 1M writes/s of fan-out capacity it takes 5 minutes, delays everyone else's posts and wastes writes on inactive users. The expected fix is the hybrid model: pull celebrities at read time and push for everyone else.</p></details>
+<details class="quiz"><summary>Which of these must be strongly consistent: (a) like count, (b) block list, (c) home feed contents, (d) DM order within a thread, (e) username uniqueness?</summary>
+<p>(b), (d) and (e). A block must take effect immediately (privacy). Messages in a thread must appear in a consistent order. Two users must never get the same username, which needs a unique constraint or a conditional write. (a) and (c) can be eventually consistent.</p></details>
+<details class="quiz"><summary>Why does a timeline store only post IDs rather than full post objects?</summary>
+<p>IDs are 8 bytes, while objects are ~1 KB, so the cache is ~100× smaller (2 TB vs ~250 TB). Edits, deletes and counter changes don't need to be fanned out to millions of timelines: hydration always reads the current object from one place. It also keeps fan-out writes tiny and fast.</p></details>
+<details class="quiz"><summary>How would the design change if the interviewer said "design TikTok's For You feed" instead?</summary>
+<p>The follow graph becomes a minor signal. The feed is generated by a recommendation pipeline (retrieval from a global content pool via embeddings and trending sources → ranking → re-ranking) using real-time watch-time signals, so there's no follower fan-out. Video transcoding, ABR streaming and CDN pre-positioning become central, and the feedback loop from events to models must be fast (minutes).</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Follow a <strong>time-boxed structure</strong>: clarify → requirements → estimates → API → data model → high-level design → deep dives → trade-offs → wrap-up.</li>
+    <li>Turn numbers into <strong>decisions</strong>: read-heavy → precompute and cache; huge egress → CDN; high fan-out → async workers.</li>
+    <li>The heart of Instagram is the <strong>hybrid feed</strong> (push for most, pull for celebrities) over <strong>IDs-only timelines</strong> in Redis.</li>
+    <li>Media goes <strong>direct to object storage</strong> with pre-signed URLs, is processed asynchronously and served via the <strong>CDN</strong>.</li>
+    <li>Know <strong>Instagram's 64-bit ID scheme</strong> (41-bit time, 13-bit logical shard, 10-bit sequence) and why logical shards make resharding easy.</li>
+    <li>Senior signals: volunteering <strong>trade-offs, failure modes and hot-key mitigations</strong>, and driving the conversation.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="how-to-approach.html">How to approach a system design problem</a>: the framework this script follows</li>
+  <li><a href="requirements.html">Requirements</a> and <a href="capacity-estimation.html">capacity estimation</a>: minutes 0–12 in depth</li>
+  <li><a href="api-design.html">API design</a>: cursors, idempotency keys, protocols</li>
+  <li><a href="news-feed.html">News feed</a>: the main deep dive</li>
+  <li><a href="id-generation.html">ID generation</a> and <a href="sharding.html">sharding</a>: the ID scheme and logical shards</li>
+  <li><a href="caching.html">Caching</a> and <a href="likes-comments.html">likes &amp; counters</a>: hot keys and counters</li>
+  <li><a href="media-upload.html">Media upload</a> and <a href="media-processing.html">media processing</a>: the media deep dive</li>
+  <li><a href="direct-messaging.html">Direct messaging</a>: the DM deep dive</li>
+  <li><a href="request-flows.html">End-to-end request flows</a>: every flow traced hop by hop</li>
+  <li><a href="glossary.html">Glossary</a>: every term in one place</li>
+</ul>
+
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

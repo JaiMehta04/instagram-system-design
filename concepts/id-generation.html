@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unique ID Generation (Snowflake) — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="id-generation">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>Every post, comment, like, story and message needs a <strong>unique ID</strong>. In a sharded system there is no single database whose auto-increment counter can hand them out safely and fast.</li>
+    <li>Good IDs are <strong>64-bit</strong> (fit in a <code>BIGINT</code>), <strong>roughly time-sortable</strong> (newer = bigger, great for B-tree indexes and feed pagination), generated at <strong>high throughput</strong> with <strong>no single point of failure</strong> and <strong>no coordination</strong> per ID.</li>
+    <li>Options: DB auto-increment, multi-master step offsets, UUID v4 (random — bad index locality), UUID v7 / ULID (time-ordered, 128-bit), ticket servers (Flickr), and <strong>Twitter Snowflake</strong>: 41-bit timestamp + 10-bit machine ID + 12-bit sequence.</li>
+    <li><strong>Instagram's publicly described scheme</strong>: 41 bits of milliseconds since a custom epoch + <strong>13 bits of logical shard ID</strong> + 10 bits of per-shard sequence, generated <em>inside PostgreSQL</em> by a PL/pgSQL function. Because the shard ID is inside the ID, any service can route a request for that object to the right shard with a bit-shift — no lookup.</li>
+    <li>The main hazard of time-based IDs is the <strong>clock</strong>: skew between machines only loosens ordering, but a clock going <strong>backwards</strong> can create duplicates unless the generator waits or refuses.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why is generating an ID hard?</h2>
+<p>On a single-server app you write <code>id SERIAL PRIMARY KEY</code> and forget about it: PostgreSQL hands out 1, 2, 3… Instagram is different. Posts, comments and likes are spread across thousands of database shards (see <a href="sharding.html">Sharding</a>), and the write volume is enormous — assume, for practice, ~100M posts, ~1B likes and ~100M comments per day, peaking at well over 100,000 new objects per second.</p>
+<ul>
+  <li>If each shard uses its own auto-increment counter, shard 7 and shard 912 will both create a post with ID 1,000,000. IDs collide the moment you look at data across shards (in caches, in Kafka events, in the feed, in URLs).</li>
+  <li>If one central database hands out all IDs, every write in the company depends on it: a <strong>single point of failure</strong> and a throughput ceiling, plus a cross-data-center round trip for each ID.</li>
+  <li>If you use random 128-bit UUIDs, you get uniqueness but lose ordering and bloat every index (more on this below).</li>
+</ul>
+<p>We want IDs that are unique <em>without asking anyone</em>, small, and that sort by creation time — so "show the newest posts" is just "sort by ID descending".</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  Imagine a national chain of delis where every customer needs a globally unique order number. One central ticket dispenser for the whole country would mean phoning headquarters for every sandwich. Instead, each order number is written as <strong>time + shop number + counter</strong>: "14:50:01.123 — shop 1341 — order #7". No two shops share a shop number, and within one shop the counter never repeats within the same millisecond, so numbers are unique without any phone calls. And because the time comes first, sorting order numbers sorts orders by when they were placed.
+</div>
+
+<h2>2. Requirements for Instagram's IDs</h2>
+<div class="table-wrap"><table>
+  <tr><th>Requirement</th><th>Why it matters for Instagram</th></tr>
+  <tr><td><b>Globally unique</b></td><td>IDs are used as cache keys, Kafka message keys, URL slugs and foreign keys across services. A duplicate means one user's post overwriting another's.</td></tr>
+  <tr><td><b>64 bits</b></td><td>Fits in a native <code>BIGINT</code>/<code>long</code>: 8 bytes per ID instead of 16 for a UUID — halving index size for billions of rows, and comparisons are a single CPU instruction.</td></tr>
+  <tr><td><b>Roughly time-sortable</b> (k-sorted)</td><td>Sort by ID ≈ sort by creation time without an extra <code>created_at</code> index; feed pagination uses "give me posts with ID &lt; cursor"; new rows append at the right edge of B-tree indexes.</td></tr>
+  <tr><td><b>High throughput, low latency</b></td><td>Hundreds of thousands of IDs/s overall, generated in microseconds, on the write path.</td></tr>
+  <tr><td><b>No single point of failure</b></td><td>ID generation must not be the component that takes Instagram down.</td></tr>
+  <tr><td><b>No per-ID coordination</b></td><td>No network round trip or lock shared across machines for each new ID.</td></tr>
+  <tr><td><b>Bonus: routable</b></td><td>If the ID tells you which shard holds the object, you can fetch it without a directory lookup.</td></tr>
+</table></div>
+<p>"Roughly" time-sortable is deliberate: IDs generated on different machines in the same few milliseconds may be slightly out of order (because their clocks differ slightly). That's fine for a feed; it is <em>not</em> a substitute for a strict global order.</p>
+
+<h2>3. The options, one by one</h2>
+
+<h3>3.1 Database auto-increment</h3>
+<p>One database with an auto-increment column (<code>SERIAL</code>, <code>AUTO_INCREMENT</code>, <code>IDENTITY</code>) generates every ID.</p>
+<ul>
+  <li><strong>Pros:</strong> simple, compact (64-bit), perfectly ordered, dense.</li>
+  <li><strong>Cons:</strong> single point of failure and write bottleneck; doesn't work across shards; IDs are guessable and leak business volume (a competitor can create two posts a day apart and subtract the IDs to learn your daily post count — the classic "German tank problem").</li>
+</ul>
+
+<h3>3.2 Multi-master with step offsets</h3>
+<p>Run N ID databases; server <em>i</em> starts at <em>i</em> and increments by N. With N = 2: server A produces 1, 3, 5…, server B produces 2, 4, 6… MySQL supports this directly with <code>auto_increment_increment = N</code> and <code>auto_increment_offset = i</code>.</p>
+<ul>
+  <li><strong>Pros:</strong> no SPOF; doubles (N×) throughput; still 64-bit.</li>
+  <li><strong>Cons:</strong> adding a server changes N and requires re-planning offsets; IDs aren't time-ordered across servers (A may be at 1,000,001 while B is at 5,000,002); still a network round trip per ID.</li>
+</ul>
+
+<h3>3.3 UUID v4 — and the index locality problem</h3>
+<p>A UUID is a 128-bit identifier, written as 36 characters like <code>9f1c2a7e-3b4d-4e8f-a1b2-c3d4e5f60718</code>. Version 4 fills <strong>122 bits with randomness</strong>. Any machine can generate one offline; the chance of a collision is negligible (you'd need ~2.7 × 10<sup>18</sup> UUIDs for a 50% chance of a single duplicate).</p>
+<p>So why not use them everywhere? Two reasons: <strong>size</strong> (16 bytes binary, 36 as text — every index and every foreign key that references it doubles or more) and, more importantly, <strong>randomness destroys index locality</strong>.</p>
+<pre class="ascii">
+ B-tree primary index (leaf pages ordered by key)
+
+ Time-ordered IDs:  [p1][p2][p3] ... [p97][p98][p99*] ← every insert lands in the LAST page
+                                                       (it stays hot in RAM; pages fill 100%)
+
+ Random UUID v4:    [p1][p2*][p3] ... [p41*][p42] ... [p97][p98*][p99]
+                         ↑ inserts land on random pages all over the index
+                         → each insert may read a cold page from disk
+                         → full pages split in half (~50-70% fill), index bloats
+                         → WAL / replication volume grows, cache hit ratio falls
+</pre>
+<p>With billions of rows, the index is far larger than RAM. Time-ordered keys keep the "insert frontier" (the right-most pages) in memory; random keys make every insert a potential random disk read and page split. Benchmarks routinely show insert throughput dropping several-fold once a random-UUID index outgrows memory. Random IDs also give no time ordering, so you need an extra <code>created_at</code> index for "newest first" queries. (See <a href="indexing.html">Indexing</a> for how B-trees work.)</p>
+
+<h3>3.4 UUID v7 and ULID — time-ordered 128-bit IDs</h3>
+<p>Newer formats keep the "generate anywhere" property but put a timestamp first:</p>
+<pre class="ascii">
+ UUID v7 (RFC 9562, 2024) — 128 bits
+ | unix_ts_ms (48) | ver=7 (4) | rand_a (12) | var (2) | rand_b (62) |
+
+ ULID — 128 bits, encoded as 26 Crockford base32 chars, e.g. 01JAZ3K5T8X2N9QW4VBCDEFGHJ
+ | timestamp ms (48) | randomness (80) |
+</pre>
+<ul>
+  <li><strong>Pros:</strong> time-sortable (good B-tree locality), no coordination, no machine IDs to assign, standard library support growing (PostgreSQL 18 adds a native <code>uuidv7()</code> function). ULID's text form is URL-friendly and lexicographically sortable.</li>
+  <li><strong>Cons:</strong> still 128 bits (2× a BIGINT); ordering within the same millisecond on different machines is random; carries no routing information. A great default when 128 bits is acceptable — and a common modern interview answer.</li>
+</ul>
+
+<h3>3.5 Ticket servers (Flickr)</h3>
+<p>Flickr publicly described a "ticket server": a dedicated MySQL database whose only job is handing out IDs from an auto-increment column, using a one-row table trick:</p>
+<pre><code>CREATE TABLE tickets64 (
+  id   BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  stub CHAR(1) NOT NULL DEFAULT '',
+  PRIMARY KEY (id), UNIQUE KEY (stub)
+) ENGINE=InnoDB;
+
+REPLACE INTO tickets64 (stub) VALUES ('a');   -- deletes + reinserts the single row, bumping id
+SELECT LAST_INSERT_ID();                       -- per-connection, so concurrent clients don't clash</code></pre>
+<p>For availability they ran <strong>two</strong> ticket servers, one producing odd and one even numbers (step offsets), with clients round-robining between them.</p>
+<ul>
+  <li><strong>Pros:</strong> 64-bit, compact, simple, roughly ordered, battle-tested.</li>
+  <li><strong>Cons:</strong> a network round trip per ID; the ticket servers are a central dependency and a throughput ceiling; odd/even servers drift apart so ordering is loose.</li>
+  <li><strong>Common improvement — segment (range) allocation:</strong> instead of one ID per request, each app server grabs a <em>block</em> (e.g. 1,000 IDs: <code>UPDATE seq SET max_id = max_id + 1000</code>) and hands them out locally from memory. One DB round trip per 1,000 IDs; a crash wastes at most the unused part of a block. Meituan's open-source Leaf uses this "segment mode" with double buffering.</li>
+</ul>
+
+<h3>3.6 Twitter Snowflake</h3>
+<p>In 2010 Twitter moved off MySQL auto-increment and published <strong>Snowflake</strong>, a service that composes a 64-bit ID from three fields, so each generator can work independently:</p>
+
+<div class="diagram">
+<svg viewBox="0 0 880 170" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <rect x="20" y="40" width="14" height="50" fill="#eceff1" stroke="#455a64"/>
+  <rect x="34" y="40" width="538" height="50" fill="#e1f5fe" stroke="#0277bd"/>
+  <rect x="572" y="40" width="131" height="50" fill="#e8f5e9" stroke="#2e7d32"/>
+  <rect x="703" y="40" width="157" height="50" fill="#f3e5f5" stroke="#6a1b9a"/>
+  <g font-weight="600" text-anchor="middle">
+    <text x="303" y="62">Timestamp — 41 bits</text>
+    <text x="637" y="62">Machine — 10</text>
+    <text x="781" y="62">Sequence — 12</text>
+  </g>
+  <g font-size="11.5" text-anchor="middle" fill="#333">
+    <text x="303" y="80">ms since custom epoch (2010-11-04) → ~69 years</text>
+    <text x="637" y="80">5 DC + 5 worker</text>
+    <text x="781" y="80">0–4095 per ms</text>
+    <text x="27" y="110">0</text>
+  </g>
+  <g font-size="11" fill="#555">
+    <text x="20" y="32">bit 63</text>
+    <text x="860" y="32" text-anchor="end">bit 0</text>
+  </g>
+  <text x="20" y="135" font-size="12" fill="#333">sign bit always 0 → IDs stay positive in signed 64-bit integers (Java long, SQL BIGINT)</text>
+  <text x="20" y="155" font-size="12" fill="#333">id = (ms_since_epoch &lt;&lt; 22) | (machine_id &lt;&lt; 12) | sequence</text>
+</svg>
+<div class="caption">Twitter Snowflake's 64-bit layout. The timestamp in the high bits makes IDs sort by time; machine ID + sequence make them unique within a millisecond.</div>
+</div>
+<ul>
+  <li><strong>41-bit timestamp</strong> — milliseconds since a custom epoch (Twitter used 1288834974657 = 2010-11-04 01:42:54.657 UTC). 2<sup>41</sup> ms ≈ <strong>69.7 years</strong>, so Twitter's IDs last until ~2080. A custom epoch (instead of 1970) avoids wasting 40 years of range.</li>
+  <li><strong>10-bit machine ID</strong> — up to 1,024 generators (Twitter split it as 5 bits data center + 5 bits worker). Assigned via configuration or a coordination service like ZooKeeper — coordination only at <em>startup</em>, never per ID.</li>
+  <li><strong>12-bit sequence</strong> — a counter that resets every millisecond: up to <strong>4,096 IDs per millisecond per machine</strong> (~4.1M/s per machine). If exhausted, the generator waits for the next millisecond.</li>
+</ul>
+<p>Snowflake-style IDs are used widely: Discord, Mastodon and many others use variants; Sony's Sonyflake uses 39 bits of 10 ms units, 8 bits of sequence and 16 bits of machine ID (more machines, fewer IDs per machine, longer lifetime).</p>
+
+<h3>3.7 Comparison</h3>
+<div class="table-wrap"><table>
+  <tr><th>Approach</th><th>Size</th><th>Time-sortable</th><th>Coordination per ID</th><th>SPOF</th><th>Throughput</th><th>Notes</th></tr>
+  <tr><td>DB auto-increment</td><td>64-bit</td><td>Yes (strictly)</td><td>Yes (DB round trip)</td><td>Yes</td><td>One DB's write rate</td><td>Leaks counts; not shard-friendly</td></tr>
+  <tr><td>Step offsets (N masters)</td><td>64-bit</td><td>Only per server</td><td>Yes</td><td>No</td><td>N × one DB</td><td>Hard to change N</td></tr>
+  <tr><td>UUID v4</td><td>128-bit</td><td>No</td><td>No</td><td>No</td><td>Unlimited</td><td>Poor B-tree locality, big indexes</td></tr>
+  <tr><td>UUID v7 / ULID</td><td>128-bit</td><td>Yes (ms)</td><td>No</td><td>No</td><td>Unlimited</td><td>Great default if 128 bits OK</td></tr>
+  <tr><td>Ticket server (+segments)</td><td>64-bit</td><td>Roughly</td><td>Yes (or per block)</td><td>Mitigated with 2+</td><td>High with blocks</td><td>Central dependency</td></tr>
+  <tr><td>Snowflake</td><td>64-bit</td><td>Roughly (ms)</td><td>No (machine ID at startup)</td><td>No</td><td>4,096/ms per worker</td><td>Clock-dependent; needs machine IDs</td></tr>
+  <tr><td>Instagram scheme</td><td>64-bit</td><td>Roughly (ms)</td><td>No (inside the shard's DB)</td><td>No</td><td>1,024/ms per shard</td><td>Encodes shard → routing for free</td></tr>
+</table></div>
+
+<h2>4. Instagram's ID scheme</h2>
+<p>In 2012 Instagram's engineering team published a well-known post ("Sharding &amp; IDs at Instagram") describing how they generate IDs for their sharded PostgreSQL. They considered the options above and rejected them: UUIDs were too big and unordered; a Snowflake service was another moving part to run (with ZooKeeper for machine IDs); ticket servers were a central dependency. Their solution: make <strong>each logical shard generate its own IDs inside PostgreSQL</strong>, embedding the shard number in the ID.</p>
+
+<h3>4.1 The bit layout</h3>
+<div class="diagram">
+<svg viewBox="0 0 880 175" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <rect x="20" y="40" width="538" height="50" fill="#e1f5fe" stroke="#0277bd"/>
+  <rect x="558" y="40" width="171" height="50" fill="#fff8e1" stroke="#f9a825"/>
+  <rect x="729" y="40" width="131" height="50" fill="#f3e5f5" stroke="#6a1b9a"/>
+  <g font-weight="600" text-anchor="middle">
+    <text x="289" y="62">Time — 41 bits</text>
+    <text x="643" y="62">Shard ID — 13 bits</text>
+    <text x="794" y="62">Seq — 10 bits</text>
+  </g>
+  <g font-size="11.5" text-anchor="middle" fill="#333">
+    <text x="289" y="80">milliseconds since Instagram's custom epoch (2011)</text>
+    <text x="643" y="80">logical shard 0–8191</text>
+    <text x="794" y="80">0–1023 per ms</text>
+  </g>
+  <g font-size="11" fill="#555">
+    <text x="20" y="32">bit 63</text>
+    <text x="558" y="32">bit 22</text>
+    <text x="729" y="32">bit 9</text>
+    <text x="860" y="32" text-anchor="end">bit 0</text>
+  </g>
+  <text x="20" y="118" font-size="12" fill="#333">id = (now_ms − epoch) &lt;&lt; 23  |  shard_id &lt;&lt; 10  |  (nextval(seq) mod 1024)</text>
+  <text x="20" y="140" font-size="12" fill="#333">decode: time = id &gt;&gt; 23   shard = (id &gt;&gt; 10) &amp; 8191   seq = id &amp; 1023</text>
+  <text x="20" y="162" font-size="12" fill="#555">41 + 13 + 10 = 64 bits — the whole BIGINT, no separate sign bit</text>
+</svg>
+<div class="caption">Instagram's publicly described 64-bit ID: time first (sortable), then the logical shard that owns the row (routable), then a per-shard sequence (unique within a millisecond).</div>
+</div>
+<ul>
+  <li><strong>41 bits — time:</strong> milliseconds since a custom epoch in 2011 → ~69.7 years of range. (Because PostgreSQL's <code>BIGINT</code> is signed and this layout uses all 64 bits, the top bit becomes 1 after 2<sup>40</sup> ms ≈ 34.8 years — around 2045–2046 — at which point IDs would turn negative and sort incorrectly unless the scheme is adjusted. A fun detail to mention in an interview.)</li>
+  <li><strong>13 bits — logical shard ID:</strong> up to 8,192 logical shards. Instagram described creating thousands of logical shards (implemented as PostgreSQL <em>schemas</em>) mapped onto a much smaller number of physical database servers, so shards can later be moved to new machines without re-sharding data.</li>
+  <li><strong>10 bits — sequence:</strong> each table in each shard has a normal PostgreSQL sequence; take <code>nextval() mod 1024</code>. Up to 1,024 IDs per shard per millisecond.</li>
+</ul>
+
+<h3>4.2 Generated inside PostgreSQL</h3>
+<p>The ID is produced by a PL/pgSQL function used as the column default, so every <code>INSERT</code> gets an ID atomically in the same database that stores the row — no extra service, no extra network hop. A function in the spirit of the published one (each logical shard is a schema, here <code>shard_1341</code>, with its own copy of the function and its own shard constant):</p>
+<pre><code>CREATE SEQUENCE shard_1341.post_id_seq;
+
+CREATE OR REPLACE FUNCTION shard_1341.next_id(OUT result BIGINT) AS $$
+DECLARE
+    our_epoch  BIGINT := 1293840000000;   -- 2011-01-01T00:00:00Z in ms (custom epoch)
+    shard_id   INT    := 1341;            -- this schema's logical shard number
+    seq_id     BIGINT;
+    now_millis BIGINT;
+BEGIN
+    SELECT nextval('shard_1341.post_id_seq') % 1024 INTO seq_id;
+    SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000) INTO now_millis;
+    result := (now_millis - our_epoch) &lt;&lt; 23;   -- 41 bits of time in the high bits
+    result := result | (shard_id &lt;&lt; 10);          -- 13 bits of shard
+    result := result | seq_id;                    -- 10 bits of sequence
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TABLE shard_1341.posts (
+    id         BIGINT NOT NULL DEFAULT shard_1341.next_id() PRIMARY KEY,
+    user_id    BIGINT NOT NULL,
+    caption    TEXT,
+    media_key  TEXT NOT NULL
+);</code></pre>
+<p>Notes: <code>clock_timestamp()</code> (not <code>now()</code>) is used because <code>now()</code> is frozen at the start of the transaction; PostgreSQL sequences are non-transactional and lock-free enough to handle very high rates; and the <code>PRIMARY KEY</code> constraint is a final safety net — in the unlikely event of a duplicate, the insert fails and can be retried instead of silently corrupting data. (Instagram's post used its own epoch constant and schema names; the structure is the same.)</p>
+
+<h3>4.3 Worked example: encoding an ID</h3>
+<p>User 31341 posts a photo on <strong>2026-10-23 at 09:20:00.000 UTC</strong> (14:50 IST). Suppose users map to logical shards by <code>user_id % 2000</code>, so the shard is 31341 mod 2000 = <strong>1341</strong>, and this shard's sequence returns 1001.</p>
+<pre class="ascii">
+ Step 1 — time since epoch
+   now   = 1,792,747,200,000 ms   (2026-10-23T09:20:00Z in Unix ms)
+   epoch = 1,293,840,000,000 ms   (2011-01-01T00:00:00Z)
+   t     =   498,907,200,000 ms   (needs 39 of the 41 bits)
+
+ Step 2 — shift each field into position
+   t     &lt;&lt; 23  = 4,185,136,929,177,600,000
+   1341  &lt;&lt; 10  =                 1,373,184
+   1001 mod 1024 =                     1,001
+
+ Step 3 — OR them together (no overlapping bits, so OR = add)
+   id = 4,185,136,929,177,600,000 + 1,373,184 + 1,001
+      = 4,185,136,929,178,974,185          (hex 0x3A1497DD0014F7E9)
+
+ Binary view (64 bits):
+   00111010000101001001011111011101000000000 | 0010100111101 | 1111101001
+   └──────────── time (41) ────────────────┘   └ shard 1341 ┘   └ seq 1001 ┘
+</pre>
+
+<h3>4.4 Worked example: decoding an ID</h3>
+<pre><code>id    = 4185136929178974185
+t     = id &gt;&gt; 23            = 498907200000      → + epoch = 1792747200000 ms = 2026-10-23 09:20:00 UTC
+shard = (id &gt;&gt; 10) &amp; 0x1FFF = 1341              → lives on logical shard 1341
+seq   = id &amp; 0x3FF          = 1001</code></pre>
+<p>Any service — the feed, the like service, a debugging tool — can therefore answer "when was this created?" and "which shard holds it?" from the ID alone.</p>
+
+<h3>4.5 Why embedding the shard ID enables routing without lookups</h3>
+<p>Without it, a request like <code>GET /media/4185136929178974185</code> would need a <strong>directory lookup</strong> ("which shard owns post X?") — another distributed table with billions of entries, another hop, another thing to cache and keep consistent. With the shard in the ID, routing is pure arithmetic plus a tiny, static map:</p>
+<div class="diagram">
+<svg viewBox="0 0 880 200" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-id-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600">
+    <rect x="15" y="70" width="170" height="56" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="100" y="93" text-anchor="middle">GET post</text><text x="100" y="112" text-anchor="middle" font-weight="400" font-size="11">id 4185…974185</text>
+    <rect x="230" y="70" width="180" height="56" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="320" y="93" text-anchor="middle">App service</text><text x="320" y="112" text-anchor="middle" font-weight="400" font-size="11">(id &gt;&gt; 10) &amp; 8191 = 1341</text>
+    <rect x="455" y="70" width="180" height="56" rx="8" fill="#eceff1" stroke="#455a64"/><text x="545" y="93" text-anchor="middle">Shard map (cached)</text><text x="545" y="112" text-anchor="middle" font-weight="400" font-size="11">1024–2047 → pg-db-07</text>
+  </g>
+  <g font-weight="600">
+    <rect x="690" y="20" width="170" height="44" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="775" y="47" text-anchor="middle">pg-db-06</text>
+    <rect x="690" y="76" width="170" height="44" rx="8" fill="#fff8e1" stroke="#c62828" stroke-width="2"/><text x="775" y="96" text-anchor="middle">pg-db-07</text><text x="775" y="112" text-anchor="middle" font-weight="400" font-size="11">schema shard_1341</text>
+    <rect x="690" y="132" width="170" height="44" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="775" y="159" text-anchor="middle">pg-db-08</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-id-1)">
+    <path d="M185,98 L228,98"/><path d="M410,98 L453,98"/><path d="M635,98 L688,98"/>
+  </g>
+  <text x="440" y="175" text-anchor="middle" font-size="12" fill="#555">no network lookup: bit-shift + an 8,192-entry in-memory map</text>
+</svg>
+<div class="caption">Routing a read: extract the logical shard from the ID, map it to a physical server with a tiny cached table, query that server directly.</div>
+</div>
+<ul>
+  <li>The logical → physical map has at most 8,192 entries — small enough to cache in every app server and update rarely (when shards move).</li>
+  <li><strong>Co-location:</strong> Instagram described sharding by user, so a post's ID carries the <em>author's</em> shard. Objects that belong together (a user's posts, likes stored with the post) can be placed on the same shard by reusing the same shard ID, enabling single-shard queries.</li>
+  <li><strong>Resharding friendliness:</strong> because IDs point at <em>logical</em> shards, moving logical shard 1341 from pg-db-07 to a new server changes one map entry; no IDs change.</li>
+</ul>
+
+<h2>5. Clocks: skew, NTP and time going backwards</h2>
+<p>Time-based IDs are only as good as the clocks that produce them. Server clocks are quartz oscillators that drift (tens of parts per million — up to a few seconds per day if uncorrected), so they're continuously disciplined by <strong>NTP</strong> (Network Time Protocol) or PTP, which typically keeps servers in a data center within about a millisecond of each other (better with modern setups like chrony + PTP).</p>
+
+<h3>5.1 Clock skew between machines: harmless-ish</h3>
+<p>If machine A's clock runs 3 ms ahead of machine B's, an ID created on B slightly <em>after</em> one on A may get a smaller value. Result: IDs are <strong>k-sorted</strong> ("roughly sorted, within the skew") rather than strictly ordered. For a feed this is invisible. It only matters if you wrongly rely on IDs for strict ordering — e.g. "process events in ID order to get causality". Use a log/sequence (e.g. Kafka offsets within a partition) for that. See <a href="cap-consistency.html">Consistency Models</a>.</p>
+
+<h3>5.2 The clock going backwards: dangerous</h3>
+<p>A clock can jump backwards when NTP <em>steps</em> a badly-off clock, after a VM migration or snapshot restore, from manual changes, or around leap seconds. If a generator issued IDs at <em>t = 1000 ms</em> and the clock jumps back to <em>t = 990</em>, it could re-issue the same <code>(time, machine, sequence)</code> triples → <strong>duplicate IDs</strong>. Defences:</p>
+<ol class="steps">
+  <li><strong>Remember the last timestamp used.</strong> If <code>now &lt; last_ms</code>, never generate with the smaller time.</li>
+  <li><strong>Small regression (a few ms): wait</strong> until the clock passes <code>last_ms</code> again, then continue. Costs a few ms of latency, rarely.</li>
+  <li><strong>Large regression: refuse</strong> (raise an error, mark the node unhealthy, alert) so a load balancer routes ID generation elsewhere. Twitter's original Snowflake did exactly this.</li>
+  <li><strong>Alternatively, "borrow from the future":</strong> keep using <code>last_ms</code> (logically) and keep incrementing the sequence until real time catches up. Never goes backwards, but drifts from real time while borrowing.</li>
+  <li><strong>Prevent big jumps operationally:</strong> configure NTP/chrony to <em>slew</em> (gradually speed up/slow down) instead of <em>step</em> after boot; use <strong>leap-second smearing</strong> (spreading the extra second over many hours, as Google and AWS time services do); monitor clock offset.</li>
+</ol>
+<p>Instagram's in-database scheme has a natural extra safety net: the 10-bit sequence comes from a monotonically increasing PostgreSQL sequence, so after a small backwards jump a duplicate would require the sequence to wrap to the <em>same</em> value within the <em>same</em> repeated millisecond, and the primary-key constraint would reject it anyway.</p>
+
+<h2>6. Throughput and lifetime math</h2>
+<pre><code>Snowflake (per worker): 2^12 = 4,096 IDs/ms  → 4,096,000 IDs/s per worker
+   × 1,024 workers (2^10)                     → ~4.2 billion IDs/s theoretical ceiling
+
+Instagram (per logical shard): 2^10 = 1,024 IDs/ms → 1,024,000 IDs/s per shard
+   × 8,192 shards (2^13)                      → ~8.4 billion IDs/s theoretical ceiling
+   Realistic need (assumption): ~1.2B objects/day ≈ 14K/s avg, ~50K/s peak
+   Even a single hot shard at 10K inserts/s uses only ~10 of 1,024 sequence values per ms.
+
+Lifetime: 2^41 ms = 2,199,023,255,552 ms ≈ 69.7 years
+   Twitter epoch 2010-11-04 → exhausted ~2080
+   41-bit signed caveat (all 64 bits used): top bit flips after 2^40 ms ≈ 34.8 years</code></pre>
+<p>The design question is how to split the bits: more machine/shard bits → more generators; more sequence bits → more IDs per generator per ms; more time bits → longer lifetime or finer resolution. Instagram traded Snowflake's 12 sequence bits for 13 shard bits because their bottleneck is per-shard insert rate (a database can't do a million inserts per second anyway), while having many logical shards gives room to grow.</p>
+
+<h2>7. A Snowflake-style generator in Python</h2>
+<pre><code>import threading
+import time
+
+
+class Snowflake:
+    """64-bit IDs: 1 unused sign bit | 41 bits ms since EPOCH | 10 bits worker | 12 bits sequence."""
+    EPOCH_MS = 1288834974657            # custom epoch (Twitter's: 2010-11-04T01:42:54.657Z)
+    WORKER_BITS, SEQ_BITS = 10, 12
+    MAX_WORKER = (1 &lt;&lt; WORKER_BITS) - 1  # 1023
+    MAX_SEQ = (1 &lt;&lt; SEQ_BITS) - 1        # 4095
+    MAX_TIME = (1 &lt;&lt; 41) - 1
+    MAX_BACKWARD_MS = 10                 # tolerate tiny clock regressions by waiting
+
+    def __init__(self, worker_id: int):
+        if not 0 &lt;= worker_id &lt;= self.MAX_WORKER:
+            raise ValueError("worker_id must be in [0, 1023]")
+        self.worker_id = worker_id       # must be unique per running generator!
+        self.last_ms = -1
+        self.seq = 0
+        self._lock = threading.Lock()
+
+    def _now(self) -&gt; int:
+        return time.time_ns() // 1_000_000 - self.EPOCH_MS
+
+    def next_id(self) -&gt; int:
+        with self._lock:
+            now = self._now()
+            if now &lt; self.last_ms:                       # clock moved backwards
+                drift = self.last_ms - now
+                if drift &gt; self.MAX_BACKWARD_MS:
+                    raise RuntimeError(f"clock moved back {drift} ms; refusing to generate")
+                while now &lt; self.last_ms:                # small drift: wait it out
+                    time.sleep((self.last_ms - now) / 1000)
+                    now = self._now()
+            if now == self.last_ms:
+                self.seq = (self.seq + 1) &amp; self.MAX_SEQ
+                if self.seq == 0:                         # 4,096 IDs used this ms
+                    while now &lt;= self.last_ms:            # spin until the next millisecond
+                        now = self._now()
+            else:
+                self.seq = 0                              # new millisecond: restart sequence
+            if now &gt; self.MAX_TIME:
+                raise RuntimeError("41-bit timestamp exhausted; pick a new epoch")
+            self.last_ms = now
+            return (now &lt;&lt; (self.WORKER_BITS + self.SEQ_BITS)) | (self.worker_id &lt;&lt; self.SEQ_BITS) | self.seq
+
+    @classmethod
+    def decode(cls, id_: int) -&gt; dict:
+        return {
+            "unix_ms": (id_ &gt;&gt; (cls.WORKER_BITS + cls.SEQ_BITS)) + cls.EPOCH_MS,
+            "worker_id": (id_ &gt;&gt; cls.SEQ_BITS) &amp; cls.MAX_WORKER,
+            "sequence": id_ &amp; cls.MAX_SEQ,
+        }
+
+
+gen = Snowflake(worker_id=37)
+ids = [gen.next_id() for _ in range(5)]
+assert ids == sorted(ids) and len(set(ids)) == 5      # unique and increasing on one worker
+print(ids[0], Snowflake.decode(ids[0]))</code></pre>
+<p>Implementation notes:</p>
+<ul>
+  <li><strong>Worker IDs must be unique</strong> among live generators. Assign from deployment config, a Kubernetes StatefulSet ordinal, or lease them from ZooKeeper/etcd (ephemeral nodes released when a process dies). Two processes sharing a worker ID will eventually collide — the most common real-world Snowflake bug.</li>
+  <li>The lock makes it thread-safe within one process; across processes, each needs its own worker ID.</li>
+  <li><strong>Embed vs service:</strong> run the generator as a library inside every service (no network hop — preferred) or as a small HA service that hands out IDs (simpler worker-ID management, but a dependency).</li>
+  <li><strong>JSON and JavaScript:</strong> JS numbers are doubles and represent integers exactly only up to 2<sup>53</sup>. A 64-bit ID sent as a JSON number gets silently rounded in browsers. Send IDs as <strong>strings</strong> (Twitter's API added <code>id_str</code> for exactly this reason).</li>
+</ul>
+
+<h2>8. How Instagram uses ID generation</h2>
+<div class="flow">
+  <div class="fnode client">📱 App<small>POST /posts</small></div><div class="farrow">→</div>
+  <div class="fnode svc">Upload / Post service<small>user 31341 → shard 1341</small></div><div class="farrow">→<small>INSERT</small></div>
+  <div class="fnode store">Shard 1341 (PostgreSQL)<small>DEFAULT next_id()</small></div><div class="farrow">→<small>id returned</small></div>
+  <div class="fnode async">Kafka event<small>key = post id</small></div><div class="farrow">→</div>
+  <div class="fnode store">Feed cache / search / CDN keys<small>all use the same id</small></div>
+</div>
+<ol>
+  <li>When user 31341 creates a post, the service computes the user's logical shard and inserts the row there; the database assigns the ID via <code>next_id()</code>.</li>
+  <li>That single ID then flows everywhere: object-storage keys for media renditions (with a hash prefix for load spreading — see <a href="object-storage.html">Object Storage</a>), the "post created" Kafka event (see <a href="message-queues.html">Message Queues</a>), the follower timelines in Redis (see <a href="news-feed.html">News Feed</a>), the search index and the URL.</li>
+  <li>Feed pagination uses the ID as a cursor: "next page = posts with ID &lt; last_seen_id", which is "older than" thanks to time-ordering (see <a href="api-design.html">API Design</a>).</li>
+  <li>Any service holding an ID can route reads to the owning shard without a lookup.</li>
+</ol>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+Instagram's 2012 engineering post describes exactly this: thousands of logical shards as PostgreSQL schemas on fewer physical servers, and IDs composed of <strong>41 bits of time in milliseconds since a custom epoch, 13 bits of logical shard ID and 10 bits of an auto-increment sequence mod 1024</strong>, generated by a PL/pgSQL function in each schema. Data stored in Cassandra in our diagram (post metadata, comments) uses the same kind of 64-bit, time-ordered IDs, which also suit Cassandra clustering keys ("newest first" within a partition). Publicly, people have also observed that the short code in a post's URL (<code>instagram.com/p/&lt;code&gt;/</code>) is a base64-style encoding of the numeric media ID — a compact, URL-friendly representation of the same number.</div>
+
+<h2>9. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Snowflake / Instagram-style IDs</h4><ul>
+    <li>64-bit: compact indexes and fast comparisons</li>
+    <li>Time-sortable: B-tree friendly, free "newest first", cursor pagination</li>
+    <li>No coordination per ID, no SPOF, millions per second</li>
+    <li>Self-describing: creation time (and shard) from the ID</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs</h4><ul>
+    <li>Depends on reasonably correct clocks; backwards jumps need handling</li>
+    <li>Worker/shard IDs must be assigned and kept unique</li>
+    <li>Only roughly ordered across machines</li>
+    <li>Leaks creation time and approximate volume</li>
+    <li>Fixed bit budget: lifetime and max shards are baked in</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Duplicate worker IDs</strong> after autoscaling or copy-pasted config → silent collisions. Lease IDs and fail fast on conflict.</li>
+  <li><strong>Using <code>now()</code> inside a transaction</strong> (frozen time) or a non-monotonic clock source.</li>
+  <li><strong>Sending 64-bit IDs as JSON numbers</strong> to JavaScript clients → rounding. Use strings.</li>
+  <li><strong>Using IDs as Redis sorted-set scores</strong> → precision loss above 2<sup>53</sup> (see <a href="caching.html">Caching</a>).</li>
+  <li><strong>Relying on ID order for strict causality</strong> across machines — it's only k-sorted.</li>
+  <li><strong>Hot prefixes</strong> when time-ordered IDs are used directly as prefixes of object-storage keys or as the first part of a range-partitioned key — all new writes hit the same partition. Hash first.</li>
+  <li><strong>Exposing sequential IDs</strong> where enumeration matters (private resources). Time-based IDs are hard to guess exactly but not secret; authorization must not depend on ID secrecy.</li>
+  <li><strong>Forgetting the epoch end</strong> — pick an epoch near your launch, and note the signed-bit caveat.</li>
+</ul>
+
+<h2>10. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>Format</th><th>Use when</th></tr>
+  <tr><td>Twitter Snowflake (and many open-source ports)</td><td>64-bit: 41 time / 10 machine / 12 seq</td><td>You need compact, sortable IDs at very high rates across many services</td></tr>
+  <tr><td>Sonyflake</td><td>64-bit: 39 time (10 ms units) / 8 seq / 16 machine</td><td>Many machines, lower per-machine rate, longer lifetime (~174 years)</td></tr>
+  <tr><td>Instagram-style PL/pgSQL function</td><td>64-bit: 41 time / 13 shard / 10 seq</td><td>Sharded PostgreSQL where IDs should encode the shard</td></tr>
+  <tr><td>UUID v7 (RFC 9562), ULID, KSUID</td><td>128-bit (KSUID 160-bit) time-ordered</td><td>Decentralised generation, no worker IDs, 128 bits acceptable</td></tr>
+  <tr><td>UUID v4</td><td>128-bit random</td><td>Unguessable tokens, idempotency keys, low-volume tables — not hot primary keys</td></tr>
+  <tr><td>MongoDB ObjectId</td><td>96-bit: 4-byte seconds + 5-byte random + 3-byte counter</td><td>Default document IDs in MongoDB</td></tr>
+  <tr><td>Flickr ticket servers, Meituan Leaf (segment mode), Baidu UidGenerator</td><td>64-bit from DB sequences / blocks</td><td>Central allocation with batching is acceptable; want dense IDs</td></tr>
+  <tr><td>DB sequences / IDENTITY</td><td>64-bit dense</td><td>Single database or per-shard local IDs that never leave the shard</td></tr>
+</table></div>
+
+<h2>11. Interview corner</h2>
+<details class="qa"><summary>Design a unique ID generator for Instagram posts.</summary>
+<p>Requirements: unique, 64-bit, roughly time-ordered, &gt;100K/s, no SPOF, no per-ID coordination. Use a Snowflake-style layout: 41 bits of milliseconds since a custom epoch (~69 years), N bits identifying the generator, and the remaining bits as a per-millisecond sequence. Instagram's variant puts 13 bits of logical shard ID and a 10-bit sequence and generates IDs inside each PostgreSQL shard via a PL/pgSQL default, so the ID also tells you where the row lives. Handle clock regressions by tracking the last timestamp and waiting or refusing; assign worker/shard IDs uniquely at startup; return IDs as strings to JS clients.</p></details>
+<details class="qa"><summary>Why not just use UUIDs?</summary>
+<p>UUID v4 is 128 bits (2× storage in every index and foreign key) and random, so inserts scatter across the B-tree, causing page splits, poor cache locality and much slower inserts once the index exceeds RAM; you also lose free time ordering and need an extra created_at index. UUID v7/ULID fix ordering but are still 128 bits and carry no routing information. They're good choices when you don't control the scale or can't assign worker IDs.</p></details>
+<details class="qa"><summary>What happens if the clock goes backwards on a Snowflake node?</summary>
+<p>If the generator naively used the new, smaller time, it could reissue (time, worker, sequence) combinations already used → duplicates. The generator remembers the last timestamp; on a small regression it waits until real time passes it, on a large one it refuses to generate and alerts (the node is removed from rotation). Operationally, slew rather than step NTP corrections and use leap-second smearing. Some implementations keep issuing IDs with the last timestamp and an incremented sequence ("borrowing" future time).</p></details>
+<details class="qa"><summary>How does putting the shard ID in the post ID help?</summary>
+<p>Routing becomes arithmetic: <code>(id &gt;&gt; 10) &amp; 8191</code> gives the logical shard, and a tiny cached map gives the physical server — no directory service, no extra hop, no extra failure point, for every read of every object. It also enables co-locating related data on the same shard, and because it's a <em>logical</em> shard, moving it to new hardware changes one map entry instead of any IDs.</p></details>
+<details class="qa"><summary>How many IDs per second can Instagram's scheme produce, and is that enough?</summary>
+<p>1,024 per millisecond per logical shard = ~1M/s per shard, and with up to 8,192 shards ~8.4B/s theoretical. Real demand is maybe tens of thousands of inserts per second overall, and a single PostgreSQL shard can't do anywhere near 1M inserts/s, so the sequence bits are never the bottleneck. If a shard did exceed 1,024 in one ms, the sequence would wrap and could collide — guarded by the primary key constraint (retry).</p></details>
+<details class="qa"><summary>Are Snowflake IDs strictly ordered? Can I use them to order events?</summary>
+<p>Only roughly (k-sorted). Within a single generator they increase strictly; across generators ordering is only as good as clock synchronisation (typically ~1 ms). They're fine for "newest first" feeds and pagination but not for causal ordering of events — use a single partition's log offsets, version numbers, or logical/hybrid clocks for that.</p></details>
+<details class="qa"><summary>How would you assign worker IDs in a Kubernetes deployment that autoscales?</summary>
+<p>Options: a StatefulSet ordinal (stable but limits scaling patterns); lease a worker ID from etcd/ZooKeeper with an ephemeral, TTL'd key so a dead pod's ID is freed and two live pods can never hold the same one; or allocate from a DB table with a lease timestamp. On startup the generator must acquire a lease before serving, and stop generating if it loses the lease.</p></details>
+
+<h2>12. Check your understanding</h2>
+<details class="quiz"><summary>Decode the Instagram-style ID 4185136929178974185 (epoch 2011-01-01T00:00:00Z = 1293840000000 ms).</summary>
+<p><code>id &gt;&gt; 23</code> = 498,907,200,000 ms after the epoch → 1,792,747,200,000 Unix ms = <strong>2026-10-23 09:20:00 UTC</strong>; <code>(id &gt;&gt; 10) &amp; 8191</code> = <strong>shard 1341</strong>; <code>id &amp; 1023</code> = <strong>sequence 1001</strong>.</p></details>
+<details class="quiz"><summary>How long does a 41-bit millisecond timestamp last, and why use a custom epoch?</summary>
+<p>2<sup>41</sup> ms ≈ <strong>69.7 years</strong>. Counting from 1970 would have used up ~40 of those years before the company even existed; a custom epoch near launch maximises remaining lifetime.</p></details>
+<details class="quiz"><summary>Why do random UUID primary keys slow down inserts once the table is large?</summary>
+<p>Each insert goes to a random leaf page of the B-tree. When the index is bigger than RAM, those pages are often not cached → random disk reads, plus frequent page splits that leave pages half-empty, bloating the index and write-ahead log. Time-ordered keys always insert at the right edge, which stays hot in memory.</p></details>
+<details class="quiz"><summary>A Snowflake worker receives 10,000 ID requests within one millisecond. What happens?</summary>
+<p>The 12-bit sequence allows 4,096 IDs per ms. After 4,096, the sequence wraps to 0 and the generator <strong>waits for the next millisecond</strong>. The 10,000 requests take ~3 ms. No duplicates — just a tiny delay.</p></details>
+<details class="quiz"><summary>Two pods accidentally share worker ID 37. What can go wrong and how would you detect it?</summary>
+<p>If both generate an ID in the same millisecond with the same sequence number, they produce <strong>identical IDs</strong> — e.g. two posts with one ID, one overwriting the other in caches. Detect via unique-constraint violations, and prevent by leasing worker IDs from etcd/ZooKeeper.</p></details>
+<details class="quiz"><summary>Your web client shows post 4185136929178974185 as 4185136929178974000 and opens the wrong post. Why?</summary>
+<p>The ID was sent as a JSON number; JavaScript stores numbers as 64-bit doubles that are exact only up to 2<sup>53</sup> ≈ 9×10<sup>15</sup>, so the 19-digit ID is rounded. Send IDs as strings.</p></details>
+<details class="quiz"><summary>Instagram moved a logical shard to a new physical server. Do any post IDs change?</summary>
+<p>No. IDs contain the <strong>logical</strong> shard number. Only the logical → physical map entry changes, which every app server picks up from configuration.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Good distributed IDs are <strong>unique, 64-bit, roughly time-sortable, fast and coordination-free</strong>.</li>
+    <li>Auto-increment and ticket servers centralise; UUID v4 is random and bloats indexes; UUID v7/ULID are time-ordered but 128-bit.</li>
+    <li><strong>Snowflake</strong> = 41-bit ms timestamp + 10-bit machine + 12-bit sequence (4,096/ms/machine, ~69 years).</li>
+    <li><strong>Instagram</strong> = 41-bit ms timestamp + 13-bit logical shard + 10-bit sequence, generated in PostgreSQL — the ID itself routes to its shard.</li>
+    <li>Handle <strong>clock regressions</strong> (wait or refuse), keep worker IDs <strong>unique</strong>, and send IDs to JS as <strong>strings</strong>.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="sharding.html">Sharding</a> — logical vs physical shards and why the shard ID in the ID matters</li>
+  <li><a href="indexing.html">Database Indexing</a> — B-trees and why key order affects insert performance</li>
+  <li><a href="databases.html">Databases: SQL vs NoSQL</a> — PostgreSQL and Cassandra, where these IDs live</li>
+  <li><a href="news-feed.html">News Feed</a> — time-sortable IDs as feed cursors</li>
+  <li><a href="api-design.html">API Design</a> — cursor-based pagination with IDs</li>
+  <li><a href="object-storage.html">Object Storage</a> — avoiding hot prefixes with time-ordered IDs</li>
+  <li><a href="cap-consistency.html">CAP &amp; Consistency</a> — why clock-based ordering is only approximate</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

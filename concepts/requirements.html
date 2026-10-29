@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Requirements: Functional &amp; Non-Functional — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="requirements">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li><strong>Functional requirements</strong> say <em>what</em> the system does (post a photo, see a feed). <strong>Non-functional requirements</strong> say <em>how well</em> it does it (scale, latency, availability, durability, consistency, security, cost).</li>
+    <li>Prioritise ruthlessly: for Instagram, <strong>core</strong> = post, follow, feed, like/comment, profiles; <strong>extended</strong> = Stories, search, DMs, notifications, Explore; <strong>out of scope</strong> = ads, shopping, live, payments.</li>
+    <li>Working assumptions for this guide: <strong>2B MAU, 500M DAU</strong>, ~100M posts/day, feed p99 &lt; ~300 ms server-side, <strong>99.99%</strong> availability (≈ 52 min downtime/year), media durability of 11 nines, read-heavy (~100:1 content views to uploads).</li>
+    <li>Consistency is chosen <strong>per feature</strong>: strong for auth and username uniqueness, ordered for DMs, eventual for feeds, likes and follower counts.</li>
+    <li>Non-functional requirements become measurable <strong>SLIs and SLOs</strong>, and every requirement should map to a concrete <strong>design decision and component</strong>. Change a requirement (E2EE DMs, chronological feed) and the design changes.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why requirements come first</h2>
+<p>"Design Instagram" could mean a weekend photo-sharing app for 1,000 people or a planet-scale platform for two billion. Those two systems share a name and almost nothing else: the first runs on one server with one database; the second needs CDNs, sharded databases, event streams, caches, ML pipelines and multiple data centres. <strong>Every architectural decision depends on the requirements.</strong> Without them, you can't tell whether a design is good — only whether it's elaborate.</p>
+<p>Requirements also protect you from the two classic failure modes:</p>
+<ul>
+  <li><strong>Under-engineering</strong> — a single PostgreSQL instance serving 300,000 feed reads per second. It will fall over.</li>
+  <li><strong>Over-engineering</strong> — globally replicated consensus databases for like counts that nobody needs to be exact. It works, but it is slow, costly and complex for no benefit.</li>
+</ul>
+<p>In an interview the first five minutes are spent here (see <a href="how-to-approach.html">How to Approach</a>). In real companies this phase is a design document's "Goals / Non-goals" section, and it is where most expensive mistakes are either made or avoided.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  Ordering a custom-built car. The <strong>functional</strong> requirements are "seats five, has a boot, drives on roads". The <strong>non-functional</strong> ones are what really shape it: "0–100 km/h in under 5 seconds" (performance), "must start at −30 °C" (reliability), "must survive a 60 km/h crash" (durability/safety), "fuel cost under X per km" (cost). A family hatchback and a race car both satisfy the functional list — the non-functional list is what makes them completely different machines.
+</div>
+
+<h2>2. Functional vs non-functional requirements</h2>
+<div class="diagram">
+<svg viewBox="0 0 820 300" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <rect x="20" y="20" width="370" height="260" rx="10" fill="#e8f5e9" stroke="#2e7d32"/>
+  <text x="205" y="48" text-anchor="middle" font-weight="700" font-size="15">Functional — WHAT it does</text>
+  <text x="205" y="68" text-anchor="middle" font-size="12" fill="#555">verbs: "a user can…"</text>
+  <g font-size="13">
+    <text x="45" y="100">• post a photo / video / carousel</text>
+    <text x="45" y="124">• follow and unfollow users</text>
+    <text x="45" y="148">• see a home feed of followed accounts</text>
+    <text x="45" y="172">• like and comment on posts</text>
+    <text x="45" y="196">• view 24-hour Stories</text>
+    <text x="45" y="220">• search users and hashtags</text>
+    <text x="45" y="244">• send direct messages</text>
+  </g>
+  <rect x="430" y="20" width="370" height="260" rx="10" fill="#fff3e0" stroke="#ef6c00"/>
+  <text x="615" y="48" text-anchor="middle" font-weight="700" font-size="15">Non-functional — HOW WELL</text>
+  <text x="615" y="68" text-anchor="middle" font-size="12" fill="#555">adjectives: "…fast, reliable, at scale"</text>
+  <g font-size="13">
+    <text x="455" y="100">• scale: 500M DAU, global</text>
+    <text x="455" y="124">• latency: feed p99 &lt; 300 ms (server)</text>
+    <text x="455" y="148">• availability: 99.99%</text>
+    <text x="455" y="172">• durability: never lose a photo</text>
+    <text x="455" y="196">• consistency: per feature</text>
+    <text x="455" y="220">• security &amp; privacy</text>
+    <text x="455" y="244">• cost per user</text>
+  </g>
+</svg>
+<div class="caption">Functional requirements decide which components exist; non-functional requirements decide how those components are built and scaled.</div>
+</div>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Functional</th><th>Non-functional (a.k.a. quality attributes, "-ilities")</th></tr>
+  <tr><td><b>Describes</b></td><td>Behaviour: inputs, outputs, features</td><td>Qualities and constraints of that behaviour</td></tr>
+  <tr><td><b>Phrased as</b></td><td>"A user can…", user stories</td><td>Measurable targets: "p99 &lt; 300 ms", "99.99% monthly"</td></tr>
+  <tr><td><b>Drives</b></td><td>Which services, APIs and data entities exist</td><td>Replication, caching, sharding, consistency model, regions</td></tr>
+  <tr><td><b>Failure looks like</b></td><td>Feature missing or wrong</td><td>Feature exists but is slow, down, loses data, leaks data, or costs too much</td></tr>
+  <tr><td><b>Instagram example</b></td><td>"Users can like a post"</td><td>"Like is acknowledged in &lt; 100 ms; count may lag by a few seconds"</td></tr>
+</table></div>
+<p>A useful trick: functional requirements are about <strong>one user's experience</strong>; non-functional requirements are about <strong>all users at once</strong> — at peak, during failures, over years.</p>
+
+<h2>3. Functional requirements for Instagram</h2>
+<h3>3.1 The feature list with priorities</h3>
+<p>We classify each feature as <strong>Core</strong> (must design end-to-end), <strong>Extended</strong> (show where it plugs in; design in depth only if asked) or <strong>Out of scope</strong> (explicitly excluded — saying so is a sign of judgement, not laziness).</p>
+<div class="table-wrap"><table>
+  <tr><th>Feature</th><th>What exactly the user can do</th><th>Priority</th><th>Owning component in the diagram</th></tr>
+  <tr><td><b>Post photo / video / carousel</b></td><td>Upload 1–10 media items (photos or videos up to a size/length limit) with caption, location and tags; the post appears on the profile and in followers' feeds</td><td>Core</td><td>Upload Service, Object Storage, Media Processing Workers, Post metadata (Cassandra)</td></tr>
+  <tr><td><b>Home feed</b></td><td>Scroll an infinite, ranked list of recent posts from followed accounts; pull-to-refresh shows new posts</td><td>Core</td><td>News Feed Service, Feed Cache (Redis), Fan-out Workers, CDN</td></tr>
+  <tr><td><b>Follow / unfollow</b></td><td>Follow public accounts instantly; request to follow private accounts; see follower/following lists and counts</td><td>Core</td><td>Follow/Graph Service, Social Graph store</td></tr>
+  <tr><td><b>Like &amp; comment</b></td><td>Like/unlike (idempotent), comment, reply, see counts and latest comments</td><td>Core</td><td>Like &amp; Comment Service, Cassandra, counters in Redis</td></tr>
+  <tr><td><b>Profiles</b></td><td>View a user's bio, counts and grid of posts; edit own profile; private/public setting</td><td>Core</td><td>User/Auth Service, User DB (PostgreSQL), Post metadata</td></tr>
+  <tr><td><b>Sign-up / login</b></td><td>Create an account with a unique username; log in; sessions across devices</td><td>Core (often assumed)</td><td>User/Auth Service, API Gateway, User DB</td></tr>
+  <tr><td><b>Stories</b></td><td>Post photo/video that disappears after 24 h; see a tray of followed accounts' stories; viewers list</td><td>Extended</td><td>Stories Service (24h TTL), Object Storage, Feed Cache</td></tr>
+  <tr><td><b>Search</b></td><td>Find users, hashtags and places by prefix (typeahead)</td><td>Extended</td><td>Search Service, Search Indexer, Elasticsearch</td></tr>
+  <tr><td><b>Direct messages</b></td><td>1:1 and group chats, real-time delivery, read receipts, media sharing</td><td>Extended</td><td>Direct Messaging (WebSocket), Messages Store</td></tr>
+  <tr><td><b>Notifications</b></td><td>Push and in-app alerts for likes, comments, follows, mentions, DMs</td><td>Extended</td><td>Notification Service, Push Providers (APNs/FCM)</td></tr>
+  <tr><td><b>Explore</b></td><td>Personalised grid of posts from accounts you don't follow</td><td>Extended</td><td>Analytics &amp; ML Training, ranking service, Feed Cache</td></tr>
+  <tr><td><b>Reels</b></td><td>Short-form vertical video feed</td><td>Extended (shares the video pipeline)</td><td>Upload, Media Processing, ML ranking, CDN</td></tr>
+  <tr><td>Ads, shopping, payments, live video, creator monetisation, content moderation tooling, account recovery flows</td><td>—</td><td>Out of scope</td><td>— (mention that they exist)</td></tr>
+</table></div>
+
+<div class="diagram">
+<svg viewBox="0 0 820 320" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <rect x="20" y="15" width="780" height="290" rx="14" fill="#eceff1" stroke="#455a64" stroke-dasharray="6 4"/>
+  <text x="410" y="40" text-anchor="middle" font-weight="700">OUT OF SCOPE — mention, don't design</text>
+  <text x="410" y="60" text-anchor="middle" font-size="12">ads · shopping · payments · live video · creator monetisation · moderation tooling</text>
+  <rect x="80" y="75" width="660" height="215" rx="12" fill="#fff3e0" stroke="#ef6c00"/>
+  <text x="410" y="100" text-anchor="middle" font-weight="700">EXTENDED — show where it plugs in</text>
+  <text x="410" y="120" text-anchor="middle" font-size="12">Stories · search · direct messages · notifications · Explore · Reels</text>
+  <rect x="170" y="135" width="480" height="140" rx="10" fill="#e8f5e9" stroke="#2e7d32"/>
+  <text x="410" y="162" text-anchor="middle" font-weight="700">CORE — design end-to-end and deep dive</text>
+  <text x="410" y="190" text-anchor="middle">post photo/video/carousel · home feed</text>
+  <text x="410" y="214" text-anchor="middle">follow / unfollow · like &amp; comment</text>
+  <text x="410" y="238" text-anchor="middle">profiles · sign-up / login</text>
+  <text x="410" y="262" text-anchor="middle" font-size="12" fill="#555">≈ 80% of the interview time</text>
+</svg>
+<div class="caption">Scope as concentric rings. The interviewer may move a feature inwards ("let's also do DMs") — that's fine; it simply moves time from one deep dive to another.</div>
+</div>
+
+<h3>3.2 Write them as user stories with acceptance criteria</h3>
+<p>Turning features into precise statements exposes hidden requirements:</p>
+<pre><code>As a user, I can publish a post with 1–10 photos/videos and a caption.
+  - Upload succeeds on flaky mobile networks (resumable, retry-safe).
+  - The post shows on my profile immediately after I publish it (read-your-writes).
+  - Followers see it in their feeds within ~seconds to a minute.
+  - Videos may show "processing" for a short time; photos appear immediately.
+
+As a user, I can open my home feed and scroll.
+  - First page renders quickly; next pages load before I reach them (prefetch).
+  - Ranked by relevance, mostly recent posts from accounts I follow.
+  - Never shows posts from accounts that blocked me or that I can't access.
+
+As a user, I can like a post.
+  - Tapping like twice does not create two likes (idempotent).
+  - The heart turns red instantly; the count may lag slightly.</code></pre>
+<p>Each acceptance criterion quietly introduces a non-functional requirement (resumability, read-your-writes, freshness, privacy, idempotency) — exactly the material for the next section.</p>
+
+<h3>3.3 Functional requirements that people forget</h3>
+<ul>
+  <li><strong>Deletion and editing</strong> — deleting a post must remove it from feeds, caches, search and (eventually) storage and the CDN.</li>
+  <li><strong>Privacy controls</strong> — private accounts, blocking, muting, "close friends" Stories audiences.</li>
+  <li><strong>Pagination</strong> — every list (feed, comments, followers) is unbounded and must be paged.</li>
+  <li><strong>Multi-device</strong> — the same account on a phone, a tablet and the web; state must sync.</li>
+  <li><strong>Internationalisation</strong> — Unicode usernames and captions, right-to-left scripts, local time zones.</li>
+</ul>
+
+<h2>4. Non-functional requirements</h2>
+<p>These are the numbers that shape the architecture. In an interview, you propose them and the interviewer adjusts them. Below are the working assumptions used throughout this guide — they are <strong>assumptions for design purposes</strong>, not official Instagram statistics.</p>
+
+<h3>4.1 Scale assumptions</h3>
+<div class="table-wrap"><table>
+  <tr><th>Metric</th><th>Assumption</th><th>Average rate</th><th>Implication</th></tr>
+  <tr><td>Monthly active users (MAU)</td><td>2 billion</td><td>—</td><td>User table ~2B rows → must be sharded</td></tr>
+  <tr><td>Daily active users (DAU)</td><td>500 million</td><td>—</td><td>Hot data set ≈ DAU's data; caches sized for DAU</td></tr>
+  <tr><td>New posts</td><td>100M/day</td><td>~1.2K/s (peak ~3.5K/s)</td><td>Media ingestion hundreds of TB/day</td></tr>
+  <tr><td>Stories</td><td>200M/day</td><td>~2.3K/s</td><td>TTL storage; huge view traffic</td></tr>
+  <tr><td>Feed page loads</td><td>10B/day (20 per DAU)</td><td>~116K/s (peak ~350K/s)</td><td>Read path must be served from memory</td></tr>
+  <tr><td>Likes</td><td>5B/day</td><td>~58K/s (peak ~175K/s)</td><td>High-write store + counters</td></tr>
+  <tr><td>Comments</td><td>500M/day</td><td>~5.8K/s</td><td>Sharded by post</td></tr>
+  <tr><td>Media views</td><td>~100 images + ~30 videos per DAU/day</td><td>~tens of PB/day egress</td><td>CDN mandatory</td></tr>
+  <tr><td>Average follows per user</td><td>~200 (celebrities: 100M+ followers)</td><td>—</td><td>Fan-out ~200× per post; celebrity hot spots</td></tr>
+</table></div>
+<p>How these numbers are derived and what they imply for storage, bandwidth and servers is worked through in <a href="capacity-estimation.html">Back-of-the-Envelope Estimation</a>.</p>
+
+<h3>4.2 Availability: 99.99% and what it really means</h3>
+<p><strong>Availability</strong> is the fraction of time (or of requests) for which the system works correctly. It is usually expressed in "nines":</p>
+<div class="table-wrap"><table>
+  <tr><th>Target</th><th>Downtime per year</th><th>per month</th><th>per day</th></tr>
+  <tr><td>99.9% ("three nines")</td><td>≈ 8.8 hours</td><td>≈ 43.8 minutes</td><td>≈ 86 seconds</td></tr>
+  <tr><td>99.95%</td><td>≈ 4.4 hours</td><td>≈ 21.9 minutes</td><td>≈ 43 seconds</td></tr>
+  <tr><td><b>99.99% ("four nines")</b></td><td><b>≈ 52.6 minutes</b></td><td><b>≈ 4.4 minutes</b></td><td><b>≈ 8.6 seconds</b></td></tr>
+  <tr><td>99.999% ("five nines")</td><td>≈ 5.3 minutes</td><td>≈ 26 seconds</td><td>≈ 0.9 seconds</td></tr>
+</table></div>
+<p>For Instagram we target <strong>99.99% for the core read path (feed, profiles, media) and for uploads</strong>. Four minutes per month is far less than the time it takes a human to be paged, log in and diagnose a problem — so four nines <strong>cannot be achieved by humans fixing things</strong>. It requires automatic failover, redundancy in every layer, gradual rollouts with automatic rollback, and graceful degradation. Extended features such as search or Explore can reasonably target 99.9%: if search is briefly down, the app is still usable.</p>
+<p>Two practical refinements:</p>
+<ul>
+  <li><strong>Request-based availability</strong> is more useful than time-based at this scale: <code>availability = successful requests / valid requests</code>. A 1% error rate for an hour is a partial outage, not "up" or "down".</li>
+  <li><strong>Graceful degradation counts.</strong> If ranking is down and we serve a chronological feed, the request succeeded — the user saw a feed. Define "success" carefully.</li>
+</ul>
+<p>The maths of how component availabilities combine (series vs parallel) is in <a href="core-principles.html">Core Principles</a>.</p>
+
+<h3>4.3 Latency targets</h3>
+<p><strong>Latency</strong> is the time from request to response. We specify it with <strong>percentiles</strong>, not averages: "p99 = 300 ms" means 99% of requests finish within 300 ms. Averages hide the slow tail that real users feel — a user who loads 20 feed pages per day will hit the p95 experience about once a day. (Percentiles are explained in depth in <a href="core-principles.html">Core Principles</a>.)</p>
+<div class="table-wrap"><table>
+  <tr><th>Operation</th><th>Target (server-side unless noted)</th><th>Why this number</th></tr>
+  <tr><td>Home feed, first page</td><td>p50 &lt; 100 ms, p99 &lt; 300 ms</td><td>Opening the app must feel instant; it's the most frequent action</td></tr>
+  <tr><td>First image visible (end-to-end, on device)</td><td>&lt; 1 s on 4G for p90</td><td>Perceived speed; needs CDN + small thumbnails + prefetch</td></tr>
+  <tr><td>Like / comment acknowledgement</td><td>p99 &lt; 200 ms</td><td>UI is optimistic (heart turns red immediately), server can be slightly slower</td></tr>
+  <tr><td>Upload acknowledged (photo)</td><td>p99 &lt; 2 s after bytes arrive</td><td>Heavy work (resize, transcode) is async</td></tr>
+  <tr><td>Post visible in followers' feeds</td><td>p99 &lt; ~1 minute (typically seconds)</td><td>Freshness requirement; drives fan-out design</td></tr>
+  <tr><td>Search typeahead</td><td>p99 &lt; 150 ms</td><td>Must keep up with typing</td></tr>
+  <tr><td>DM delivery to an online recipient</td><td>p99 &lt; 500 ms</td><td>Chat must feel real-time → persistent WebSockets</td></tr>
+  <tr><td>Push notification delivered</td><td>Seconds (best effort)</td><td>Depends on APNs/FCM; not under our full control</td></tr>
+</table></div>
+<div class="callout tip"><span class="callout-title">💡 Latency budget</span>
+A p99 of 300 ms for the feed must be <em>split</em> across hops: e.g. gateway 10 ms + feed service logic 30 ms + Redis timeline read 5 ms + parallel hydration of 20 posts from cache 40 ms + ranking 80 ms + serialization 10 ms, leaving headroom. If one hop needs 200 ms (a database query), the budget is blown — which is exactly why the feed is pre-computed and cached.</div>
+
+<h3>4.4 Durability of media and data</h3>
+<p><strong>Durability</strong> is the probability that data, once acknowledged as stored, is never lost. It is different from availability: a photo can be temporarily unavailable (a region is down) but must never be permanently lost.</p>
+<ul>
+  <li><strong>Media:</strong> target object-storage-class durability (S3 is designed for 99.999999999% — "11 nines" — annual object durability). Achieved by replicating or erasure-coding each object across multiple disks, racks and availability zones, plus cross-region copies for disaster recovery. See <a href="object-storage.html">Object Storage</a>.</li>
+  <li><strong>Acknowledged writes:</strong> once the app says "posted", the post must survive any single machine or zone failure. That means the metadata write is replicated (e.g. Cassandra with replication factor 3 and a quorum write) before success is returned — an <strong>RPO</strong> (recovery point objective: how much data you can lose) of zero for posts.</li>
+  <li><strong>Derived data is re-buildable:</strong> timelines in Redis, search indexes and counters can be regenerated from the source of truth, so they need availability more than durability.</li>
+  <li><strong>Deletes must also be durable</strong>: when a user deletes content, it must not resurface from a replica or backup restore.</li>
+</ul>
+
+<h3>4.5 Consistency expectations per feature</h3>
+<p><strong>Consistency</strong> here means: after a write, what can readers see? Strong consistency (everyone sees the latest write immediately) costs latency and availability, so we pay for it only where users would notice or be harmed. Full theory in <a href="cap-consistency.html">CAP, PACELC &amp; Consistency Models</a>.</p>
+<div class="table-wrap"><table>
+  <tr><th>Feature</th><th>Required consistency</th><th>Reason</th></tr>
+  <tr><td>Username uniqueness</td><td><b>Strong (linearizable)</b></td><td>Two people must never both get <code>@sunset</code>; a duplicate is a correctness bug</td></tr>
+  <tr><td>Login, password change, session revocation</td><td><b>Strong</b></td><td>A changed password or revoked session must take effect everywhere immediately — security</td></tr>
+  <tr><td>Privacy settings, blocks</td><td>Strong-ish; fail closed</td><td>A blocked user seeing your post, even briefly, is a privacy incident</td></tr>
+  <tr><td>Direct messages</td><td><b>Ordered per conversation</b>, no loss, no duplicates shown</td><td>Messages out of order change meaning</td></tr>
+  <tr><td>My own post on my profile</td><td>Read-your-writes</td><td>"I posted and it's not there" looks like a bug</td></tr>
+  <tr><td>Home feed</td><td>Eventual (seconds)</td><td>Nobody can tell if a friend's post arrived 3 s late</td></tr>
+  <tr><td>Like counts, view counts, follower counts</td><td>Eventual; approximate OK</td><td>"1.2M likes" doesn't need to be exact; huge write rates</td></tr>
+  <tr><td>Stories</td><td>Eventual; expiry within minutes of 24 h</td><td>Small staleness is invisible</td></tr>
+  <tr><td>Search index</td><td>Eventual (seconds–minutes)</td><td>Indexed asynchronously from Kafka</td></tr>
+</table></div>
+
+<h3>4.6 Read:write ratio</h3>
+<p>Instagram is <strong>read-heavy</strong>, but the ratio depends on what you count:</p>
+<ul>
+  <li><strong>Content views vs content creation:</strong> each post is created once and viewed hundreds of times → <strong>~100:1 or more</strong>. This is the ratio that justifies pre-computed feeds, caches and CDNs.</li>
+  <li><strong>Bytes out vs bytes in:</strong> media egress (tens of PB/day) vs uploads (hundreds of TB/day) → also ~100:1.</li>
+  <li><strong>API requests:</strong> likes are writes and very frequent, so at the API level the ratio is lower (perhaps ~3–5:1). That's why the like path is designed as a <em>write-optimised</em> path (append-only store, sharded counters) even inside a read-heavy product.</li>
+</ul>
+<p>Saying "read-heavy, ~100:1, so I'll optimise reads — but likes are a high-volume write path that needs special handling" is a strong, nuanced interview statement.</p>
+
+<h3>4.7 Security &amp; privacy</h3>
+<ul>
+  <li><strong>Authentication &amp; authorization</strong> on every request at the <a href="api-gateway.html">API Gateway</a>; tokens with expiry; per-object access checks (private accounts, blocks). See <a href="authentication.html">Authentication</a>.</li>
+  <li><strong>Encryption</strong> in transit (TLS everywhere, including service-to-service) and at rest (disk/object encryption, managed keys).</li>
+  <li><strong>Media access control</strong>: signed, expiring CDN URLs so private photos can't be hot-linked forever (see <a href="cdn.html">CDN</a>).</li>
+  <li><strong>Abuse prevention</strong>: <a href="rate-limiting.html">rate limiting</a>, spam and bot detection, content moderation in the media pipeline.</li>
+  <li><strong>Regulation</strong>: data deletion and export (e.g. GDPR "right to erasure"), data residency where required, minors' protections, audit logs.</li>
+</ul>
+<p>Details in <a href="security.html">Security &amp; Privacy</a>.</p>
+
+<h3>4.8 Cost</h3>
+<p>At this scale, cost is a first-class requirement. A design that is 20% cheaper per user saves enormous amounts annually. The big cost drivers are <strong>media storage</strong> (PBs per year, growing forever), <strong>egress bandwidth</strong> (CDN), <strong>RAM for caches</strong>, and <strong>compute for transcoding and ML</strong>. Cost-shaped decisions include storage tiering (move old, rarely-viewed media to cheaper cold storage), efficient codecs (WebP/AVIF images, modern video codecs), not fanning out to inactive users, and right-sizing caches with the 80/20 rule.</p>
+
+<h3>4.9 Other quality attributes</h3>
+<div class="table-wrap"><table>
+  <tr><th>Attribute</th><th>Instagram expectation</th></tr>
+  <tr><td>Scalability</td><td>Handle 2–3× daily peaks, viral spikes (a celebrity post) and multi-year growth without redesign — horizontal scaling everywhere</td></tr>
+  <tr><td>Fault tolerance</td><td>Survive loss of any server, any availability zone, ideally any region</td></tr>
+  <tr><td>Observability</td><td>Metrics, logs and traces for every service; SLO dashboards and alerts (<a href="observability.html">Observability</a>)</td></tr>
+  <tr><td>Maintainability</td><td>Hundreds of engineers deploy many times per day safely; independent services (<a href="microservices.html">Microservices</a>)</td></tr>
+  <tr><td>Mobile constraints</td><td>Flaky networks, limited battery and data; resumable uploads; offline-tolerant UI (<a href="clients.html">Clients</a>)</td></tr>
+</table></div>
+
+<h2>5. Making requirements measurable: SLIs, SLOs and SLAs</h2>
+<p>"Fast" and "reliable" are not testable. Site Reliability Engineering (SRE) practice turns non-functional requirements into three precise terms:</p>
+<div class="cards">
+  <div class="card"><h4>📏 SLI — Service Level Indicator</h4><p>A <em>measurement</em>. E.g. "the fraction of feed requests that return 2xx in under 300 ms, measured at the load balancer".</p></div>
+  <div class="card"><h4>🎯 SLO — Service Level Objective</h4><p>A <em>target</em> for an SLI over a window. E.g. "99.9% of feed requests in a rolling 28 days are fast and successful".</p></div>
+  <div class="card"><h4>📜 SLA — Service Level Agreement</h4><p>A <em>contract</em> with consequences (refunds) if missed. Consumer apps like Instagram don't have SLAs with users; cloud providers and B2B APIs do. SLAs are set looser than internal SLOs.</p></div>
+  <div class="card"><h4>💰 Error budget</h4><p><code>1 − SLO</code>. The amount of unreliability you're <em>allowed</em>. 99.9% → 0.1% of requests may fail. Spend it on deploys and experiments; freeze risky launches when it's exhausted.</p></div>
+</div>
+
+<div class="diagram">
+<svg viewBox="0 0 820 230" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <text x="20" y="30" font-weight="700">Feed SLO: 99.9% of requests successful and &lt; 300 ms over 28 days (≈ 280B requests)</text>
+  <rect x="20" y="50" width="780" height="40" fill="#e8f5e9" stroke="#2e7d32"/>
+  <text x="380" y="75" text-anchor="middle">99.9% must be good (≈ 279.7B requests)</text>
+  <rect x="722" y="50" width="78" height="40" fill="#ffebee" stroke="#c62828"/>
+  <text x="761" y="70" text-anchor="middle" font-size="11">error</text><text x="761" y="84" text-anchor="middle" font-size="11">budget</text>
+  <text x="20" y="118" font-size="12" fill="#555">(error-budget box drawn enlarged for visibility — really 0.1% ≈ 280M bad requests)</text>
+  <text x="20" y="150" font-weight="700">How the 280M-request budget was spent this window:</text>
+  <rect x="20" y="162" width="250" height="34" fill="#fff3e0" stroke="#ef6c00"/><text x="145" y="184" text-anchor="middle" font-size="12">bad deploy, rolled back: 40%</text>
+  <rect x="270" y="162" width="190" height="34" fill="#fff8e1" stroke="#f9a825"/><text x="365" y="184" text-anchor="middle" font-size="12">Redis failover: 30%</text>
+  <rect x="460" y="162" width="125" height="34" fill="#f3e5f5" stroke="#6a1b9a"/><text x="522" y="184" text-anchor="middle" font-size="12">slow tail: 20%</text>
+  <rect x="585" y="162" width="215" height="34" fill="#e8f5e9" stroke="#2e7d32"/><text x="692" y="184" text-anchor="middle" font-size="12">remaining: 10% → be careful</text>
+  <text x="20" y="220" font-size="12" fill="#555">When the remaining budget hits 0, risky launches pause and reliability work takes priority.</text>
+</svg>
+<div class="caption">An SLO turns "reliable" into a number; the error budget turns that number into a decision-making tool.</div>
+</div>
+
+<h3>5.1 Example SLOs for Instagram</h3>
+<div class="table-wrap"><table>
+  <tr><th>User journey</th><th>SLI (good events / valid events)</th><th>SLO (28-day window)</th></tr>
+  <tr><td>Open feed</td><td>Feed responses with 2xx and latency &lt; 300 ms</td><td>99.9% (availability-only SLI: 99.99%)</td></tr>
+  <tr><td>Publish post</td><td>Post creations acknowledged successfully</td><td>99.99%</td></tr>
+  <tr><td>Post propagation</td><td>Posts present in 99% of followers' timelines within 60 s</td><td>99%</td></tr>
+  <tr><td>Media delivery</td><td>CDN media requests 2xx with time-to-first-byte &lt; 200 ms</td><td>99.9%</td></tr>
+  <tr><td>Send DM</td><td>Messages delivered to online recipients within 1 s</td><td>99.9%</td></tr>
+  <tr><td>Durability</td><td>Acknowledged media objects readable later</td><td>11 nines (annual)</td></tr>
+</table></div>
+<div class="callout warn"><span class="callout-title">⚠️ Measure where the user is</span>
+An SLI measured inside the feed service ignores failures at the load balancer, DNS or CDN. Prefer measuring at the edge (load balancer logs) or from the client (real-user monitoring). And never set a 100% SLO: it is unachievable, and it leaves zero room to ever deploy anything.</div>
+
+<h2>6. From requirement to design decision to component</h2>
+<p>This is the most important table in the lesson. Every box in the Instagram diagram exists because of a requirement — if you can't say which one, the box probably shouldn't be there.</p>
+<div class="table-wrap"><table>
+  <tr><th>Requirement</th><th>Design decision</th><th>Component in the diagram</th></tr>
+  <tr><td>Post photos/videos up to hundreds of MB on mobile networks</td><td>Direct-to-storage uploads via pre-signed URLs; resumable chunks</td><td>Upload Service + Object Storage (<a href="media-upload.html">Media Upload</a>)</td></tr>
+  <tr><td>Media must never be lost (11 nines)</td><td>Erasure-coded/replicated blob store across zones + cross-region copy</td><td>Object Storage (<a href="object-storage.html">Object Storage</a>)</td></tr>
+  <tr><td>Media must load fast worldwide; tens of PB/day egress</td><td>Pull CDN with versioned, signed URLs</td><td>CDN (<a href="cdn.html">CDN</a>)</td></tr>
+  <tr><td>Multiple device sizes, video on slow networks</td><td>Async resize/transcode into renditions + adaptive bitrate</td><td>Media Processing Workers (<a href="media-processing.html">Media Processing</a>)</td></tr>
+  <tr><td>Feed p99 &lt; 300 ms at ~350K req/s peak</td><td>Pre-computed timelines in memory (fan-out on write)</td><td>Feed Fan-out Workers + Feed Cache/Redis (<a href="news-feed.html">News Feed</a>)</td></tr>
+  <tr><td>Celebrities with 100M+ followers</td><td>Hybrid fan-out: pull celebrity posts at read time</td><td>News Feed Service (<a href="news-feed.html">News Feed</a>)</td></tr>
+  <tr><td>Ranked feed and Explore</td><td>Event logging + offline training + online scoring</td><td>Analytics &amp; ML Training (<a href="analytics-ml.html">Analytics &amp; ML</a>)</td></tr>
+  <tr><td>~58K likes/s, eventual counts OK</td><td>Append-only write-optimised store + sharded/cached counters</td><td>Like &amp; Comment Service, Cassandra, Redis (<a href="likes-comments.html">Likes &amp; Comments</a>)</td></tr>
+  <tr><td>2B users, unique usernames (strong)</td><td>Relational DB with unique constraint, sharded by user_id, with replicas</td><td>User DB / PostgreSQL (<a href="databases.html">Databases</a>, <a href="sharding.html">Sharding</a>)</td></tr>
+  <tr><td>Billions of posts, write-heavy, "latest posts by user"</td><td>Wide-column store partitioned by user_id, clustered by time-ordered post_id</td><td>Post metadata / Cassandra (<a href="id-generation.html">ID Generation</a>)</td></tr>
+  <tr><td>Who follows whom, both directions, fast</td><td>Adjacency lists stored in both directions</td><td>Follow/Graph Service + Social Graph store (<a href="social-graph.html">Social Graph</a>)</td></tr>
+  <tr><td>Stories disappear after 24 h</td><td>TTL on metadata and timeline entries; lifecycle rules for media</td><td>Stories Service (<a href="stories.html">Stories</a>)</td></tr>
+  <tr><td>Typeahead search p99 &lt; 150 ms</td><td>Inverted index + prefix index, updated asynchronously</td><td>Search Service, Search Indexer, Elasticsearch (<a href="search.html">Search</a>)</td></tr>
+  <tr><td>Real-time DMs, ordered per conversation</td><td>Persistent WebSocket connections; per-conversation sequence numbers</td><td>Direct Messaging + Messages Store (<a href="direct-messaging.html">Direct Messaging</a>)</td></tr>
+  <tr><td>Users notified of likes/comments/follows</td><td>Event-driven notification pipeline with batching and dedupe</td><td>Notification Service → APNs/FCM (<a href="notifications.html">Notifications</a>)</td></tr>
+  <tr><td>Decoupled side effects; absorb spikes</td><td>Publish domain events, process asynchronously</td><td>Kafka event bus (<a href="message-queues.html">Message Queues</a>)</td></tr>
+  <tr><td>99.99% availability</td><td>No SPOFs: redundant LBs, stateless services in many zones, replicated stores, automatic failover</td><td>Load Balancer, all stores' replicas (<a href="core-principles.html">Core Principles</a>, <a href="replication.html">Replication</a>)</td></tr>
+  <tr><td>Global users, regional disasters</td><td>Multi-region deployment, geo-routing</td><td>DNS + regions (<a href="dns.html">DNS</a>, <a href="multi-region.html">Multi-Region</a>)</td></tr>
+  <tr><td>Security, abuse prevention</td><td>Central auth, TLS termination, rate limits</td><td>API Gateway (<a href="api-gateway.html">API Gateway</a>, <a href="rate-limiting.html">Rate Limiting</a>)</td></tr>
+</table></div>
+
+<pre class="ascii">
+ REQUIREMENT                   DECISION                        COMPONENT
+ ─────────────                 ─────────                       ─────────
+ "feed p99 &lt; 300 ms"  ───────&gt; precompute timelines ────────&gt; Fan-out workers ─&gt; Redis
+ "~100:1 read-heavy"  ───────&gt; cache + replicas + CDN ──────&gt; Redis, read replicas, CDN
+ "never lose a photo" ───────&gt; replicate across zones ──────&gt; Object storage (S3)
+ "unique usernames"   ───────&gt; single-leader + UNIQUE ──────&gt; PostgreSQL (sharded)
+ "counts can lag"     ───────&gt; async, eventual counters ────&gt; Kafka ─&gt; Redis counters
+</pre>
+
+<h2>7. Clarifying questions to ask the interviewer</h2>
+<p>Below are the questions worth asking for "Design Instagram", with typical interviewer answers and what you do with them. You won't ask all of them — pick the 6–8 that most change the design, and <strong>propose an answer</strong> in the same breath ("I'll assume X — OK?").</p>
+<div class="table-wrap"><table>
+  <tr><th>#</th><th>Question</th><th>Example answer</th><th>Design consequence</th></tr>
+  <tr><td>1</td><td>Which features are in scope? I'd propose upload, follow, feed, like/comment as core.</td><td>"Yes, plus Stories if time allows."</td><td>Deep dives on feed and upload; Stories as TTL extension</td></tr>
+  <tr><td>2</td><td>How many users? DAU/MAU? Global?</td><td>"2B MAU, 500M DAU, worldwide."</td><td>Sharding, CDN, multi-region</td></tr>
+  <tr><td>3</td><td>Photos only, or videos too? Size/length limits?</td><td>"Both; videos up to a few minutes."</td><td>Transcoding pipeline; adaptive streaming; storage ×several</td></tr>
+  <tr><td>4</td><td>Is the feed ranked or chronological?</td><td>"Ranked, but mostly recent posts from people you follow."</td><td>ML ranking stage; candidate generation + scoring</td></tr>
+  <tr><td>5</td><td>How fresh must the feed be?</td><td>"A new post should show within a minute."</td><td>Async fan-out acceptable; no synchronous fan-out</td></tr>
+  <tr><td>6</td><td>Are follows one-directional? Any accounts with huge follower counts?</td><td>"One-way; top accounts have hundreds of millions."</td><td>Hybrid push/pull fan-out</td></tr>
+  <tr><td>7</td><td>Latency target for the feed?</td><td>"Feels instant — let's say p99 under 300 ms server-side."</td><td>Timelines in memory; aggressive caching</td></tr>
+  <tr><td>8</td><td>Availability expectations? Is brief staleness OK for likes and feeds?</td><td>"Highly available; staleness of seconds is fine."</td><td>AP-leaning stores, async counters (<a href="cap-consistency.html">CAP</a>)</td></tr>
+  <tr><td>9</td><td>Private accounts and blocking?</td><td>"Yes, both."</td><td>Authorization check on every read path; filter at fan-out and at read</td></tr>
+  <tr><td>10</td><td>Can users edit/delete posts? Any legal deletion requirements?</td><td>"Delete yes; edit caption only."</td><td>Deletion propagation to caches, search, CDN; tombstones</td></tr>
+  <tr><td>11</td><td>Do we need DMs? Encrypted end-to-end?</td><td>"Out of scope for now."</td><td>Show the box; skip design</td></tr>
+  <tr><td>12</td><td>Read:write expectations?</td><td>"Heavily read-dominated."</td><td>Optimise reads (caches, replicas, CDN)</td></tr>
+  <tr><td>13</td><td>Any cost or team constraints? Build on a cloud provider?</td><td>"Assume a large cloud; cost matters but isn't the main focus."</td><td>Managed services (S3, managed Kafka) are acceptable</td></tr>
+  <tr><td>14</td><td>Analytics / notifications required?</td><td>"Notifications for likes and follows, yes."</td><td>Event-driven notification pipeline</td></tr>
+</table></div>
+<div class="callout interview"><span class="callout-title">🎤 Interview tip</span>
+Ask questions in <strong>batches by theme</strong> ("three quick questions on scale…") and write the answers on the board. Don't spend more than ~5 minutes. If the interviewer says "you decide", make a reasonable assumption, state it, and move on — they're testing whether you can make decisions under ambiguity.</div>
+
+<h2>8. How requirements change the design</h2>
+<p>The best way to understand requirements is to see what happens when one changes. Interviewers love this as a follow-up ("what if…?").</p>
+<div class="table-wrap"><table>
+  <tr><th>If the requirement becomes…</th><th>…the design changes like this</th></tr>
+  <tr><td><b>DMs must be end-to-end encrypted (E2EE)</b></td><td>The server can no longer read message content: no server-side search over messages, no server-side spam/content scanning of text, no server-rendered link previews. Clients manage keys (e.g. Signal-protocol style key exchange, per-device keys); multi-device sync and history restore become hard (encrypted backups); moderation shifts to metadata and user reports. The Messages Store holds ciphertext only.</td></tr>
+  <tr><td><b>The feed must be strictly chronological</b></td><td>The ML ranking stage disappears; the timeline is a simple time-sorted merge. Fan-out still helps, but pull-on-read (merge the latest posts of each followee, k-way merge by timestamp) becomes more attractive because no scoring is needed. "Exactly in order" also demands time-ordered IDs (<a href="id-generation.html">ID Generation</a>) and consistent clocks.</td></tr>
+  <tr><td><b>Like counts must be exact and real-time</b></td><td>Async counters aren't enough; you need atomic increments on a strongly consistent counter — a hot-key problem for viral posts (millions of likes/hour on one row). Expect sharded counters with synchronous aggregation, higher latency, and lower availability during partitions.</td></tr>
+  <tr><td><b>Video-first (like Reels/TikTok)</b></td><td>Storage and egress grow ~10×; transcoding compute dominates; adaptive bitrate streaming; the feed becomes a recommendation feed (Explore-like) driven mostly by ML rather than the follow graph.</td></tr>
+  <tr><td><b>Only one country, 10M users</b></td><td>One region; a single primary PostgreSQL with replicas may handle all metadata; simple fan-out; maybe a commercial CDN. Far fewer moving parts — and that's the <em>right</em> answer for that requirement.</td></tr>
+  <tr><td><b>Data residency (EU data must stay in the EU)</b></td><td>Region-pinned storage per user; routing users to their home region; cross-region features (a German user following a US user) need careful replication of only allowed data.</td></tr>
+  <tr><td><b>Posts must appear in followers' feeds within 1 second</b></td><td>Fan-out must be fast and prioritised; celebrity pulls at read time; possibly push notifications over persistent connections. Much more infrastructure for marginal user value — worth questioning the requirement.</td></tr>
+  <tr><td><b>99.999% availability</b></td><td>Multi-region active-active for reads and writes, automated regional failover, conflict resolution for concurrent writes, extremely conservative deploys. Cost and complexity increase sharply for each additional nine.</td></tr>
+  <tr><td><b>Stories must vanish at exactly 24:00:00</b></td><td>Read-time filtering by <code>expires_at</code> (cheap, exact) instead of relying on background TTL deletion (lazy, approximate). CDN URLs must expire too.</td></tr>
+</table></div>
+<div class="callout tip"><span class="callout-title">💡 Push back on expensive requirements</span>
+Senior engineers question requirements whose cost exceeds their value: "Do we really need exact like counts? Users see '1.2M' anyway — approximate counts let us avoid a hot-key bottleneck." This is a strong staff-level signal, as long as you accept the interviewer's final decision.</div>
+
+<h2>9. How Instagram uses requirements to shape its design</h2>
+<div class="flow">
+  <div class="fnode client">Product need<small>"show friends' posts"</small></div><div class="farrow">→<small>functional</small></div>
+  <div class="fnode edge">Quality bar<small>p99 &lt; 300 ms, 99.99%</small></div><div class="farrow">→<small>numbers</small></div>
+  <div class="fnode svc">Decision<small>precompute timelines</small></div><div class="farrow">→<small>build</small></div>
+  <div class="fnode store">Component<small>Redis feed cache</small></div><div class="farrow">→<small>measure</small></div>
+  <div class="fnode ext">SLI / SLO<small>dashboards, alerts</small></div>
+</div>
+<p>Reading the Instagram diagram through the lens of requirements:</p>
+<ul>
+  <li>The <strong>API path and the media path are separate</strong> because the latency and bandwidth requirements of the two are completely different — JSON responses are small and personalised (served by services), media is huge and shared (served by the <a href="cdn.html">CDN</a>).</li>
+  <li><strong>Kafka sits in the middle</strong> because many requirements are "eventually, within seconds" (fan-out, search indexing, notifications, analytics) rather than "before the response". Doing them asynchronously keeps the upload latency target and isolates failures.</li>
+  <li><strong>Different stores for different consistency needs</strong>: PostgreSQL where uniqueness and transactions matter (users), Cassandra where write throughput and availability matter (posts, likes), Redis where latency matters (timelines, counters).</li>
+  <li><strong>Stateless services</strong> exist because of the availability and scalability requirements: any instance can die or be added without losing data.</li>
+</ul>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+Instagram's requirements have shifted dramatically over its history, and public engineering talks describe the architecture following them. A famous public example is the <strong>feed ordering requirement</strong>: Instagram launched with a reverse-chronological feed and moved to a ranked feed in 2016, because as people followed more accounts they were missing a large share of posts. That requirement change brought in an entire ML ranking stack (the "Analytics &amp; ML Training" box). Later, following user demand, Instagram re-introduced <strong>"Following" and "Favorites" chronological views</strong> as options — the same data, different read-time ordering. Similarly, when Stories launched (2016) the new <em>ephemeral</em> requirement led to TTL-based storage, and the push for end-to-end encrypted messaging across Meta's apps reshaped how DMs are stored. The rough figures used throughout this guide (2B MAU, 500M DAU) are our working assumptions in that spirit — public reports place Instagram's monthly users in the billions.</div>
+
+<h3>A worked requirements summary (what you'd leave on the whiteboard)</h3>
+<pre><code>INSTAGRAM — REQUIREMENTS (agreed with interviewer)
+
+Functional (core):    post photo/video/carousel · home feed (ranked) · follow/unfollow
+                      like/comment · profiles · auth
+Functional (extended): stories (24h) · search · DMs · notifications · explore
+Out of scope:         ads · shopping · payments · live
+
+Scale:        2B MAU · 500M DAU · 100M posts/day · 10B feed loads/day · 5B likes/day
+Latency:      feed p99 &lt; 300 ms (server) · like ack p99 &lt; 200 ms · post visible to followers &lt; 1 min
+Availability: 99.99% feed/upload/media · 99.9% search/explore
+Durability:   no acknowledged post/media ever lost (11 nines media)
+Consistency:  strong → usernames, auth, privacy · ordered → DMs
+              read-your-writes → own posts · eventual → feed, counts, search
+Read:write:   ~100:1 content views : uploads (likes = heavy write path)
+Security:     authN/Z on every request, TLS, signed media URLs, privacy, deletion
+Cost:         storage tiering, efficient codecs, skip inactive users in fan-out</code></pre>
+
+<h2>10. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Spending time on requirements</h4><ul>
+    <li>Prevents designing the wrong thing</li>
+    <li>Gives you numbers to justify every component</li>
+    <li>Lets you choose consistency per feature instead of one-size-fits-all</li>
+    <li>Creates a checklist to verify the final design against</li>
+    <li>Signals product sense and seniority</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs and risks</h4><ul>
+    <li>Takes time from design — over 7–8 minutes hurts</li>
+    <li>Too many open questions sound indecisive</li>
+    <li>Over-specifying (exact numbers to 3 significant figures) wastes effort</li>
+    <li>Rigid requirements can hide better options — sometimes the right move is to negotiate them</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Skipping non-functional requirements.</strong> Listing features only, then having no basis for choosing caches, replicas or consistency models.</li>
+  <li><strong>"Highly available and strongly consistent everywhere."</strong> During a network partition you can't have both (<a href="cap-consistency.html">CAP</a>); pick per feature.</li>
+  <li><strong>Averages instead of percentiles.</strong> "Average latency 100 ms" says nothing about the 1% of users waiting 3 seconds.</li>
+  <li><strong>Confusing availability with durability.</strong> A system can be up and still have lost data, or down with all data safe.</li>
+  <li><strong>Forgetting deletes and privacy.</strong> Blocked users, private accounts and legal deletion touch every read path and every cache.</li>
+  <li><strong>Scope creep.</strong> Trying to cover DMs, Reels, Explore and ads in 45 minutes. Say "out of scope" explicitly.</li>
+  <li><strong>Treating assumptions as facts.</strong> Say "assume 500M DAU", not "Instagram has exactly 500M DAU".</li>
+  <li><strong>Setting a 100% target.</strong> Leaves no error budget and is physically impossible.</li>
+</ul>
+
+<h2>11. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Tool / practice</th><th>What it's for</th><th>When to use it</th></tr>
+  <tr><td>Design docs / RFCs (Goals, Non-goals, Requirements sections)</td><td>Agreeing requirements before building</td><td>Every non-trivial project</td></tr>
+  <tr><td>User stories + acceptance criteria (Jira, Linear, etc.)</td><td>Precise functional requirements</td><td>Feature planning</td></tr>
+  <tr><td>MoSCoW prioritisation (Must/Should/Could/Won't)</td><td>Core vs extended vs out-of-scope</td><td>Scoping a release or an interview answer</td></tr>
+  <tr><td>Prometheus + Grafana; Datadog; Google Cloud Monitoring SLOs</td><td>Measuring SLIs, SLO dashboards, burn-rate alerts</td><td>Any production service with an SLO</td></tr>
+  <tr><td>OpenSLO / Sloth (SLO-as-code)</td><td>Declaring SLOs in version-controlled config</td><td>Many services, consistent SLO definitions</td></tr>
+  <tr><td>Real-user monitoring (RUM), mobile performance SDKs</td><td>Client-side latency SLIs (first image visible)</td><td>User-facing apps where network dominates</td></tr>
+  <tr><td>Load-testing tools (k6, Locust, Gatling, JMeter)</td><td>Verifying scale and latency requirements before launch</td><td>Pre-launch and capacity planning</td></tr>
+  <tr><td>Chaos engineering (Chaos Monkey, Gremlin, LitmusChaos)</td><td>Verifying availability/fault-tolerance requirements</td><td>Systems targeting 99.99%+</td></tr>
+</table></div>
+
+<h2>12. Interview corner</h2>
+<details class="qa"><summary>What's the difference between functional and non-functional requirements? Give Instagram examples.</summary>
+<p>Functional requirements describe behaviour — what a user can do: "upload a photo with a caption", "see a feed of followed accounts", "like a post". Non-functional requirements describe qualities of that behaviour across all users: "feed p99 under 300 ms at 350K requests/s", "99.99% availability", "no acknowledged upload is ever lost", "like counts may be eventually consistent". Functional requirements decide which services and entities exist; non-functional ones decide how they are built — caching, replication, sharding, consistency model, regions.</p></details>
+<details class="qa"><summary>What does 99.99% availability mean, and how would you achieve it for Instagram's feed?</summary>
+<p>At most ~52.6 minutes of downtime per year, ~4.4 minutes per month, or 0.01% of requests failing. That's faster than any human can respond, so it requires automation: no single points of failure (redundant load balancers, stateless services across ≥3 availability zones, replicated Redis and databases with automatic failover), health-checked load balancing, gradual deploys with automatic rollback, timeouts and circuit breakers, and graceful degradation — e.g. if ranking fails, serve a chronological timeline from the cache; if the cache fails, serve a smaller feed built from the post store.</p></details>
+<details class="qa"><summary>Which Instagram features need strong consistency and which can be eventual? Why?</summary>
+<p>Strong: username uniqueness (duplicates are a correctness bug), authentication and session revocation (security), privacy settings and blocks (privacy harm). Ordered: DMs within a conversation. Read-your-writes: a user's own posts and profile edits. Eventual: home feed, like/view/follower counts, search index, Stories tray — a few seconds of staleness is invisible and buys low latency and high availability at huge write rates.</p></details>
+<details class="qa"><summary>Why specify latency as p99 rather than average?</summary>
+<p>Averages hide the tail. If 99% of requests take 50 ms and 1% take 5 s, the average is ~100 ms — it looks fine but one request in a hundred is terrible. Heavy users make many requests per day, so most of them experience the tail daily. Also, a page that calls many backends is slowed by the slowest one, so tail latency of components becomes typical latency of the page. p99 (or p99.9) targets force you to control the tail.</p></details>
+<details class="qa"><summary>Explain SLI, SLO, SLA and error budget with an Instagram example.</summary>
+<p>SLI: the measured fraction of feed requests that succeed in under 300 ms. SLO: the target, e.g. 99.9% over 28 days. SLA: an external contract with penalties — Instagram doesn't have one with consumers, but a cloud provider has one with Instagram, and it's looser than internal SLOs. Error budget: 1 − SLO = 0.1% — with ~280B feed requests in 28 days, about 280M may be bad. Teams spend the budget on risk (deploys, experiments); if it's exhausted, they pause launches and fix reliability.</p></details>
+<details class="qa"><summary>The interviewer says DMs must now be end-to-end encrypted. What changes?</summary>
+<p>The server only stores and forwards ciphertext. Keys live on devices (per-device identity keys, a Signal-style protocol for session setup), so: multi-device requires encrypting each message for every device of every participant (fan-out per device); message history on a new device needs encrypted backups or device-to-device transfer; server-side features that read content — search over messages, link previews, spam/abuse classifiers on text — move to the client or rely on metadata and user reports. Storage, ordering and delivery mechanics stay similar.</p></details>
+<details class="qa"><summary>How would you prioritise features when the interviewer says "Design Instagram" with no other guidance?</summary>
+<p>Propose: core = posting media, following, home feed, like/comment, profiles — the loop that makes Instagram work (create → distribute → consume → engage). Extended = Stories, search, DMs, notifications, Explore — I'll show where they plug in. Out of scope = ads, shopping, payments, live video. Then confirm with the interviewer and ask which part they'd like to dig into. This focuses time on the feed and media pipeline, where the hard scaling problems are.</p></details>
+<details class="qa"><summary>Is Instagram read-heavy or write-heavy? Be precise.</summary>
+<p>Read-heavy for content: each post is created once and viewed hundreds of times (~100:1 or more), and media bytes out exceed bytes in by a similar factor — so we optimise reads with timelines in Redis, caches and a CDN. But some paths are write-heavy: likes (~58K/s average under our assumptions), view counters, and the fan-out of each post to hundreds of follower timelines (~20B timeline inserts/day). Those get write-optimised designs: append-only stores, batching, sharded counters.</p></details>
+
+<h2>13. Check your understanding</h2>
+<details class="quiz"><summary>Classify: (a) "users can delete comments", (b) "comment deletion propagates within 5 seconds", (c) "comments are stored encrypted at rest", (d) "users can reply to a comment".</summary>
+<p>(a) and (d) are <strong>functional</strong> (behaviours). (b) is <strong>non-functional</strong> (a latency/consistency target). (c) is <strong>non-functional</strong> (security).</p></details>
+<details class="quiz"><summary>Numeric: a service has an SLO of 99.95% availability per 30-day month. How many minutes of downtime is that?</summary>
+<p>30 days × 1,440 min = 43,200 min. 0.05% of that = 43,200 × 0.0005 = <strong>21.6 minutes</strong> per month.</p></details>
+<details class="quiz"><summary>Numeric: with 10B feed loads/day, how many failed requests per day does a 99.99% success SLO allow?</summary>
+<p>0.01% × 10B = <strong>1 million</strong> failed feed requests per day. Large in absolute terms — which is why request-based SLIs are measured as ratios, not counts.</p></details>
+<details class="quiz"><summary>Scenario: your post appears in your followers' feeds 20 seconds after you publish, but on your own profile instantly. Is that a requirements violation?</summary>
+<p>No. The requirements are read-your-writes for the author's own view (satisfied) and eventual propagation to followers within ~1 minute (satisfied). This is exactly the intended design: the author's write is read from the primary/session, followers get it via asynchronous fan-out.</p></details>
+<details class="quiz"><summary>Why does "username uniqueness" force a different database choice than "like counts"?</summary>
+<p>Uniqueness requires a linearizable check-and-set: when two people claim the same name simultaneously exactly one must win, which needs a single authority (a leader with a unique constraint, or consensus). Like counts tolerate staleness and approximate values but have a very high write rate, so an AP-leaning, write-optimised store with asynchronous counters fits better.</p></details>
+<details class="quiz"><summary>Which is durability and which is availability: (a) "the photo can't be loaded for 10 minutes during a zone outage", (b) "a disk failure destroyed the only copy of a photo"?</summary>
+<p>(a) is an <strong>availability</strong> failure — the data still exists and will come back. (b) is a <strong>durability</strong> failure — the data is gone forever. Durability is protected with replication/erasure coding across failure domains and backups; availability with redundancy and failover.</p></details>
+<details class="quiz"><summary>The interviewer changes the requirement to "feed must be strictly chronological". Name two components that change.</summary>
+<p>The ML ranking stage (Analytics &amp; ML / ranking in the News Feed Service) is removed from the read path, and the timeline merge becomes a pure time-ordered merge — which makes pull-on-read (k-way merge of followees' latest posts) more attractive and puts more weight on time-ordered post IDs. Fan-out workers may still be used, but freshness and ordering guarantees become stricter.</p></details>
+<details class="quiz"><summary>Why is "the system must be 100% available" a bad requirement?</summary>
+<p>It's unachievable (hardware, networks and humans fail), and it leaves an error budget of zero — meaning no deploy, migration or experiment is ever "allowed". Every extra nine costs much more than the last. Choose the lowest target users won't notice and the business can afford.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Requirements come first: <strong>functional</strong> = what, <strong>non-functional</strong> = how well. The second list shapes the architecture far more.</li>
+    <li>Prioritise into <strong>core / extended / out of scope</strong>; for Instagram the core loop is post → fan-out → feed → like/comment.</li>
+    <li>Quantify: <strong>500M DAU, ~100M posts/day, feed p99 &lt; 300 ms, 99.99% (~52 min/yr), 11-nines media durability, ~100:1 reads</strong>.</li>
+    <li>Choose <strong>consistency per feature</strong>: strong for usernames/auth/privacy, ordered for DMs, read-your-writes for own content, eventual for feeds and counts.</li>
+    <li>Make requirements measurable with <strong>SLIs, SLOs and error budgets</strong>.</li>
+    <li>Every component should trace back to a requirement — and changing a requirement (E2EE, chronological feed, exact counts) changes the design.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="how-to-approach.html">How to Approach a System Design Problem</a> — where requirements fit in the 6-step framework</li>
+  <li><a href="capacity-estimation.html">Back-of-the-Envelope Estimation</a> — turning the scale assumptions into QPS, storage and bandwidth</li>
+  <li><a href="core-principles.html">Core Principles</a> — availability maths, percentiles, scalability</li>
+  <li><a href="cap-consistency.html">CAP, PACELC &amp; Consistency Models</a> — the theory behind per-feature consistency choices</li>
+  <li><a href="news-feed.html">News Feed</a> — how the latency and freshness requirements are met</li>
+  <li><a href="observability.html">Observability</a> — measuring SLIs and alerting on SLOs</li>
+  <li><a href="security.html">Security &amp; Privacy</a> — the security and privacy requirements in depth</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

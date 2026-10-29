@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Media Processing Pipeline — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="media-processing">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>A raw upload is <strong>not</strong> what users download. The media pipeline turns one original into many <strong>renditions</strong>: validated, privacy-scrubbed (EXIF/GPS removed), correctly rotated, resized, re-encoded (JPEG/WebP/AVIF), plus thumbnails and tiny blurred placeholders.</li>
+    <li>Videos are <strong>transcoded</strong> into a <strong>bitrate ladder</strong> (240p…1080p) with modern codecs (H.264, HEVC, VP9, AV1), cut into 2–6 s <strong>HLS/DASH segments</strong>, so players can do <strong>adaptive bitrate</strong> streaming.</li>
+    <li>Work is driven by <a href="message-queues.html">Kafka</a> events into autoscaled <strong>worker pools</strong> that execute a <strong>task DAG</strong> with retries, idempotent outputs, priorities and (for video) GPU/ASIC hardware encoders.</li>
+    <li><strong>Content moderation</strong> runs in the pipeline: perceptual-hash matching (PhotoDNA, PDQ) against known illegal content, ML classifiers, and human review queues; ML also generates <strong>automatic alt text</strong>.</li>
+    <li>A <strong>post state machine</strong> (UPLOADED → PROCESSING → PUBLISHED, or FAILED/REJECTED) keeps it all consistent; <strong>lazy transcoding</strong> of rare renditions and spending expensive encodes only on popular videos keep costs sane.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why process media at all?</h2>
+<p>A modern phone produces a 12–48 megapixel photo of 2–6 MB (often in Apple's HEIC format) and 4K HDR video at 20–50 Mbit/s. Now think about who views it on Instagram: a user on a 5-year-old Android phone with a 720-pixel-wide screen on a congested 3G network in a rural area, a user on a new iPhone on Wi-Fi, and someone on a desktop browser that can't decode HEIC at all. Serving the original to all of them would be wrong in every way:</p>
+<ul>
+  <li><strong>Too big:</strong> downloading 5 MB to display a 640-pixel-wide image wastes ~95% of the bytes, the user's data plan and our CDN bandwidth. Feeds would scroll at a crawl.</li>
+  <li><strong>Incompatible:</strong> not every device decodes HEIC, HEVC, AV1 or HDR.</li>
+  <li><strong>Unsafe for privacy:</strong> photos carry <strong>EXIF metadata</strong> including the exact <strong>GPS coordinates</strong> where they were taken — often the user's home.</li>
+  <li><strong>Unsafe for the platform:</strong> uploads may be malformed (or deliberately malicious) files, or prohibited content that must never be published.</li>
+  <li><strong>Not streamable:</strong> a single large video file can't adapt to a network that drops from 20 Mbit/s to 1 Mbit/s mid-playback.</li>
+</ul>
+<p>So every upload goes through a <strong>media processing pipeline</strong> that produces a set of safe, optimised, device-appropriate renditions, stores them in <a href="object-storage.html">object storage</a>, and lets the <a href="cdn.html">CDN</a> serve the right one to each viewer.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  Think of a <strong>photo lab and print shop</strong>. A customer drops off a raw negative. Before anything is printed, a clerk checks it's really film (validation), removes the customer's address label stuck on the envelope (EXIF stripping), turns it the right way up (orientation), and an inspector checks nothing illegal is on it (moderation). Then the lab produces <strong>wallet, postcard and poster prints</strong> (renditions) on different paper types (formats), a contact sheet of thumbnails, and for a home movie, copies on different tape qualities so it plays on any player (bitrate ladder). Big orders are split among many technicians (worker pools), urgent orders jump the queue (priorities), and the order slip tracks status: received → in the lab → ready for pickup (state machine).
+</div>
+
+<h2>2. The pipeline at a glance</h2>
+<div class="diagram">
+<svg viewBox="0 0 880 300" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-media-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600">
+    <rect x="10" y="120" width="110" height="54" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="65" y="143" text-anchor="middle">Raw upload</text><text x="65" y="161" text-anchor="middle" font-weight="400" font-size="11">S3 raw bucket</text>
+    <rect x="150" y="120" width="110" height="54" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="205" y="143" text-anchor="middle">Kafka</text><text x="205" y="161" text-anchor="middle" font-weight="400" font-size="11">media.uploaded</text>
+    <rect x="290" y="120" width="120" height="54" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="350" y="143" text-anchor="middle">Validate</text><text x="350" y="161" text-anchor="middle" font-weight="400" font-size="11">type, size, decode</text>
+    <rect x="440" y="120" width="130" height="54" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="505" y="143" text-anchor="middle">Normalize</text><text x="505" y="161" text-anchor="middle" font-weight="400" font-size="11">strip EXIF, rotate</text>
+    <rect x="610" y="20" width="160" height="46" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="690" y="40" text-anchor="middle">Renditions</text><text x="690" y="56" text-anchor="middle" font-weight="400" font-size="11">resize ×N, JPEG/WebP/AVIF</text>
+    <rect x="610" y="78" width="160" height="46" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="690" y="98" text-anchor="middle">Video transcode</text><text x="690" y="114" text-anchor="middle" font-weight="400" font-size="11">ladder + HLS/DASH</text>
+    <rect x="610" y="136" width="160" height="46" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="690" y="156" text-anchor="middle">Thumbs + preview</text><text x="690" y="172" text-anchor="middle" font-weight="400" font-size="11">blurhash, poster frame</text>
+    <rect x="610" y="194" width="160" height="46" rx="8" fill="#ffebee" stroke="#c62828"/><text x="690" y="214" text-anchor="middle">Moderation</text><text x="690" y="230" text-anchor="middle" font-weight="400" font-size="11">hash match + ML</text>
+    <rect x="610" y="252" width="160" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="690" y="277" text-anchor="middle">Alt text (ML)</text>
+    <rect x="800" y="120" width="70" height="54" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="835" y="143" text-anchor="middle">Publish</text><text x="835" y="161" text-anchor="middle" font-weight="400" font-size="11">state ✔</text>
+  </g>
+  <g stroke="#555" stroke-width="1.4" fill="none" marker-end="url(#ar-media-1)">
+    <path d="M120,147 L148,147"/><path d="M260,147 L288,147"/><path d="M410,147 L438,147"/>
+    <path d="M570,140 L608,45"/><path d="M570,143 L608,101"/><path d="M570,147 L608,159"/><path d="M570,151 L608,215"/><path d="M570,155 L608,270"/>
+    <path d="M770,45 L798,135"/><path d="M770,101 L798,140"/><path d="M770,159 L798,150"/><path d="M770,215 L798,160"/><path d="M770,270 L798,166"/>
+  </g>
+</svg>
+<div class="caption">The media pipeline is a fan-out/fan-in DAG: sequential safety steps first, then parallel rendition, moderation and enrichment tasks, then a join that publishes the post.</div>
+</div>
+<p>The order matters: <strong>validate before decoding further</strong> (security), <strong>normalise before producing renditions</strong> (so every rendition is upright and metadata-free), run renditions and moderation <strong>in parallel</strong>, and only flip the post to <strong>PUBLISHED</strong> when the required outputs and checks are complete.</p>
+
+<h2>3. Image processing stages</h2>
+
+<h3>3.1 Validation</h3>
+<ul>
+  <li><strong>Check the real type</strong> by magic bytes (<code>FF D8 FF</code> = JPEG, <code>89 50 4E 47</code> = PNG, <code>ftypheic</code> = HEIC), never the file extension or the client-supplied <code>Content-Type</code>.</li>
+  <li><strong>Limits:</strong> max file size (e.g. 50 MB photo), max dimensions and total pixel count. A tiny 50 KB PNG can declare 50,000 × 50,000 pixels and expand to 10 GB in memory — a <strong>decompression bomb</strong>. Read the header first and reject before decoding.</li>
+  <li><strong>Decode in a sandbox:</strong> image/video decoders are complex C code with a long history of vulnerabilities (e.g. the 2016 "ImageTragick" ImageMagick flaw allowed remote code execution via crafted images). Run workers with least privilege, seccomp/containers, no network access except storage, and a strict allow-list of formats.</li>
+  <li><strong>Integrity:</strong> verify the uploaded size/checksum matches what the client declared; compute a content hash (for dedup and for moderation hash checks).</li>
+  <li><strong>Video:</strong> probe with <code>ffprobe</code>: container, codecs, duration (Reels max length), resolution, frame rate, rotation, audio presence, corrupted streams.</li>
+</ul>
+
+<h3>3.2 EXIF stripping (privacy)</h3>
+<p><strong>EXIF</strong> (Exchangeable Image File Format) metadata is embedded by cameras: camera make/model, lens, exposure, timestamps, sometimes the device serial number, a thumbnail of the original, and — critically — <strong>GPS latitude/longitude</strong>, accurate to a few metres. Publishing it would reveal where users live, where their children go to school, or where a vulnerable person is hiding.</p>
+<pre><code>$ exiftool IMG_4821.HEIC
+Make                 : Apple
+Model                : iPhone 15 Pro
+Date/Time Original   : 2026:10:23 14:41:07
+Orientation          : Rotate 90 CW
+GPS Latitude         : 19 deg 4' 33.12" N        ← user's home, to ~3 m
+GPS Longitude        : 72 deg 52' 40.56" E
+Lens Model           : iPhone 15 Pro back triple camera 6.765mm f/1.78</code></pre>
+<p>The pipeline <strong>re-encodes</strong> every rendition from decoded pixels and writes <strong>no metadata</strong> except what's needed for correct display (e.g. an ICC colour profile). Anything useful (capture time, a location the user <em>chose</em> to tag) is stored as structured fields in the post's metadata DB, under the user's control — not hidden in the file. Re-encoding (rather than editing tags) also defeats metadata hidden in unusual places (XMP, IPTC, maker notes, trailing bytes after the image).</p>
+
+<h3>3.3 Orientation fix</h3>
+<p>Phone sensors capture in one fixed orientation. Instead of rotating pixels, the camera saves them as captured and sets the EXIF <strong>Orientation</strong> tag (values 1–8: normal, mirrored, rotated 90°/180°/270°, and mirrored+rotated). Viewers are supposed to apply it. If you strip EXIF <em>without</em> first applying the rotation, half your portrait photos show up sideways. So: read the Orientation tag, physically rotate/flip the pixels, then drop the tag. (Videos have a similar rotation flag in the container metadata.)</p>
+
+<h3>3.4 Resizing to multiple renditions</h3>
+<p>Generate a fixed set of widths covering common screen sizes and layouts — for example 1080, 750, 640, 480 and 320 px for the feed, plus small square crops (150–240 px) for profile grids and thumbnails. Instagram displays feed photos between 1.91:1 landscape and 4:5 portrait, 1080 px wide at most, so larger inputs are scaled down and out-of-range aspect ratios are cropped.</p>
+<ul>
+  <li><strong>Resampling filter:</strong> high-quality downscaling uses filters such as Lanczos or Catmull-Rom; naive nearest-neighbour causes aliasing (jagged edges, moiré). Add mild sharpening after large reductions.</li>
+  <li><strong>Resize from the best source once</strong>, or cascade (1080 → 640 → 320) for speed — fewer decode passes, slight quality cost.</li>
+  <li><strong>Colour:</strong> convert wide-gamut (Display P3) and HDR inputs to sRGB/SDR for broad compatibility, or keep a P3-tagged variant for capable devices.</li>
+  <li><strong>Fast libraries:</strong> libvips (streaming, low memory) is typically several times faster than ImageMagick for this workload; JPEG decoders can also decode at 1/2, 1/4 or 1/8 scale directly ("shrink-on-load"), a huge saving when making thumbnails.</li>
+</ul>
+
+<h3>3.5 Format conversion: JPEG, WebP, AVIF</h3>
+<div class="table-wrap"><table>
+  <tr><th>Format</th><th>Typical size vs JPEG at similar quality</th><th>Encode speed</th><th>Support</th><th>Notes</th></tr>
+  <tr><td><b>JPEG</b> (1992)</td><td>1× (baseline)</td><td>Very fast</td><td>Universal</td><td>Use an optimising encoder (mozjpeg) and <em>progressive</em> mode so a blurry full image appears early.</td></tr>
+  <tr><td><b>WebP</b> (2010)</td><td>~25–35% smaller</td><td>Fast</td><td>All modern browsers, Android, iOS 14+</td><td>Supports alpha and animation; good default for app and web.</td></tr>
+  <tr><td><b>AVIF</b> (2019)</td><td>~40–50% smaller</td><td>Slow (5–20× JPEG)</td><td>Modern browsers, Android 12+, iOS 16+</td><td>Based on the AV1 video codec; supports HDR/wide gamut. Best bytes, most CPU.</td></tr>
+  <tr><td><b>HEIC/HEIF</b></td><td>~40–50% smaller</td><td>Medium</td><td>Apple devices; limited elsewhere</td><td>Common <em>input</em> format from iPhones; patent licensing limits use as an output.</td></tr>
+  <tr><td><b>JPEG XL</b></td><td>~35–60% smaller; lossless JPEG recompression ~20%</td><td>Medium</td><td>Limited (Safari; others partial)</td><td>Promising, not yet universal.</td></tr>
+</table></div>
+<p>The API returns a set of candidate URLs (or the app requests by capability), and the client picks the best format it can decode and the smallest width ≥ its display width × pixel density. See <a href="clients.html">Clients</a>.</p>
+
+<h3>3.6 Quality vs compression trade-offs</h3>
+<p>Lossy encoders expose a quality knob (JPEG/WebP "q" 0–100, AVIF quantizer/CRF). Higher quality → bigger files; beyond ~85 the extra bytes are mostly invisible. Practical techniques:</p>
+<ul>
+  <li><strong>Pick quality per rendition:</strong> thumbnails tolerate lower quality (q≈70) than a full-screen 1080 px image (q≈80–85).</li>
+  <li><strong>Chroma subsampling 4:2:0:</strong> store colour at half resolution (eyes are less sensitive to colour detail than brightness) — ~30–50% savings for little visible loss.</li>
+  <li><strong>Perceptual targets instead of fixed q:</strong> measure quality with metrics such as SSIM, Butteraugli or VMAF and binary-search the lowest quality that meets a target score. A flat blue sky compresses far better than a forest, so per-image tuning can save another ~10–30%.</li>
+</ul>
+<pre class="ascii">
+ Illustrative sizes for one 1080×1350 photo (varies a lot with content):
+   original HEIC from phone ............. 3.2 MB  (4032×5040)
+   JPEG  q=85 progressive (mozjpeg) ...... 260 KB
+   WebP  q=80 ............................ 180 KB   (-31%)
+   AVIF  cq=28 ........................... 120 KB   (-54%)
+   640 px WebP ...........................  70 KB
+   150 px thumbnail WebP .................   6 KB
+   BlurHash placeholder ..................  ~30 bytes (a text string!)
+</pre>
+
+<h3>3.7 Thumbnails and placeholders (blurhash)</h3>
+<p>Even a 70 KB image takes a moment on a slow network. To avoid blank grey boxes while scrolling, the pipeline produces <strong>placeholders</strong> small enough to embed directly in the feed API's JSON, so they're shown instantly before any image request:</p>
+<ul>
+  <li><strong>Dominant colour</strong> — a single hex colour (a few bytes).</li>
+  <li><strong>BlurHash</strong> — the image is reduced to a handful of low-frequency colour components (a small grid of DCT-like coefficients, e.g. 4×3) and encoded as a ~20–30 character base83 string such as <code>LEHV6nWB2yk8pyo0adR*.7kCMdnj</code>. The client decodes it into a smooth, blurred gradient matching the photo's colours and layout, then cross-fades to the real image.</li>
+  <li><strong>Tiny preview (LQIP)</strong> — a very low-resolution JPEG/WebP (e.g. ~40 px wide, a few hundred bytes) scaled up with a blur. Facebook publicly described sending ~200-byte preview photos inside API responses by stripping the standard JPEG header (which the app already knows) from tiny thumbnails.</li>
+  <li><strong>Video poster frame / animated preview</strong> — a representative frame (chosen by a quality/face heuristic, not just frame 0) and short low-res preview clips for grids.</li>
+</ul>
+
+<h2>4. Video processing</h2>
+
+<h3>4.1 Codecs vs containers</h3>
+<p>Two terms beginners often confuse:</p>
+<ul>
+  <li>A <strong>codec</strong> (coder/decoder) is the compression algorithm for the video (or audio) stream itself: H.264, HEVC, VP9, AV1 for video; AAC or Opus for audio.</li>
+  <li>A <strong>container</strong> is the file format that wraps one or more encoded streams plus timing and metadata: MP4 (and fragmented MP4 / CMAF), MOV, WebM, MPEG-TS. "An .mp4 file" says nothing certain about which codec is inside.</li>
+</ul>
+<p>Video codecs exploit redundancy in space (within a frame, like JPEG) and in time (consecutive frames are similar). Frames come in three kinds: <strong>I-frames</strong> (keyframes — self-contained, large), <strong>P-frames</strong> (store differences from previous frames using motion vectors) and <strong>B-frames</strong> (reference both past and future frames — smallest). A <strong>GOP</strong> (group of pictures) runs from one keyframe to the next. A player can only start decoding — or switch quality — at a keyframe, so keyframes must be placed at <strong>every segment boundary</strong>, aligned across all renditions (e.g. a keyframe every 2 s with 4 s segments).</p>
+<div class="table-wrap"><table>
+  <tr><th>Codec</th><th>Year</th><th>Bitrate vs H.264 at equal quality</th><th>Encode cost</th><th>Device support</th><th>Licensing</th></tr>
+  <tr><td><b>H.264 / AVC</b></td><td>2003</td><td>1× (baseline)</td><td>Low; hardware everywhere</td><td>Universal — every phone, browser, TV</td><td>Patent pools (royalties)</td></tr>
+  <tr><td><b>H.265 / HEVC</b></td><td>2013</td><td>~30–50% less</td><td>~2–10× H.264 in software</td><td>Apple devices, most newer Android hardware; patchy in browsers</td><td>Complex, multiple patent pools</td></tr>
+  <tr><td><b>VP9</b></td><td>2013</td><td>~30–40% less</td><td>~5–10× H.264</td><td>Chrome, Firefox, Android; YouTube's workhorse</td><td>Royalty-free (Google)</td></tr>
+  <tr><td><b>AV1</b></td><td>2018</td><td>~30% less than VP9/HEVC, ~50% less than H.264</td><td>High in software (SVT-AV1 made it practical); hardware decode in newer devices</td><td>Modern browsers, newer phones with AV1 decoders</td><td>Royalty-free (Alliance for Open Media, incl. Meta)</td></tr>
+</table></div>
+<p>The usual strategy is <strong>H.264 for everyone</strong> (guaranteed playback) plus a <strong>more efficient codec</strong> (VP9/AV1, or HEVC for Apple) for devices that support it — and, because those encodes are expensive, often only for videos that will be watched a lot (section 7).</p>
+
+<h3>4.2 The bitrate ladder</h3>
+<p>A <strong>bitrate ladder</strong> is the set of resolution/bitrate pairs a video is encoded into. Each "rung" is a complete rendition. Illustrative ladder for a vertical 9:16 Reel (actual values depend on content, codec and encoder):</p>
+<div class="table-wrap"><table>
+  <tr><th>Rung</th><th>Resolution (9:16)</th><th>H.264 video bitrate</th><th>AV1 video bitrate (≈)</th><th>30 s clip size (H.264, incl. 64–128 kbps audio)</th><th>Typical network</th></tr>
+  <tr><td>240p</td><td>240×426</td><td>~300 kbps</td><td>~150 kbps</td><td>~1.4 MB</td><td>Poor 3G</td></tr>
+  <tr><td>360p</td><td>360×640</td><td>~600 kbps</td><td>~300 kbps</td><td>~2.5 MB</td><td>3G</td></tr>
+  <tr><td>480p</td><td>480×854</td><td>~1.0 Mbps</td><td>~500 kbps</td><td>~4.0 MB</td><td>Weak 4G</td></tr>
+  <tr><td>720p</td><td>720×1280</td><td>~2.0 Mbps</td><td>~1.0 Mbps</td><td>~7.9 MB</td><td>4G</td></tr>
+  <tr><td>1080p</td><td>1080×1920</td><td>~3.5–5 Mbps</td><td>~2.0–2.5 Mbps</td><td>~14–19 MB</td><td>Good 4G / 5G / Wi-Fi</td></tr>
+</table></div>
+<p>(Size check for 720p: 2.128 Mbps × 30 s ≈ 64 Mbit ≈ 8 MB.) <strong>Per-title / per-scene encoding</strong> — popularised publicly by Netflix — adapts the ladder to content: a talking head against a plain wall looks great at half the bitrate of a confetti-filled concert clip, so you measure quality (e.g. VMAF) and choose the cheapest bitrate per rung that hits the target.</p>
+<pre><code># one rung of the ladder with ffmpeg (H.264, 720p, keyframe every 2 s @ 30 fps, 4 s fMP4 segments)
+ffmpeg -i input.mov -vf "scale=720:1280" -c:v libx264 -preset slow -crf 23 \
+       -maxrate 2000k -bufsize 4000k -g 60 -keyint_min 60 -sc_threshold 0 \
+       -c:a aac -b:a 128k -f hls -hls_time 4 -hls_segment_type fmp4 \
+       -hls_playlist_type vod 720p/index.m3u8</code></pre>
+
+<h3>4.3 Segmenting: HLS and DASH</h3>
+<p>Each rendition is cut into short <strong>segments</strong> (typically 2–6 s) plus <strong>manifests</strong> that describe them:</p>
+<ul>
+  <li><strong>HLS</strong> (HTTP Live Streaming, Apple): <code>.m3u8</code> text playlists — a <em>master</em> playlist listing the variants and a <em>media</em> playlist per variant listing segments.</li>
+  <li><strong>MPEG-DASH</strong>: an XML <code>.mpd</code> manifest describing "representations" and segment templates.</li>
+  <li><strong>CMAF</strong>: a common fragmented-MP4 segment format both HLS and DASH can reference, so you store segments once and serve two manifests.</li>
+</ul>
+<pre><code>#EXTM3U                                    &lt;- master.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=428000,RESOLUTION=240x426,CODECS="avc1.4d4015,mp4a.40.2"
+240p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2128000,RESOLUTION=720x1280,CODECS="avc1.4d401f,mp4a.40.2"
+720p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=4128000,RESOLUTION=1080x1920,CODECS="avc1.640028,mp4a.40.2"
+1080p/index.m3u8
+
+#EXTM3U                                    &lt;- 720p/index.m3u8
+#EXT-X-TARGETDURATION:4
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:4.0,
+seg_000.m4s
+#EXTINF:4.0,
+seg_001.m4s
+#EXT-X-ENDLIST</code></pre>
+<p>Segments are small immutable files — perfect for <a href="cdn.html">CDN</a> caching. Short-form apps also commonly use a single progressive MP4 per rendition fetched with HTTP Range requests for the very first seconds (fastest start), switching to ABR segments as playback continues.</p>
+
+<h3>4.4 Adaptive bitrate (ABR) playback</h3>
+<p>The player downloads the manifest, then fetches segments one at a time, choosing the rung for <em>each</em> segment based on measured throughput and how many seconds of video are buffered:</p>
+<pre class="ascii">
+ bandwidth   ███████████▇▇▅▃▂▂▂▃▅▇██████        (Wi-Fi → walks into lift → back)
+ rung chosen 1080 1080 1080 720 480 360 360 480 720 1080 1080
+ buffer (s)  [4][8][12][14][12][9][8][8][10][12][14]
+                                 ↑ buffer drains while bandwidth is low; player steps DOWN
+                                   before the buffer empties, so playback never stalls
+</pre>
+<ul>
+  <li><strong>Throughput-based</strong> algorithms pick the highest rung below the recent measured bandwidth (with a safety margin).</li>
+  <li><strong>Buffer-based</strong> algorithms (e.g. BOLA) pick rungs from buffer level: low buffer → low rung, full buffer → climb.</li>
+  <li><strong>Fast start:</strong> begin with a low/medium rung (and prefetch the first segment of the next Reels in the feed) so playback starts in &lt; 200 ms, then climb.</li>
+  <li>The goal is to minimise <strong>rebuffering</strong> (stalls hurt engagement far more than slightly lower resolution) while maximising quality and avoiding constant switching.</li>
+</ul>
+
+<h2>5. Orchestrating the pipeline</h2>
+
+<h3>5.1 Kafka → worker pools → task DAG</h3>
+<p>When an upload completes, the Upload Service publishes <code>media.uploaded</code> to <a href="message-queues.html">Kafka</a>. A pipeline orchestrator consumes it and expands it into a <strong>DAG</strong> (directed acyclic graph) of tasks, each executed by a specialised <strong>worker pool</strong>:</p>
+<div class="diagram">
+<svg viewBox="0 0 880 270" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-media-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600">
+    <rect x="10" y="110" width="100" height="44" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="60" y="137" text-anchor="middle">Probe</text>
+    <rect x="140" y="110" width="110" height="44" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="195" y="137" text-anchor="middle">Split chunks</text>
+    <rect x="290" y="20" width="150" height="40" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="365" y="45" text-anchor="middle">Encode 1080p ×k</text>
+    <rect x="290" y="70" width="150" height="40" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="365" y="95" text-anchor="middle">Encode 720p ×k</text>
+    <rect x="290" y="120" width="150" height="40" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="365" y="145" text-anchor="middle">Encode 480p…240p</text>
+    <rect x="290" y="170" width="150" height="40" rx="8" fill="#ffebee" stroke="#c62828"/><text x="365" y="195" text-anchor="middle">Moderation</text>
+    <rect x="290" y="220" width="150" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="365" y="245" text-anchor="middle">Poster + preview</text>
+    <rect x="485" y="70" width="120" height="90" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="545" y="110" text-anchor="middle">Stitch +</text><text x="545" y="128" text-anchor="middle">package</text>
+    <rect x="645" y="110" width="100" height="44" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="695" y="137" text-anchor="middle">Join / gate</text>
+    <rect x="775" y="110" width="95" height="44" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="822" y="137" text-anchor="middle">PUBLISHED</text>
+  </g>
+  <g stroke="#555" stroke-width="1.4" fill="none" marker-end="url(#ar-media-2)">
+    <path d="M110,132 L138,132"/>
+    <path d="M250,125 L288,40"/><path d="M250,129 L288,90"/><path d="M250,134 L288,140"/><path d="M250,138 L288,190"/><path d="M250,142 L288,240"/>
+    <path d="M440,40 L483,85"/><path d="M440,90 L483,105"/><path d="M440,140 L483,140"/>
+    <path d="M605,115 L643,128"/><path d="M440,190 L643,140"/><path d="M440,240 L643,148"/>
+    <path d="M745,132 L773,132"/>
+  </g>
+  <text x="365" y="12" text-anchor="middle" font-size="11" fill="#555">parallel tasks on GPU / CPU pools</text>
+</svg>
+<div class="caption">A video DAG: probe, split into chunks at keyframes, encode every chunk of every rung in parallel, stitch and package into HLS/DASH, and publish only when the gate's required inputs (renditions + moderation verdict) are present.</div>
+</div>
+<ul>
+  <li><strong>Chunked parallel encoding:</strong> a 90 s Reel split into 10 s chunks (at keyframes) × 5 rungs = 45 independent encode tasks; with enough workers the wall-clock time approaches the time to encode a single chunk.</li>
+  <li><strong>Separate pools per resource type:</strong> CPU pools for images, GPU/ASIC pools for video, GPU pools for ML moderation — each sized and autoscaled independently.</li>
+  <li><strong>Workflow state</strong> (which tasks are done, outputs, attempts) lives in a database or a workflow engine (Temporal, AWS Step Functions, Netflix Conductor), not in worker memory, so any worker can resume a half-finished DAG.</li>
+</ul>
+
+<h3>5.2 Retries and idempotency</h3>
+<p>Workers crash, spot instances vanish, storage calls time out; Kafka delivers at least once. Every task must therefore be <strong>safe to run twice</strong>:</p>
+<ul>
+  <li><strong>Deterministic output keys:</strong> the output location is a pure function of the input, e.g. <code>{hash}/p/{media_id}/v1/720p/seg_003.m4s</code>. Re-running overwrites the same object with identical content — harmless.</li>
+  <li><strong>Check before work:</strong> if the output already exists (HEAD request) and the task is marked done, skip.</li>
+  <li><strong>Conditional state updates:</strong> mark tasks done with compare-and-set (<code>UPDATE … SET state='DONE' WHERE task_id=? AND state='RUNNING'</code>).</li>
+  <li><strong>Retry policy:</strong> exponential backoff with jitter for transient errors; a max attempt count; permanent errors (corrupt file) fail fast; exhausted retries go to a dead-letter queue and the post to <code>FAILED</code> with a user-visible "upload failed, retry?" (see <a href="resilience-patterns.html">Resilience Patterns</a>).</li>
+  <li><strong>Timeouts / leases:</strong> a task claimed by a worker that dies is re-queued after its lease expires.</li>
+</ul>
+
+<h3>5.3 Priorities and autoscaling</h3>
+<ul>
+  <li><strong>Critical path first:</strong> to publish quickly, produce only what's needed for the first view — e.g. the 1080 + 640 px images, a thumbnail and placeholder, or the 360p/720p H.264 rungs for video — in a <strong>high-priority</strong> queue. The remaining rungs and advanced codecs follow in lower-priority queues after the post is live.</li>
+  <li><strong>Separate lanes:</strong> interactive uploads vs bulk re-encoding/backfill jobs (e.g. re-encoding old photos to AVIF) never share a queue, so a backfill can't delay a user's post.</li>
+  <li><strong>Autoscale on lag / queue age:</strong> uploads peak in the evening and around events (New Year); scale pools on consumer lag and oldest-task age rather than CPU alone. Low-priority batch work can soak up idle capacity and cheap spot instances off-peak.</li>
+</ul>
+
+<h3>5.4 GPU and hardware encoders</h3>
+<p>Software encoders (x264, x265, libvpx, SVT-AV1) give the best compression per bit at slow presets but cost lots of CPU. <strong>Hardware encoders</strong> — GPU blocks such as NVIDIA NVENC and Intel Quick Sync, or dedicated <strong>ASICs</strong> — encode many streams in real time at a fraction of the power, at somewhat lower compression efficiency than the slowest software presets. Large platforms build their own: Google described its Argos video coding unit for YouTube, and Meta announced the <strong>MSVP</strong> (Meta Scalable Video Processor) ASIC for transcoding video-on-demand and live streams. A common split: hardware for the fast, high-volume first encodes; high-effort software encodes for the most-watched content where every saved bit is multiplied by millions of views.</p>
+
+<h2>6. Content moderation in the pipeline</h2>
+<p>Instagram must keep illegal and policy-violating content off the platform at the scale of hundreds of millions of uploads per day. Moderation is layered, from cheap and certain to expensive and nuanced:</p>
+
+<h3>6.1 Perceptual hashing: known illegal content</h3>
+<p>A <strong>cryptographic hash</strong> (SHA-256) changes completely if a single pixel changes, so re-saving, resizing or cropping an image defeats it. A <strong>perceptual hash</strong> instead summarises what the image <em>looks like</em>: visually similar images get hashes that differ in only a few bits, measured by <strong>Hamming distance</strong> (the number of differing bits).</p>
+<pre><code># dHash - the simplest perceptual hash, to build intuition (64 bits)
+def dhash(img):
+    g = img.convert("L").resize((9, 8))          # grayscale, 9×8 pixels: throws away detail &amp; colour
+    px = list(g.getdata())
+    bits = 0
+    for row in range(8):
+        for col in range(8):                     # is each pixel brighter than its right neighbour?
+            left, right = px[row * 9 + col], px[row * 9 + col + 1]
+            bits = (bits &lt;&lt; 1) | (left &gt; right)
+    return bits
+
+def is_match(h1, h2, threshold=10):
+    return bin(h1 ^ h2).count("1") &lt;= threshold  # Hamming distance: few differing bits = same picture</code></pre>
+<p>Production hashes are far more robust: <strong>PhotoDNA</strong> (developed by Microsoft and Dartmouth, licensed to platforms and used industry-wide) and Meta's open-sourced <strong>PDQ</strong> (256-bit, for photos) and <strong>TMK+PDQF</strong> (for video). Platforms check every upload against hash lists of <strong>known child sexual abuse material (CSAM)</strong> maintained with organisations such as NCMEC, and against shared databases of known terrorist content (e.g. GIFCT's hash-sharing database). A match is a near-certain verdict: the upload is <strong>blocked before publishing</strong>, evidence is preserved for the legally required report (US providers must report apparent CSAM to NCMEC), and the account is actioned by specialised teams. Hash matching is cheap (compute a hash, look up nearby hashes in an index), so it runs <strong>synchronously</strong> on every upload, and lists are re-applied retroactively when new hashes are added.</p>
+
+<h3>6.2 ML classifiers: new content</h3>
+<p>Hashes only catch <em>known</em> items. For everything else, ML models score each image (and sampled video frames, audio transcripts and on-image text via OCR) for policy areas: nudity/sexual content, graphic violence, hate symbols, self-harm, spam/scams, and more. Each model outputs a probability, and thresholds map scores to actions:</p>
+<div class="table-wrap"><table>
+  <tr><th>Score band</th><th>Action</th><th>Why</th></tr>
+  <tr><td>Very high confidence violation</td><td>Block or remove automatically</td><td>Precision is high enough that waiting for a human only spreads harm</td></tr>
+  <tr><td>Uncertain / borderline</td><td>Publish with reduced distribution (e.g. not eligible for Explore/recommendations) and/or queue for human review</td><td>Avoid wrongly removing legitimate posts; humans decide</td></tr>
+  <tr><td>Low</td><td>Allow</td><td>Most content</td></tr>
+</table></div>
+<p>Thresholds are tuned per policy and per surface: missing CSAM is unacceptable, so recall is pushed very high and humans absorb the extra false positives; for lower-severity policies, precision matters more. Heavy models run on GPU pools in parallel with transcoding so they add little to time-to-publish; some run asynchronously after publishing, with takedown if they fire later.</p>
+
+<h3>6.3 Human review queues</h3>
+<ul>
+  <li>Items flagged by models, by <strong>user reports</strong> or by proactive sweeps land in review queues, <strong>prioritised by severity and predicted reach</strong> (a borderline post going viral jumps ahead of one with 10 views).</li>
+  <li>Reviewers see the content with policy guidance; tools reduce harm to reviewers (blurring, greyscale, muted audio by default).</li>
+  <li>Decisions feed back as <strong>training labels</strong> for the classifiers and as new hashes so the same content is caught automatically next time.</li>
+  <li>Users can <strong>appeal</strong>; appeals go to a separate queue.</li>
+</ul>
+<p>See <a href="security.html">Security &amp; Privacy</a> for abuse prevention more broadly.</p>
+
+<h2>7. Automatic alt text</h2>
+<p>Blind and low-vision users rely on screen readers (VoiceOver, TalkBack), which read an image's <strong>alt text</strong>. Most people never write one, so the pipeline generates it: object/scene-recognition or image-captioning models produce a description such as <em>"Photo may contain: 2 people, smiling, beach, ocean, sunset"</em>. Facebook launched automatic alt text in 2016, and Instagram added automatic and custom alt text in 2018. The generated text is stored in the post's metadata (users can override it with their own), delivered in the API response, and — with privacy care — can be a signal for search and content understanding (see <a href="search.html">Search</a>). It's an ML task that runs on the same GPU pool as moderation, off the critical path.</p>
+
+<h2>8. Cost optimisations</h2>
+<p>Media processing is one of the largest compute bills in a photo/video product, and its outputs drive storage and CDN bills. The big levers:</p>
+<ul>
+  <li><strong>Lazy / on-demand renditions:</strong> eagerly produce only the common renditions. A rare one (an unusual size for a tablet layout, a new format) is generated on first request: CDN miss → origin image service → not in storage → generate from the original (or nearest larger rendition), store it, return it, with request coalescing so a burst produces it once. You trade a slower first request for never computing or storing renditions nobody asks for.</li>
+  <li><strong>Spend expensive encodes only where they pay back:</strong> every video gets a cheap H.264 ladder; when a video's watch time crosses a threshold (or is predicted to), enqueue AV1/VP9/HEVC encodes. Views follow a power law, so a small fraction of videos carries most watch time. Meta engineers have publicly described this kind of prioritisation for Instagram video, producing basic encodings for everything and advanced encodings for content predicted to be watched most.</li>
+  <li><strong>Client-side pre-processing:</strong> the app resizes (e.g. to 1080 px) and compresses before uploading — less upload time on mobile, less server CPU. Instagram has publicly talked about starting the upload in the background while the user is still writing the caption, so "Share" feels instant.</li>
+  <li><strong>Deduplication:</strong> identical re-uploads (memes, reposts) detected by content hash reuse existing renditions.</li>
+  <li><strong>Hardware encoders and spot capacity</strong> for high-volume and batch work; efficient libraries (libvips, shrink-on-load).</li>
+  <li><strong>Storage hygiene:</strong> expire raw uploads; keep originals in cheaper tiers; drop renditions that can be regenerated (see <a href="object-storage.html">Object Storage</a>).</li>
+</ul>
+<pre><code>Is an AV1 encode worth it for one video? (all inputs are assumptions)
+  AV1 encode cost: ~10 core-minutes ≈ 0.17 core-h × $0.03/core-h  ≈ $0.005
+  Saves ~40% of bytes vs H.264: an 8 MB watch → saves ~3.2 MB per view
+  CDN cost ≈ $0.01/GB → saving ≈ $0.000032 per view
+  Break-even ≈ 0.005 / 0.000032 ≈ 160 views
+  ⇒ encode AV1 for videos likely to exceed a few hundred views; skip it for the long tail.
+  (Users on slow networks also get better quality at the same bitrate — a product win, not just cost.)</code></pre>
+
+<h2>9. The post state machine</h2>
+<p>Many asynchronous steps must end in one consistent answer to "can people see this post?". A <strong>state machine</strong> stored with the post's metadata makes that explicit:</p>
+<div class="diagram">
+<svg viewBox="0 0 880 250" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-media-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600" text-anchor="middle">
+    <rect x="10" y="40" width="110" height="40" rx="20" fill="#e1f5fe" stroke="#0277bd"/><text x="65" y="65">CREATED</text>
+    <rect x="160" y="40" width="120" height="40" rx="20" fill="#e1f5fe" stroke="#0277bd"/><text x="220" y="65">UPLOADING</text>
+    <rect x="320" y="40" width="115" height="40" rx="20" fill="#fff8e1" stroke="#f9a825"/><text x="377" y="65">UPLOADED</text>
+    <rect x="475" y="40" width="125" height="40" rx="20" fill="#f3e5f5" stroke="#6a1b9a"/><text x="537" y="65">PROCESSING</text>
+    <rect x="645" y="40" width="125" height="40" rx="20" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2.5"/><text x="707" y="65">PUBLISHED</text>
+    <rect x="790" y="40" width="80" height="40" rx="20" fill="#eceff1" stroke="#455a64"/><text x="830" y="65">DELETED</text>
+    <rect x="160" y="170" width="120" height="40" rx="20" fill="#eceff1" stroke="#455a64"/><text x="220" y="195">ABANDONED</text>
+    <rect x="400" y="170" width="105" height="40" rx="20" fill="#ffebee" stroke="#c62828"/><text x="452" y="195">FAILED</text>
+    <rect x="560" y="170" width="120" height="40" rx="20" fill="#fff3e0" stroke="#ef6c00"/><text x="620" y="195">IN_REVIEW</text>
+    <rect x="740" y="170" width="120" height="40" rx="20" fill="#ffebee" stroke="#c62828"/><text x="800" y="195">REJECTED</text>
+  </g>
+  <g stroke="#555" stroke-width="1.4" fill="none" marker-end="url(#ar-media-3)">
+    <path d="M120,60 L158,60"/><path d="M280,60 L318,60"/><path d="M435,60 L473,60"/><path d="M600,60 L643,60"/><path d="M770,60 L788,60"/>
+    <path d="M220,80 L220,168"/>
+    <path d="M515,80 L470,168"/>
+    <path d="M440,170 C420,130 480,110 505,82"/>
+    <path d="M560,80 L605,168"/>
+    <path d="M650,170 L700,82"/>
+    <path d="M680,190 L738,190"/>
+    <path d="M600,80 C680,110 760,130 790,168"/>
+  </g>
+  <g font-size="11" fill="#333">
+    <text x="139" y="34" text-anchor="middle">URL issued</text>
+    <text x="299" y="34" text-anchor="middle">object stored</text>
+    <text x="454" y="34" text-anchor="middle">event</text>
+    <text x="622" y="34" text-anchor="middle">all required ✔</text>
+    <text x="226" y="128">URL expired</text>
+    <text x="412" y="122" text-anchor="end">retry</text>
+    <text x="482" y="152">retries exhausted</text>
+    <text x="598" y="140">borderline</text>
+    <text x="690" y="152">approved</text>
+    <text x="709" y="184" text-anchor="middle">violates</text>
+    <text x="790" y="108">hash match</text>
+  </g>
+</svg>
+<div class="caption">The post lifecycle. Only PUBLISHED posts are returned by feed, profile and search APIs; every transition is a conditional update so duplicate or late events can't move a post backwards.</div>
+</div>
+<ul>
+  <li><strong>Transitions are conditional</strong> (compare-and-set): <code>UPDATE posts SET state='PUBLISHED' WHERE id=? AND state='PROCESSING'</code>. A duplicate "processing done" event, or a late one for a post the user already deleted, changes nothing.</li>
+  <li><strong>The publish gate</strong> fires when the required outputs exist <em>and</em> blocking checks have passed; non-critical outputs (extra rungs, AV1, alt text) may arrive after PUBLISHED.</li>
+  <li><strong>Timeouts:</strong> a sweeper moves posts stuck in PROCESSING too long to retry or FAILED; UPLOADING posts whose upload URL expired become ABANDONED and their raw objects are cleaned up.</li>
+  <li><strong>Side effects on entering PUBLISHED:</strong> emit <code>post.created</code> (via the outbox — see <a href="message-queues.html">Message Queues</a>) to trigger feed fan-out, search indexing and notifications. Fan-out must <em>not</em> happen earlier, or followers would see a post with missing media.</li>
+  <li><strong>Optimistic UI:</strong> the author's app shows the post immediately from local data while the server is still processing; the client polls or receives a push when it's live (see <a href="clients.html">Clients</a>).</li>
+</ul>
+
+<h2>10. Numbers to reason with</h2>
+<p>All inputs are assumptions for practice (see <a href="capacity-estimation.html">Back-of-the-Envelope Estimation</a>):</p>
+<pre><code>Photos: 100M/day ≈ 1,160/s average, ~3.5K/s at peak
+  per photo: decode + orient + 5 sizes × (JPEG + WebP) + AVIF for the top sizes + hashes
+  ≈ 1.5 core-seconds  →  peak ≈ 3.5K × 1.5 ≈ 5,000 cores busy
+  outputs ≈ 12 files, ~0.5 MB total per photo → ~50 TB/day of image renditions
+
+Videos: 20M/day, average 30 s
+  cheap H.264 ladder (5 rungs) in software ≈ 2 core-minutes per video
+  20M × 2 = 40M core-min/day ÷ 1,440 min ≈ 28,000 cores on average (peaks higher)
+  AV1 for EVERY video at ~10× cost → ~280,000 cores  ✗
+  AV1 for the ~5–10% of videos that get most watch time → +14K–28K cores  ✔
+  (hardware encoders/ASICs cut these core counts dramatically)
+  storage: ladder ≈ 30 MB + original ≈ 30 MB → ~1.2 PB/day for video
+
+Latency targets (time from upload complete → visible):
+  photo: ~1–2 s     30 s Reel: first rungs in ~5–15 s, remaining rungs/codecs minutes later</code></pre>
+
+<h2>11. How Instagram uses the media pipeline</h2>
+<div class="flow">
+  <div class="fnode client">📱 App<small>resize, upload early</small></div><div class="farrow">→<small>pre-signed PUT</small></div>
+  <div class="fnode store">Object storage<small>raw bucket</small></div><div class="farrow">→<small>media.uploaded</small></div>
+  <div class="fnode async">Media Processing Workers<small>DAG on CPU/GPU pools</small></div><div class="farrow">→<small>renditions</small></div>
+  <div class="fnode store">Object storage<small>immutable keys</small></div><div class="farrow">→<small>origin pull</small></div>
+  <div class="fnode edge">CDN<small>right rendition per device</small></div>
+</div>
+<ol>
+  <li>The app prepares media on-device (crop to the allowed aspect ratio, resize toward 1080 px, compress) and starts uploading via the <a href="media-upload.html">Upload Service</a>'s pre-signed URL, often before the user finishes the caption.</li>
+  <li>The Upload Service publishes <code>media.uploaded</code>; the post sits in <code>PROCESSING</code>.</li>
+  <li><strong>Media Processing Workers</strong> validate, strip EXIF/GPS, fix orientation, run hash matching and classifiers, produce image renditions or the video ladder + HLS/DASH segments, thumbnails, BlurHash/preview, and alt text — writing everything to <a href="object-storage.html">object storage</a> under immutable keys.</li>
+  <li>When required outputs and blocking checks are done, the post becomes <code>PUBLISHED</code> and <code>post.created</code> triggers <a href="news-feed.html">feed fan-out</a>, <a href="search.html">search indexing</a> and <a href="notifications.html">notifications</a>.</li>
+  <li>Viewers receive JSON with placeholders and signed CDN URLs per rendition; the app picks format and size, and the video player runs ABR over the CDN.</li>
+</ol>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+Publicly known details: Instagram displays feed photos at up to <strong>1080 px</strong> wide with aspect ratios from <strong>1.91:1 to 4:5</strong>, and resizes larger uploads; it introduced <strong>automatic alt text</strong> (plus custom alt text) in 2018; Meta has open-sourced the <strong>PDQ and TMK+PDQF</strong> perceptual hashing algorithms used to find matching photos and videos, and participates in industry hash-sharing for CSAM and terrorist content; Meta engineering has published about producing basic video encodings for everything while reserving <strong>advanced encodings such as AV1</strong> for the most-watched content, and about its <strong>MSVP</strong> video transcoding ASIC. Early Instagram talks also emphasised perceived speed: uploading in the background while the user edits the caption and showing the post optimistically.</div>
+
+<h2>12. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ What the pipeline buys</h4><ul>
+    <li>Fast loads and smooth playback on every device and network</li>
+    <li>Huge bandwidth savings (renditions + modern codecs)</li>
+    <li>Privacy (no GPS leaks) and security (malformed files rejected)</li>
+    <li>Platform safety via hashing, ML and human review</li>
+    <li>Accessibility via alt text</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ What it costs</h4><ul>
+    <li>Large compute bill (video encoding dominates) and storage for many renditions</li>
+    <li>Time-to-publish latency and eventual consistency</li>
+    <li>Complex orchestration: DAGs, retries, partial failures</li>
+    <li>Codec support fragmentation across devices</li>
+    <li>Moderation errors either way: false positives anger users, false negatives cause harm</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Stripping EXIF before applying orientation</strong> → sideways photos.</li>
+  <li><strong>Forgetting metadata in other places</strong> (XMP, video container tags) → GPS leaks. Re-encode from pixels.</li>
+  <li><strong>Decoding untrusted files unsandboxed</strong> or without pixel limits → RCE or decompression-bomb OOMs.</li>
+  <li><strong>Misaligned keyframes</strong> across rungs → glitches or stalls when ABR switches.</li>
+  <li><strong>Publishing before moderation/renditions are ready</strong> → broken images in followers' feeds or harmful content going live.</li>
+  <li><strong>Non-idempotent tasks</strong> (random output names) → duplicates and orphaned objects on retry.</li>
+  <li><strong>One queue for everything</strong> → a bulk re-encode backlog delays users' posts.</li>
+  <li><strong>Encoding every video with the most expensive codec</strong> → compute cost explodes for videos nobody watches.</li>
+</ul>
+
+<h2>13. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Tool</th><th>What it does</th><th>When to use</th></tr>
+  <tr><td>libvips, sharp (Node), Pillow-SIMD, ImageMagick</td><td>Image decode/resize/encode</td><td>libvips/sharp for high-throughput, low-memory pipelines; ImageMagick for breadth (sandbox it)</td></tr>
+  <tr><td>mozjpeg, libwebp, libavif, libjxl</td><td>Format encoders</td><td>Best size/quality for each format</td></tr>
+  <tr><td>FFmpeg (+ x264, x265, libvpx, SVT-AV1)</td><td>Swiss-army knife for probing, transcoding, packaging</td><td>Almost every video pipeline</td></tr>
+  <tr><td>NVIDIA NVENC, Intel QSV, custom ASICs (Meta MSVP, Google Argos)</td><td>Hardware encoding</td><td>High-volume, real-time or cost-sensitive transcoding</td></tr>
+  <tr><td>Shaka Packager, Bento4, GPAC</td><td>HLS/DASH/CMAF packaging, DRM</td><td>Producing manifests and segments</td></tr>
+  <tr><td>AWS Elemental MediaConvert, Mux, Cloudflare Stream</td><td>Managed video transcoding/streaming</td><td>You don't want to run encoding fleets</td></tr>
+  <tr><td>Cloudinary, imgix, Thumbor</td><td>On-the-fly image transformation services</td><td>Lazy renditions via URL parameters</td></tr>
+  <tr><td>PhotoDNA, PDQ, TMK+PDQF</td><td>Perceptual hashing for known harmful content</td><td>Mandatory baseline for any user-generated media platform</td></tr>
+  <tr><td>AWS Rekognition, Google Cloud Vision, Hive, in-house models</td><td>ML classification, labels, OCR, captions</td><td>Moderation and alt text without (or before) building your own models</td></tr>
+  <tr><td>Temporal, AWS Step Functions, Netflix Conductor</td><td>Durable workflow/DAG orchestration</td><td>Multi-step pipelines with retries and state</td></tr>
+  <tr><td>BlurHash, ThumbHash</td><td>Compact image placeholders</td><td>Instant visual placeholders in API responses</td></tr>
+</table></div>
+
+<h2>14. Interview corner</h2>
+<details class="qa"><summary>Design the photo processing pipeline for Instagram.</summary>
+<p>Client uploads directly to a raw bucket via a pre-signed URL; the Upload Service publishes <code>media.uploaded</code> and sets the post to PROCESSING. A worker pool consumes it: validate (magic bytes, size/pixel limits, sandboxed decode), apply EXIF orientation then strip all metadata, compute perceptual hashes and check against known-bad lists (block on match), produce renditions (e.g. 1080/640/320 px + thumbnails) in JPEG and WebP/AVIF with tuned quality, generate BlurHash and alt text, run classifiers. Outputs go to object storage under deterministic keys; a conditional state update to PUBLISHED triggers <code>post.created</code> for fan-out. Tasks are idempotent and retried with backoff; failures go to a DLQ and FAILED state. Pools autoscale on lag; critical renditions run in a high-priority lane.</p></details>
+<details class="qa"><summary>How does adaptive bitrate streaming work and what does the backend have to produce?</summary>
+<p>The backend transcodes each video into a ladder of renditions (e.g. 240p–1080p at increasing bitrates), with keyframes aligned at fixed intervals, cuts each into 2–6 s segments, and writes HLS/DASH manifests listing variants and segments. The player downloads the manifest and then picks a rendition per segment based on measured throughput and buffer level, stepping down before the buffer empties and back up when bandwidth recovers. Segments are static files cached by the CDN.</p></details>
+<details class="qa"><summary>Transcoding a 10-minute 4K video takes 20 minutes on one machine. How do you make it fast?</summary>
+<p>Split it at keyframes into chunks (say 10 s), encode every chunk of every rung in parallel across a worker pool (60 chunks × 5 rungs = 300 tasks), then stitch and package. Use hardware encoders for the first-available rungs, publish as soon as a playable subset (e.g. 360p/720p) is ready, and add higher rungs and advanced codecs later at lower priority. Ensure consistent encoder settings and closed GOPs so chunks join seamlessly.</p></details>
+<details class="qa"><summary>How do you prevent known illegal images from ever being published?</summary>
+<p>Compute robust perceptual hashes (PhotoDNA, PDQ; TMK+PDQF for video) synchronously during processing, before the post can transition to PUBLISHED, and look them up against industry hash lists with a Hamming-distance threshold. A match blocks publication, preserves evidence, triggers the legally required report and account action through a specialised workflow. Re-scan existing content when new hashes arrive. ML classifiers and human review cover previously unseen content.</p></details>
+<details class="qa"><summary>Video encoding costs are exploding. What do you do?</summary>
+<p>Encode a cheap baseline (H.264 ladder, possibly fewer rungs, hardware encoders) for every upload; reserve expensive codecs (AV1) and high-effort presets for videos predicted or observed to get high watch time, since views follow a power law; generate rare renditions lazily; use per-title encoding to avoid wasting bits on simple content; run batch work on spot capacity; dedupe re-uploads; and move to dedicated hardware encoders at scale. Measure with cost per watch-hour and quality metrics (VMAF), not just per-upload cost.</p></details>
+<details class="qa"><summary>Why must the pipeline be idempotent, and how do you make it so?</summary>
+<p>Kafka delivers at least once and workers crash mid-task, so tasks will run more than once. Use deterministic output keys derived from (media_id, rendition, version), so re-running overwrites identical bytes; check for existing outputs before working; record task completion and post state with compare-and-set updates; and dedupe side effects (like emitting <code>post.created</code>) via the state transition — only the transition into PUBLISHED emits, and it can only happen once.</p></details>
+
+<h2>15. Check your understanding</h2>
+<details class="quiz"><summary>Why does a portrait iPhone photo show sideways after a naive "strip all EXIF" step?</summary>
+<p>The phone stored the pixels in sensor orientation and recorded the needed rotation in the EXIF <strong>Orientation</strong> tag. Stripping the tag without first rotating the pixels loses that instruction. Fix: apply the orientation to the pixels, then strip.</p></details>
+<details class="quiz"><summary>What is the difference between a codec and a container? Give one example of each.</summary>
+<p>A codec compresses the media stream (H.264, AV1, AAC); a container packages encoded streams with timing/metadata into a file (MP4, WebM, MPEG-TS). The same MP4 container can hold H.264 or AV1 video.</p></details>
+<details class="quiz"><summary>A 720p rung is encoded at 2,000 kbps video + 128 kbps audio. How big is a 45 s clip?</summary>
+<p>2,128 kbps × 45 s = 95,760 kbit ≈ 95.8 Mbit ÷ 8 ≈ <strong>12 MB</strong>.</p></details>
+<details class="quiz"><summary>Why must keyframes be aligned across all rungs of the ladder?</summary>
+<p>A player can only start decoding at a keyframe. ABR switches rendition at segment boundaries; if every rung has a keyframe at exactly the same timestamps (each segment starts with one), the player can switch cleanly. Misaligned keyframes cause glitches, stalls or the need to download overlapping data.</p></details>
+<details class="quiz"><summary>Two images: one is a re-saved, slightly cropped copy of the other. Will SHA-256 detect them as the same? Will PDQ?</summary>
+<p>SHA-256: <strong>no</strong> — any byte change produces a completely different hash. PDQ: <strong>likely yes</strong> — perceptual hashes of visually similar images differ in few bits, so the Hamming distance falls under the match threshold.</p></details>
+<details class="quiz"><summary>Using the break-even estimate in section 8, should you AV1-encode a Reel that will be watched ~40 times? ~10,000 times?</summary>
+<p>At ~160 views break-even: <strong>40 views — no</strong> (encode cost exceeds bandwidth saved); <strong>10,000 views — yes</strong>, savings are ~60× the encode cost, and viewers on slow networks get better quality.</p></details>
+<details class="quiz"><summary>A "media processed" event arrives twice for the same post; the user deleted the post in between. What should happen, and what mechanism guarantees it?</summary>
+<p>Nothing should change: the post must stay DELETED and no <code>post.created</code> should be emitted. A conditional state transition (<code>… WHERE state = 'PROCESSING'</code>) fails for a DELETED post and for an already-PUBLISHED post, making the handler idempotent.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Never serve the original: <strong>validate → strip EXIF (after fixing orientation) → resize → re-encode</strong> into multiple sizes and formats, plus thumbnails and BlurHash placeholders.</li>
+    <li>Video = <strong>codec</strong> inside a <strong>container</strong>, transcoded into a <strong>bitrate ladder</strong>, segmented for <strong>HLS/DASH</strong>, played with <strong>ABR</strong>; align keyframes.</li>
+    <li>Orchestrate with <strong>Kafka → worker pools → task DAG</strong>, idempotent outputs, retries/DLQ, priority lanes, autoscaling and hardware encoders.</li>
+    <li><strong>Moderation</strong> layers hash matching (PhotoDNA/PDQ), ML classifiers and human review; ML also provides <strong>alt text</strong>.</li>
+    <li>A conditional <strong>post state machine</strong> gates publishing; spend expensive encodes only where views justify them.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="media-upload.html">Media Upload Service</a> — how the raw file gets into storage</li>
+  <li><a href="object-storage.html">Object Storage</a> — where originals and renditions live</li>
+  <li><a href="cdn.html">CDN</a> — how renditions and video segments reach viewers</li>
+  <li><a href="message-queues.html">Message Queues &amp; Kafka</a> — the events and worker pools driving the pipeline</li>
+  <li><a href="clients.html">Clients</a> — choosing renditions, placeholders, optimistic UI and players</li>
+  <li><a href="resilience-patterns.html">Resilience Patterns</a> — retries, backoff and idempotency</li>
+  <li><a href="security.html">Security &amp; Privacy</a> — sandboxing, metadata privacy and abuse prevention</li>
+  <li><a href="analytics-ml.html">Analytics &amp; ML</a> — models behind moderation, alt text and encoding decisions</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

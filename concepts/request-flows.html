@@ -1,0 +1,1100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>End-to-End Request Flows — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="request-flows">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>Every Instagram feature is a <strong>chain of components</strong>. This lesson follows nine real user actions hop by hop, from the phone to storage and back, naming every box on the architecture diagram.</li>
+    <li>Almost every flow has two parts. A short <strong>synchronous</strong> part, where the user waits (target: a few hundred ms), and a longer <strong>asynchronous</strong> part that runs after the response through <a href="message-queues.html">Kafka</a> (fan-out, transcoding, indexing, notifications, analytics).</li>
+    <li>The <strong>API path</strong> (small JSON through Load Balancer → API Gateway → services) and the <strong>media path</strong> (large bytes going straight to <a href="object-storage.html">Object Storage</a> on upload and coming from the <a href="cdn.html">CDN</a> on download) are always kept separate.</li>
+    <li>Reads are fast because the work was done ahead of time. Feeds are <a href="news-feed.html">pre-computed by fan-out</a>, renditions are pre-generated, and search is <a href="search.html">pre-indexed</a>. Writes are fast because the expensive work is deferred to background workers.</li>
+    <li>Each flow below has an ASCII sequence diagram, numbered steps, a latency budget, a failure analysis and links to the lesson behind each concept. The lesson ends with a sync-vs-async summary table.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why trace requests end to end?</h2>
+<p>The other lessons teach one building block at a time: <a href="dns.html">DNS</a>, <a href="load-balancer.html">load balancing</a>, <a href="caching.html">caching</a>, <a href="sharding.html">sharding</a>, <a href="message-queues.html">Kafka</a> and so on. Real systems are never one block, though. When you double-tap a photo, at least six components take part in under a tenth of a second, and a few more keep working for seconds afterwards. Until you can trace that path, you don't really understand the system. Interviewers know this, so "walk me through what happens when…" is one of the most common system design questions.</p>
+<p>Tracing a request end to end teaches you three things no single lesson can:</p>
+<ul>
+  <li><strong>Where the time goes.</strong> A 200 ms budget gets split between network round trips, the gateway, cache lookups, database queries and ranking. If you know the budget, you know what to optimise.</li>
+  <li><strong>What the user waits for and what they don't.</strong> The design trick behind Instagram's snappy feel is to make the user wait only for the minimum: "your post is saved". Everything else (resizing, fan-out to 500 followers, search indexing, push notifications) happens asynchronously.</li>
+  <li><strong>What breaks, and what the user sees when it does.</strong> Every hop can fail. A good design decides, for each hop, whether to retry, fall back, degrade or fail loudly.</li>
+</ul>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  Think of sending a parcel. At the counter (the <em>synchronous</em> part) the clerk weighs it, takes payment and hands you a tracking number. You leave after two minutes. Sorting, trucks, planes and the final delivery van (the <em>asynchronous</em> part) take two days, and you don't stand at the counter waiting for them. If the clerk made you wait until the parcel arrived, the queue would reach around the block. Instagram's "201 Created" is the tracking number. <a href="message-queues.html">Kafka</a> is the sorting centre. The <a href="notifications.html">notification</a> is the "delivered" text message.
+</div>
+
+<h2>2. The cast: every component on the diagram</h2>
+<p>All nine flows use the same architecture. Here it is again, with the <strong>synchronous request path</strong> drawn solid and the <strong>asynchronous event path</strong> dashed.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 585" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-rf-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <!-- clients, dns, cdn -->
+  <rect x="15" y="180" width="100" height="56" rx="8" fill="#e1f5fe" stroke="#0277bd"/>
+  <text x="65" y="204" text-anchor="middle" font-weight="600">📱 Clients</text>
+  <text x="65" y="222" text-anchor="middle" font-size="11">Mobile · Web</text>
+  <rect x="15" y="90" width="100" height="44" rx="8" fill="#fff3e0" stroke="#ef6c00"/>
+  <text x="65" y="117" text-anchor="middle" font-weight="600">CDN</text>
+  <rect x="150" y="60" width="100" height="40" rx="8" fill="#fff3e0" stroke="#ef6c00"/>
+  <text x="200" y="85" text-anchor="middle" font-weight="600">DNS</text>
+  <rect x="140" y="185" width="102" height="46" rx="8" fill="#fff3e0" stroke="#ef6c00"/>
+  <text x="191" y="212" text-anchor="middle" font-weight="600" font-size="12.5">Load Balancer</text>
+  <rect x="262" y="185" width="110" height="46" rx="8" fill="#fff3e0" stroke="#ef6c00"/>
+  <text x="317" y="205" text-anchor="middle" font-weight="600">API Gateway</text>
+  <text x="317" y="222" text-anchor="middle" font-size="10.5">auth · rate limit</text>
+  <!-- services group -->
+  <rect x="392" y="40" width="180" height="350" rx="10" fill="#f6fbf6" stroke="#2e7d32" stroke-dasharray="4 3"/>
+  <text x="482" y="58" text-anchor="middle" font-size="12" font-weight="600" fill="#2e7d32">Application services</text>
+  <g font-size="12.5">
+    <rect x="402" y="68" width="160" height="32" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="482" y="89" text-anchor="middle">Upload Service</text>
+    <rect x="402" y="108" width="160" height="32" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="482" y="129" text-anchor="middle">Stories Service</text>
+    <rect x="402" y="148" width="160" height="32" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="482" y="169" text-anchor="middle">Like &amp; Comment</text>
+    <rect x="402" y="188" width="160" height="32" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="482" y="209" text-anchor="middle">Follow/Graph</text>
+    <rect x="402" y="228" width="160" height="32" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="482" y="249" text-anchor="middle">News Feed Service</text>
+    <rect x="402" y="268" width="160" height="32" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="482" y="289" text-anchor="middle">Search Service</text>
+    <rect x="402" y="308" width="160" height="32" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="482" y="329" text-anchor="middle">Direct Messaging</text>
+    <rect x="402" y="348" width="160" height="32" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="482" y="369" text-anchor="middle">User/Auth Service</text>
+  </g>
+  <!-- data group -->
+  <rect x="590" y="40" width="220" height="350" rx="10" fill="#fffdf3" stroke="#f9a825" stroke-dasharray="4 3"/>
+  <text x="700" y="58" text-anchor="middle" font-size="12" font-weight="600" fill="#b28704">Data layer</text>
+  <g font-size="12">
+    <rect x="600" y="68" width="200" height="36" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="700" y="91" text-anchor="middle">Object Storage (S3)</text>
+    <rect x="600" y="114" width="200" height="36" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="700" y="137" text-anchor="middle">Post Metadata (Cassandra)</text>
+    <rect x="600" y="160" width="200" height="36" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="700" y="183" text-anchor="middle">Social Graph store</text>
+    <rect x="600" y="206" width="200" height="36" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="700" y="229" text-anchor="middle">Feed Cache (Redis)</text>
+    <rect x="600" y="252" width="200" height="36" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="700" y="275" text-anchor="middle">Search Index (Elasticsearch)</text>
+    <rect x="600" y="298" width="200" height="36" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="700" y="321" text-anchor="middle">Messages Store</text>
+    <rect x="600" y="344" width="200" height="36" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="700" y="367" text-anchor="middle">User DB (PostgreSQL)</text>
+  </g>
+  <!-- kafka + consumers -->
+  <rect x="150" y="410" width="660" height="34" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/>
+  <text x="480" y="432" text-anchor="middle" font-weight="600" font-size="12.5">Kafka (event bus) · post / like / comment / follow / story / message events</text>
+  <g font-size="12">
+    <rect x="150" y="470" width="122" height="44" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="211" y="489" text-anchor="middle" font-weight="600">Search Indexer</text><text x="211" y="505" text-anchor="middle" font-size="10.5">→ Elasticsearch</text>
+    <rect x="282" y="470" width="122" height="44" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="343" y="489" text-anchor="middle" font-weight="600">Feed Fan-out</text><text x="343" y="505" text-anchor="middle" font-size="10.5">Workers → Redis</text>
+    <rect x="414" y="470" width="122" height="44" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="475" y="489" text-anchor="middle" font-weight="600">Media Processing</text><text x="475" y="505" text-anchor="middle" font-size="10.5">Workers → S3</text>
+    <rect x="546" y="470" width="122" height="44" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="607" y="489" text-anchor="middle" font-weight="600">Notification</text><text x="607" y="505" text-anchor="middle" font-size="10.5">Service</text>
+    <rect x="678" y="470" width="122" height="44" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="739" y="489" text-anchor="middle" font-weight="600">Analytics &amp; ML</text><text x="739" y="505" text-anchor="middle" font-size="10.5">Training</text>
+  </g>
+  <rect x="546" y="533" width="122" height="36" rx="8" fill="#eceff1" stroke="#455a64"/>
+  <text x="607" y="556" text-anchor="middle" font-size="12" font-weight="600">APNs / FCM</text>
+  <!-- sync arrows -->
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-rf-1)">
+    <path d="M100,180 L160,102"/>
+    <path d="M115,208 L138,208"/>
+    <path d="M242,208 L260,208"/>
+    <path d="M372,208 L390,208"/>
+    <path d="M572,215 L588,215"/>
+    <path d="M65,178 L65,136"/>
+  </g>
+  <!-- async arrows -->
+  <g stroke="#6a1b9a" stroke-width="1.5" fill="none" stroke-dasharray="5 3" marker-end="url(#ar-rf-1)">
+    <path d="M482,390 L482,408"/>
+    <path d="M211,444 L211,468"/><path d="M343,444 L343,468"/><path d="M475,444 L475,468"/><path d="M607,444 L607,468"/><path d="M739,444 L739,468"/>
+    <path d="M607,514 L607,531"/>
+    <path d="M546,551 L8,551 L8,213 L13,213"/>
+  </g>
+  <path d="M780,68 L780,20 L65,20 L65,88" stroke="#ef6c00" stroke-width="1.5" fill="none" stroke-dasharray="5 3" marker-end="url(#ar-rf-1)"/>
+  <text x="380" y="15" text-anchor="middle" font-size="11" fill="#ef6c00">origin pull (media bytes, on CDN miss)</text>
+  <text x="138" y="162" font-size="11" fill="#555">resolve</text>
+  <text x="20" y="160" font-size="11" fill="#555">media</text>
+  <text x="300" y="565" text-anchor="middle" font-size="11" fill="#6a1b9a">push notification to the phone</text>
+</svg>
+<div class="caption">Solid arrows: the synchronous API path the user waits on. Dashed purple: events flowing through Kafka to background consumers, which write their results back into the data layer (index, timelines, renditions). Dashed orange: media served by the CDN, origin-pulled from Object Storage.</div>
+</div>
+
+<h3>2.1 Conventions used in every flow</h3>
+<ul>
+  <li><strong>DNS and the TLS connection are set up once.</strong> Flow 1 shows <a href="dns.html">DNS</a> resolution and the <a href="networking-basics.html">TLS handshake</a> in full. After that the app reuses one long-lived HTTP/2 or HTTP/3 connection, so later flows skip those hops.</li>
+  <li><strong>"LB + API Gateway"</strong> stands for two hops. The <a href="load-balancer.html">Load Balancer</a> spreads connections over healthy gateway nodes. The <a href="api-gateway.html">API Gateway</a> terminates TLS, validates the JWT (<a href="authentication.html">authentication</a>), applies <a href="rate-limiting.html">rate limits</a> and routes to the right service. They are merged into one column to keep the diagrams readable.</li>
+  <li><strong>Service-to-service calls</strong> inside the data center are gRPC or Thrift over persistent connections, with deadlines (see <a href="api-design.html">API design</a> and <a href="microservices.html">microservices</a>). Every call carries a trace ID so the whole flow shows up as one <a href="observability.html">distributed trace</a>.</li>
+  <li><strong>"Post Meta (Cassandra)"</strong> is the diagram's <em>Post/Comment/Story Metadata (Cassandra)</em> store, partitioned by <code>user_id</code> or <code>post_id</code> (see <a href="sharding.html">sharding</a>).</li>
+  <li><strong>Arrow styles</strong> in the ASCII diagrams: <code>-----&gt;</code> synchronous call, <code>.....&gt;</code> response, <code>~~~~&gt;</code> asynchronous event via Kafka, <code>--</code> local work inside one component.</li>
+  <li><strong>All numbers are assumptions</strong> for a typical user on a good 4G/5G connection with ~40 ms round-trip time (RTT) to the nearest region. They are not official Instagram measurements.</li>
+</ul>
+
+<h3>2.2 The two golden rules behind every flow</h3>
+<div class="cards">
+  <div class="card"><h4>⚡ Do the minimum synchronously</h4><p>The synchronous path writes the <em>source of truth</em> (one row, one edge, one message), publishes an event, and returns. Everything that can be eventually consistent is pushed to Kafka consumers.</p></div>
+  <div class="card"><h4>📦 Bytes never go through services</h4><p>Uploads go straight to Object Storage with a <a href="media-upload.html">pre-signed URL</a>. Downloads come from the <a href="cdn.html">CDN</a>. The API only ever carries IDs, metadata and URLs, so app servers stay small, stateless and cheap.</p></div>
+  <div class="card"><h4>🧮 Precompute for reads</h4><p>Instagram is read-heavy (assume ~100 reads per write). Feeds, story trays, renditions, counters and search indexes are built at write time so that reads are a few key lookups.</p></div>
+  <div class="card"><h4>🔁 Make every step retry-safe</h4><p>Networks fail and Kafka redelivers. Every write uses an <a href="api-design.html">idempotency key</a> or a natural primary key, so doing it twice has the same effect as doing it once (see <a href="resilience-patterns.html">resilience patterns</a>).</p></div>
+</div>
+
+<!-- ============================ FLOW 1 ============================ -->
+<h2>3. Flow 1 — App open &amp; login</h2>
+<p>The user installs the app, types a username and password and taps <em>Log in</em>. This flow sets up everything the other flows reuse: the IP address of the nearest region, an encrypted connection, and the tokens that prove who the user is.</p>
+
+<pre class="ascii">
+  Clients    DNS      Load        API     User/Auth     User DB      Kafka
+                    Balancer    Gateway    Service   (PostgreSQL)
+     |        |         |          |          |            |           |
+     | 1 resolve i.instagram.com   |          |            |           |
+     |-------&gt;|         |          |          |            |           |
+     | 2 IP of nearest region (GeoDNS)        |            |           |
+     |&lt;.......|         |          |          |            |           |
+     | 3 TLS 1.3 + POST /v1/auth/login        |            |           |
+     |-----------------&gt;|          |          |            |           |
+     |        |         | 4 forward to healthy node        |           |
+     |        |         |---------&gt;|          |            |           |
+     |        |         |          |-- 5 rate-limit by IP + username   |
+     |        |         |          | 6 VerifyCredentials (gRPC)        |
+     |        |         |          |---------&gt;|            |           |
+     |        |         |          |          | 7 SELECT user by username
+     |        |         |          |          |-----------&gt;|           |
+     |        |         |          |          | 8 user_id, password_hash
+     |        |         |          |          |&lt;...........|           |
+     |        |         |          |          |-- 9 argon2/bcrypt verify, risk check
+     |        |         |          |          | 10 INSERT session + refresh token
+     |        |         |          |          |-----------&gt;|           |
+     |        |         |          |          | 11 user.logged_in      |
+     |        |         |          |          |~~~~~~~~~~~~~~~~~~~~~~~&gt;|
+     |        |         |          | 12 access JWT + refresh token     |
+     |        |         |          |&lt;.........|            |           |
+     | 13 200 OK {tokens}          |          |            |           |
+     |&lt;............................|          |            |           |
+== app now fires feed, stories-tray and push-token calls in parallel ==|
+     |        |         |          |          |            |           |
+
+legend:  ----&gt; synchronous call    ....&gt; response    ~~~~&gt; asynchronous event (Kafka)    -- local work
+</pre>
+
+<ol class="steps">
+  <li><strong>Clients → DNS:</strong> the app resolves <code>i.instagram.com</code>. The phone's OS cache or the ISP's recursive resolver usually already has the answer. If not, the query reaches the authoritative <a href="dns.html">DNS</a>, which uses <strong>GeoDNS</strong> to pick a nearby, healthy region.</li>
+  <li><strong>DNS → Clients:</strong> returns the virtual IP (VIP) of that region's Load Balancer, with a short TTL (e.g. 60 s) so traffic can be moved quickly during an outage (see <a href="multi-region.html">multi-region</a>).</li>
+  <li><strong>Clients → Load Balancer:</strong> the app opens a TCP connection, performs a TLS 1.3 handshake (1 RTT, or 0 RTT on resumption; see <a href="networking-basics.html">networking basics</a>) and sends <code>POST /v1/auth/login {username, password, device_id}</code>.</li>
+  <li><strong>Load Balancer → API Gateway:</strong> an L4 <a href="load-balancer.html">load balancer</a> forwards the connection to a healthy gateway node, chosen by consistent hashing or least-connections. Health checks keep failed nodes out of rotation.</li>
+  <li><strong>API Gateway:</strong> terminates TLS. Login is one of the few unauthenticated routes, so instead of checking a token the gateway applies a strict <a href="rate-limiting.html">rate limit</a> per IP and per username (e.g. 5 attempts/min) to block credential stuffing.</li>
+  <li><strong>API Gateway → User/Auth Service:</strong> forwards the request as an internal gRPC call with a deadline (e.g. 1 s).</li>
+  <li><strong>User/Auth Service → User DB (PostgreSQL):</strong> looks up the account. Usernames map to a <code>user_id</code> through a lookup table. The <code>user_id</code> tells the service which <a href="sharding.html">shard</a> holds the row, and reads can go to a <a href="replication.html">read replica</a>.</li>
+  <li><strong>User DB → User/Auth Service:</strong> returns <code>user_id</code>, the salted password hash, the account status and the 2FA settings.</li>
+  <li><strong>User/Auth Service (local):</strong> verifies the password with a deliberately slow hash (argon2 or bcrypt, ~50–100 ms of CPU) and runs risk checks (new device? impossible travel?). Risky logins get a 2FA or e-mail challenge instead of tokens. See <a href="authentication.html">authentication</a> and <a href="security.html">security</a>.</li>
+  <li><strong>User/Auth Service → User DB:</strong> writes a session record: the device and a <em>hash</em> of a new refresh token. This write goes to the shard's primary.</li>
+  <li><strong>User/Auth Service → Kafka:</strong> publishes <code>user.logged_in</code> asynchronously. Analytics &amp; ML Training uses it for fraud models, and the Notification Service can send "new login from Chrome on Windows" alerts.</li>
+  <li><strong>User/Auth Service → API Gateway:</strong> returns a short-lived signed <strong>access token</strong> (a JWT, valid ~15–60 min) and a long-lived opaque <strong>refresh token</strong> (valid for weeks).</li>
+  <li><strong>API Gateway → Clients:</strong> <code>200 OK</code>. The app stores the tokens in the iOS Keychain or Android Keystore. It then fires three calls <em>in parallel</em> over the same connection: the home feed (Flow 3), the stories tray (Flow 6) and <code>POST /v1/devices {push_token}</code>, which registers the APNs/FCM token used in Flow 9.</li>
+</ol>
+
+<h3>3.1 Every later app open (already logged in)</h3>
+<p>Login happens rarely. A normal cold start is much cheaper. The app paints the <strong>last feed it cached on disk</strong> immediately (see <a href="clients.html">clients</a>), reuses its tokens, and refreshes in the background. The gateway validates the JWT <em>locally</em>: it checks the signature with the Auth service's public key (cached), the expiry and the audience. No call to the User/Auth Service is needed, which takes the Auth service off the hot path of every request. If the access token has expired, the app calls <code>POST /v1/auth/refresh</code> once. The Auth service checks the refresh token against the User DB (where it can also be revoked) and issues a new JWT.</p>
+
+<h3>3.2 Latency budget (first login)</h3>
+<div class="table-wrap"><table>
+  <tr><th>Hop</th><th>Typical time</th><th>Notes</th></tr>
+  <tr><td>DNS lookup</td><td>0–50 ms</td><td>0 if cached on the device; one recursive lookup otherwise</td></tr>
+  <tr><td>TCP + TLS 1.3 handshake</td><td>~80 ms</td><td>2 RTTs at 40 ms (1 with QUIC/HTTP/3, ~0 when resumed)</td></tr>
+  <tr><td>Request upload + LB + gateway</td><td>~25 ms</td><td>Half an RTT plus ~3 ms of routing and rate-limit checks</td></tr>
+  <tr><td>User DB lookup</td><td>~3 ms</td><td>Indexed primary-key read on a replica</td></tr>
+  <tr><td>Password hash verify</td><td>~70 ms</td><td>Deliberately slow to make offline cracking expensive</td></tr>
+  <tr><td>Session write + token signing</td><td>~6 ms</td><td>Primary write plus a signature</td></tr>
+  <tr><td>Response download</td><td>~20 ms</td><td>Half an RTT</td></tr>
+  <tr><td><b>Total</b></td><td><b>~200–250 ms</b></td><td>Acceptable for a once-in-months action. Every later request skips ~180 ms of it.</td></tr>
+</table></div>
+
+<h3>3.3 What happens on failure</h3>
+<ul>
+  <li><strong>DNS outage or slow resolver:</strong> the app keeps using cached IPs. Many large apps also ship fallback IPs or use multiple resolvers. A GeoDNS failover moves users to another region within roughly a TTL.</li>
+  <li><strong>A gateway node dies:</strong> LB health checks drop it within seconds. Clients on that node reconnect, and the login is retried safely because nothing was committed.</li>
+  <li><strong>User/Auth Service is down:</strong> <em>new logins fail</em>, but every existing session keeps working because JWTs are validated at the gateway without calling Auth. That containment is the main reason for using signed tokens. Refreshes fail too, so a long Auth outage slowly logs people out as access tokens expire.</li>
+  <li><strong>User DB primary fails:</strong> credential reads still succeed from replicas, but session writes fail until a replica is promoted (seconds to tens of seconds; see <a href="replication.html">replication</a>). The gateway returns a retryable 503 and the app retries with exponential backoff plus jitter.</li>
+  <li><strong>Brute-force attack:</strong> rate limits return <code>429 Too Many Requests</code>. Repeated failures trigger CAPTCHA or account lockout.</li>
+</ul>
+
+<!-- ============================ FLOW 2 ============================ -->
+<h2>4. Flow 2 — Uploading a photo post</h2>
+<p>This is the most important write in Instagram, and it touches the most components. The design goal is to make the user wait only until the photo is <strong>durably stored and the post row exists</strong>. Everything else (renditions, moderation, delivery into 500 followers' feeds, hashtag indexing, notifications) happens in the background. The flow has three phases.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 265" width="820" xmlns="http://www.w3.org/2000/svg" font-size="12.5">
+  <line x1="10" y1="100" x2="810" y2="100" stroke="#cfd8dc"/>
+  <text x="12" y="62" font-weight="700" fill="#0277bd">User waits</text><text x="12" y="78" font-size="11" fill="#555">(synchronous)</text>
+  <text x="12" y="160" font-weight="700" fill="#6a1b9a">Background</text><text x="12" y="176" font-size="11" fill="#555">(asynchronous)</text>
+  <rect x="145" y="40" width="95" height="44" rx="7" fill="#e8f5e9" stroke="#2e7d32"/><text x="192" y="59" text-anchor="middle">Init upload</text><text x="192" y="76" text-anchor="middle" font-size="11">~60 ms</text>
+  <rect x="245" y="40" width="175" height="44" rx="7" fill="#fff8e1" stroke="#f9a825"/><text x="332" y="59" text-anchor="middle">PUT bytes to S3</text><text x="332" y="76" text-anchor="middle" font-size="11">~0.3–2 s (network bound)</text>
+  <rect x="425" y="40" width="105" height="44" rx="7" fill="#e8f5e9" stroke="#2e7d32"/><text x="477" y="59" text-anchor="middle">Create post</text><text x="477" y="76" text-anchor="middle" font-size="11">~60 ms</text>
+  <line x1="542" y1="28" x2="542" y2="250" stroke="#2e7d32" stroke-width="2" stroke-dasharray="6 4"/>
+  <text x="548" y="36" font-size="11.5" font-weight="700" fill="#2e7d32">201 Created → user moves on</text>
+  <g font-size="12">
+    <rect x="560" y="112" width="250" height="28" rx="6" fill="#f3e5f5" stroke="#6a1b9a"/><text x="685" y="131" text-anchor="middle">Media processing + moderation (2–5 s)</text>
+    <rect x="560" y="147" width="250" height="28" rx="6" fill="#f3e5f5" stroke="#6a1b9a"/><text x="685" y="166" text-anchor="middle">Feed fan-out to followers (&lt;1–10 s)</text>
+    <rect x="560" y="182" width="250" height="28" rx="6" fill="#f3e5f5" stroke="#6a1b9a"/><text x="685" y="201" text-anchor="middle">Search indexing (~1–2 s)</text>
+    <rect x="560" y="217" width="250" height="28" rx="6" fill="#f3e5f5" stroke="#6a1b9a"/><text x="685" y="236" text-anchor="middle">Notifications · analytics (seconds)</text>
+  </g>
+  <text x="145" y="130" font-size="11.5" fill="#555">The app shows the post immediately from the</text>
+  <text x="145" y="146" font-size="11.5" fill="#555">local file (optimistic UI) while the background</text>
+  <text x="145" y="162" font-size="11.5" fill="#555">work runs; followers see it a few seconds later.</text>
+</svg>
+<div class="caption">The upload's critical path is the three green and yellow boxes. Everything purple runs after the user has been told "posted", in parallel, through Kafka consumers.</div>
+</div>
+
+<h3>4.1 Phase A — the synchronous upload</h3>
+<pre class="ascii">
+  Clients      LB +       Upload    Object     Post Meta    Kafka
+            API Gateway   Service   Storage   (Cassandra)
+     |           |           |         |           |          |
+     |-- 1 resize, compress, hash, idempotency key |          |
+     | 2 POST /v1/media/uploads        |           |          |
+     |----------&gt;|           |         |           |          |
+     |           | 3 auth OK, route    |           |          |
+     |           |----------&gt;|         |           |          |
+     |           |           |-- 4 new media_id + pre-signed PUT URL
+     |           |           | 5 upload session = PENDING     |
+     |           |           |--------------------&gt;|          |
+     | 6 {media_id, upload_url}        |           |          |
+     |&lt;......................|         |           |          |
+     | 7 PUT bytes directly (resumable)|           |          |
+     |--------------------------------&gt;|           |          |
+     | 8 200 + ETag          |         |           |          |
+     |&lt;................................|           |          |
+     | 9 POST /v1/posts {media_id, caption}        |          |
+     |----------&gt;|           |         |           |          |
+     |           | 10 route (Idempotency-Key)      |          |
+     |           |----------&gt;|         |           |          |
+     |           |           | 11 HEAD: object exists?        |
+     |           |           |--------&gt;|           |          |
+     |           |           | 12 INSERT post (PROCESSING)    |
+     |           |           |--------------------&gt;|          |
+     |           |           | 13 post.created     |          |
+     |           |           |~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~&gt;|
+     | 14 201 Created {post_id}        |           |          |
+     |&lt;......................|         |           |          |
+     |           |           |         |           |          |
+
+legend:  ----&gt; synchronous call    ....&gt; response    ~~~~&gt; asynchronous event (Kafka)    -- local work
+</pre>
+<ol class="steps">
+  <li><strong>Clients (local):</strong> the app applies filters, resizes the image to at most 1080 px wide and compresses it (a 12 MP camera photo of ~4 MB becomes ~300–600 KB). It also computes a content hash and generates an <strong>idempotency key</strong> (a random UUID) for this post. Doing this on the phone saves upload time and server CPU (see <a href="clients.html">clients</a>).</li>
+  <li><strong>Clients → LB + API Gateway:</strong> <code>POST /v1/media/uploads {type: "image/jpeg", size, sha256}</code> with the JWT.</li>
+  <li><strong>API Gateway → Upload Service:</strong> the JWT is valid and the upload <a href="rate-limiting.html">rate limit</a> is fine (e.g. 100 posts/day), so the request is routed.</li>
+  <li><strong>Upload Service (local):</strong> generates a globally unique, time-sortable <code>media_id</code> (see <a href="id-generation.html">ID generation</a>) and signs a <strong>pre-signed PUT URL</strong> for <code>raw/{media_id}</code> in Object Storage, valid for ~15 minutes and only for that key, content type and size. See <a href="media-upload.html">media upload</a>.</li>
+  <li><strong>Upload Service → Post/Comment/Story Metadata (Cassandra):</strong> records an upload session with <code>status = PENDING</code>, so abandoned uploads can be found and cleaned up later.</li>
+  <li><strong>Upload Service → Clients:</strong> returns <code>{media_id, upload_url}</code>. This hop is ~60 ms end to end.</li>
+  <li><strong>Clients → Object Storage:</strong> the app <code>PUT</code>s the bytes <em>directly</em> to <a href="object-storage.html">Object Storage</a>, bypassing the Load Balancer, API Gateway and Upload Service entirely. Large files (Reels) use multipart or resumable chunks of ~5–8 MB, so a dropped connection resumes from the last chunk instead of starting over.</li>
+  <li><strong>Object Storage → Clients:</strong> <code>200 OK</code> with an ETag (checksum). The object is now durably stored, replicated or erasure-coded across devices and zones.</li>
+  <li><strong>Clients → LB + API Gateway:</strong> <code>POST /v1/posts {media_id, caption, location, user_tags}</code> with the header <code>Idempotency-Key: 7c9e…</code>.</li>
+  <li><strong>API Gateway → Upload Service:</strong> routed. If the Upload Service has already seen this key (because the client retried after a timeout), it returns the original response instead of creating a second post. See <a href="api-design.html">API design</a>.</li>
+  <li><strong>Upload Service → Object Storage:</strong> a <code>HEAD raw/{media_id}</code> confirms the object exists and its size and hash match, so a client cannot create a post pointing at nothing.</li>
+  <li><strong>Upload Service → Post/Comment/Story Metadata (Cassandra):</strong> inserts the post (<code>post_id, user_id, media_key, caption, status = PROCESSING, created_at</code>) into <code>posts_by_id</code> and <code>posts_by_user</code>. The post count on the profile is incremented in Feed Cache (Redis) counters.</li>
+  <li><strong>Upload Service → Kafka:</strong> publishes <code>post.created {post_id, user_id, media_key, created_at}</code>, keyed by <code>user_id</code> so that all of one user's events land in order on one partition (see <a href="message-queues.html">Kafka</a>). To guarantee the event is never lost when the DB write succeeds, use the <strong>transactional outbox</strong> pattern: write the event to an outbox table in the same write, and a relay publishes it.</li>
+  <li><strong>Upload Service → Clients:</strong> <code>201 Created {post_id}</code>. The app already shows the post on the user's profile from the local file. The user is done.</li>
+</ol>
+
+<h3>4.2 Phase B — asynchronous media processing</h3>
+<pre class="ascii">
+  Kafka   Media Processing    Object     Post Meta     CDN
+               Workers        Storage   (Cassandra)
+    |             |              |           |          |
+    | 15 consume post.created    |           |          |
+    |~~~~~~~~~~~~&gt;|              |           |          |
+    |             | 16 GET original          |          |
+    |             |-------------&gt;|           |          |
+    |             |-- 17 renditions, WebP/AVIF, moderation
+    |             | 18 PUT renditions        |          |
+    |             |-------------&gt;|           |          |
+    |             | 19 status=READY + keys   |          |
+    |             |-------------------------&gt;|          |
+    | 20 post.ready              |           |          |
+    |&lt;~~~~~~~~~~~~|              |           |          |
+    |             | 21 (optional) pre-warm hot PoPs     |
+    |             |------------------------------------&gt;|
+    |             |              |           |          |
+
+legend:  ----&gt; synchronous call    ....&gt; response    ~~~~&gt; asynchronous event (Kafka)    -- local work
+</pre>
+<ol class="steps" start="15">
+  <li><strong>Kafka → Media Processing Workers:</strong> a worker in the consumer group takes <code>post.created</code> from its partition.</li>
+  <li><strong>Media Processing Workers → Object Storage:</strong> downloads the original from <code>raw/</code>.</li>
+  <li><strong>Media Processing Workers (local):</strong> generates renditions (e.g. 150 px thumbnail, 320, 640 and 1080 px, in JPEG plus WebP/AVIF), a tiny blur placeholder, strips EXIF location metadata for privacy, and runs moderation classifiers (nudity, violence, spam) plus perceptual hashing against known-bad content. Videos are transcoded into HLS/DASH segments at several bitrates. See <a href="media-processing.html">media processing</a>.</li>
+  <li><strong>Media Processing Workers → Object Storage:</strong> writes each rendition under a <strong>content-versioned key</strong> such as <code>p/{media_id}/{hash}_1080.webp</code>, so the <a href="cdn.html">CDN</a> can cache them forever.</li>
+  <li><strong>Media Processing Workers → Post/Comment/Story Metadata (Cassandra):</strong> updates the post to <code>status = READY</code> with the rendition keys, width, height and blur hash. If moderation rejected the content, the status becomes <code>REMOVED</code> and the flow stops here.</li>
+  <li><strong>Media Processing Workers → Kafka:</strong> publishes <code>post.ready</code>. Followers are only told about posts whose media can actually be displayed.</li>
+  <li><strong>Media Processing Workers → CDN (optional):</strong> for accounts with huge followings, the worker pre-warms the new renditions in major PoPs to avoid a thundering herd on the origin when millions of people open the post at once.</li>
+</ol>
+
+<h3>4.3 Phase C — asynchronous distribution</h3>
+<pre class="ascii">
+  Kafka    Fan-out  Social Graph   Feed Cache    Search   Search Index   Notification    Analytics
+           Workers      store        (Redis)     Indexer      (ES)          Service        &amp; ML
+    |         |           |             |           |           |              |             |
+    | 22 consume post.ready             |           |           |              |             |
+    |~~~~~~~~&gt;|           |             |           |           |              |             |
+    |         | 23 page through followers           |           |              |             |
+    |         |----------&gt;|             |           |           |              |             |
+    |         | 24 ZADD post_id to each timeline    |           |              |             |
+    |         |------------------------&gt;|           |           |              |             |
+    | 25 consume post.ready             |           |           |              |             |
+    |~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~&gt;|           |              |             |
+    |         |           |             |           | 26 index caption, hashtags             |
+    |         |           |             |           |----------&gt;|              |             |
+    | 27 consume (tags, mentions)       |           |           |              |             |
+    |~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~&gt;|             |
+    | 28 events to warehouse            |           |           |              |             |
+    |~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~&gt;|
+    |         |           |             |           |           |              |             |
+
+legend:  ----&gt; synchronous call    ....&gt; response    ~~~~&gt; asynchronous event (Kafka)    -- local work
+</pre>
+<ol class="steps" start="22">
+  <li><strong>Kafka → Feed Fan-out Workers:</strong> consume <code>post.ready</code>.</li>
+  <li><strong>Feed Fan-out Workers → Social Graph store:</strong> page through the author's followers (e.g. 1,000 per page). If the author is a <strong>celebrity</strong> (say more than ~1M followers) the workers skip push fan-out entirely; their posts are pulled at read time in Flow 3. See <a href="news-feed.html">news feed</a> and <a href="social-graph.html">social graph</a>.</li>
+  <li><strong>Feed Fan-out Workers → Feed Cache (Redis):</strong> for each follower, <code>ZADD timeline:{follower_id} {created_at} {post_id}</code> and trim to the newest ~500 entries. Pipelining batches thousands of writes per round trip. Inactive followers (no app open in 30 days) can be skipped; their feed is rebuilt on demand.</li>
+  <li><strong>Kafka → Search Indexer:</strong> a separate consumer group reads the same event independently. That is the power of a log: one event, many readers.</li>
+  <li><strong>Search Indexer → Search Index (Elasticsearch):</strong> indexes the caption, hashtags and location so the post shows up under <code>#sunset</code> within a second or two. See <a href="search.html">search</a>.</li>
+  <li><strong>Kafka → Notification Service:</strong> sends notifications to users tagged or mentioned in the caption, and to followers who turned on "post notifications" for this author (Flow 9).</li>
+  <li><strong>Kafka → Analytics &amp; ML Training:</strong> the event lands in the data warehouse and feature stores. It's used for metrics, abuse detection and training the feed and Explore ranking models. See <a href="analytics-ml.html">analytics &amp; ML</a>.</li>
+</ol>
+
+<h3>4.4 Latency budget</h3>
+<div class="table-wrap"><table>
+  <tr><th>Segment</th><th>Assumed time</th><th>Who waits?</th></tr>
+  <tr><td>Init upload (RTT + ID + URL signing + PENDING row)</td><td>~60 ms</td><td>User (behind a progress bar)</td></tr>
+  <tr><td>PUT 500 KB at 5 Mbps uplink</td><td>~0.8 s</td><td>User (progress bar; the app can start this while the caption is typed)</td></tr>
+  <tr><td>Create post (RTT + HEAD + insert + publish)</td><td>~60 ms</td><td>User</td></tr>
+  <tr><td>Image renditions + moderation</td><td>2–5 s (minutes for long video)</td><td>Nobody; post visible to followers after this</td></tr>
+  <tr><td>Fan-out to 500 followers</td><td>&lt; 100 ms of Redis writes; ~1 s including queueing</td><td>Nobody</td></tr>
+  <tr><td>Fan-out to 200k followers</td><td>seconds to tens of seconds</td><td>Nobody (this is why celebrities use pull instead)</td></tr>
+</table></div>
+<div class="callout tip"><span class="callout-title">💡 Hiding the upload entirely</span>
+A widely used trick: start uploading the media <em>as soon as the user picks the photo</em>, while they're still choosing a filter and typing the caption. By the time they tap <em>Share</em>, only the ~60 ms "create post" call is left. If they abandon, an Object Storage lifecycle rule deletes the orphaned <code>raw/</code> object after 24 h.</div>
+
+<h3>4.5 What happens on failure</h3>
+<ul>
+  <li><strong>The network drops mid-upload:</strong> resumable/multipart upload continues from the last acknowledged chunk. If the pre-signed URL expires, the app asks for a new one with the same <code>media_id</code>.</li>
+  <li><strong>The client times out on "create post" and retries:</strong> the idempotency key makes the retry return the same <code>post_id</code>, so there is no duplicate post.</li>
+  <li><strong>Kafka is unavailable:</strong> with the outbox pattern the post row and the pending event are committed together, and a relay publishes it when Kafka recovers. Followers see the post late but never miss it. Without an outbox you get "posted but never appeared in feeds", a classic dual-write bug.</li>
+  <li><strong>A media worker crashes halfway:</strong> it never committed its Kafka offset, so another worker gets the same event (<em>at-least-once</em> delivery). Renditions are written to deterministic keys, so redoing the work simply overwrites identical files. The operation is idempotent.</li>
+  <li><strong>A poison message</strong> (e.g. a corrupt file that crashes the decoder) is retried a few times and then moved to a <strong>dead-letter queue</strong>; the post is marked <code>FAILED</code> and the user sees "Couldn't post, try again".</li>
+  <li><strong>Fan-out lags behind</strong> (consumer lag during a spike): posting still succeeds. Followers' feeds are a little stale, autoscaling adds workers, and Flow 3's read path can pull very recent posts directly to fill the gap.</li>
+</ul>
+
+<!-- ============================ FLOW 3 ============================ -->
+<h2>5. Flow 3 — Loading the home feed</h2>
+<p>This is the most frequent request in the system (assume ~5 billion feed loads a day, around 60k requests per second on average and 150k at peak). The goal is a <strong>p99 under ~300 ms server time</strong>. That is only possible because most of the work, deciding <em>which</em> posts are candidates, was done at write time in Flow 2.</p>
+
+<pre class="ascii">
+  Clients      LB +       News Feed  Feed Cache    Follow/    Post Meta     CDN
+            API Gateway    Service     (Redis)      Graph    (Cassandra)
+     |           |            |           |           |           |          |
+     |-- 1 render cached feed from disk   |           |           |          |
+     | 2 GET /v1/feed?cursor=...          |           |           |          |
+     |----------&gt;|            |           |           |           |          |
+     |           | 3 JWT ok, route        |           |           |          |
+     |           |-----------&gt;|           |           |           |          |
+     |           |            | 4 ZREVRANGE timeline:{uid}        |          |
+     |           |            |----------&gt;|           |           |          |
+     |           |            | 5 followed celebrities?           |          |
+     |           |            |----------------------&gt;|           |          |
+     |           |            | 6 recent posts of celebs (pull)   |          |
+     |           |            |----------------------------------&gt;|          |
+     |           |            |-- 7 merge, filter, rank ~500 -&gt; 20|          |
+     |           |            | 8 MGET post objects + counters    |          |
+     |           |            |----------&gt;|           |           |          |
+     |           |            | 9 fill cache misses   |           |          |
+     |           |            |----------------------------------&gt;|          |
+     | 10 20 posts + signed CDN URLs + cursor         |           |          |
+     |&lt;.......................|           |           |           |          |
+     | 11 GET images (prefetch next)      |           |           |          |
+     |----------------------------------------------------------------------&gt;|
+     | 12 bytes (hit) / origin pull (miss)|           |           |          |
+     |&lt;......................................................................|
+     | 13 impression batch -&gt; Kafka       |           |           |          |
+     |~~~~~~~~~~&gt;|            |           |           |           |          |
+     |           |            |           |           |           |          |
+
+legend:  ----&gt; synchronous call    ....&gt; response    ~~~~&gt; asynchronous event (Kafka)    -- local work
+</pre>
+<ol class="steps">
+  <li><strong>Clients (local):</strong> the app immediately renders the feed it saved on disk last time, so the user sees content in under 100 ms even on a bad network. It then asks the server for fresh content (stale-while-revalidate; see <a href="clients.html">clients</a>).</li>
+  <li><strong>Clients → LB + API Gateway:</strong> <code>GET /v1/feed?cursor=&lt;opaque&gt;&amp;limit=20</code> with the JWT. The cursor encodes where the previous page ended (<a href="api-design.html">cursor pagination</a>, never offsets).</li>
+  <li><strong>API Gateway → News Feed Service:</strong> the JWT signature and expiry are verified locally, the user is under the rate limit, and the request is routed to any News Feed Service instance. The service is stateless (see <a href="microservices.html">microservices</a>).</li>
+  <li><strong>News Feed Service → Feed Cache (Redis):</strong> <code>ZREVRANGE timeline:{uid} 0 499</code> returns up to 500 post IDs that the fan-out workers pushed into this user's timeline. It's a single in-memory read of ~1 ms. See <a href="caching.html">caching</a>.</li>
+  <li><strong>News Feed Service → Follow/Graph:</strong> "which celebrities does this user follow?" These are the accounts excluded from push fan-out. The answer is small, and cached per user. In parallel with step 4.</li>
+  <li><strong>News Feed Service → Post/Comment/Story Metadata (Cassandra):</strong> fetches the last ~48 h of posts from each followed celebrity (<code>posts_by_user</code> is partitioned by author and clustered by time, so each fetch is one partition read; celebrities' recent posts are also heavily cached). This is the <strong>pull</strong> half of the hybrid model. See <a href="news-feed.html">news feed</a>.</li>
+  <li><strong>News Feed Service (local):</strong> merges the pushed and pulled candidates, removes posts that are deleted, blocked, muted or already seen, then <strong>ranks</strong>. A cheap first-stage model trims ~500 candidates to ~100, then a heavier model scores those using features like your affinity with the author, the post's early engagement and media type. It also inserts a few suggested posts. See <a href="analytics-ml.html">analytics &amp; ML ranking</a>.</li>
+  <li><strong>News Feed Service → Feed Cache (Redis):</strong> <em>hydrates</em> the top 20. A multi-get fetches cached post objects (author, caption, rendition keys) and the like/comment counters.</li>
+  <li><strong>News Feed Service → Post/Comment/Story Metadata (Cassandra):</strong> fills any cache misses and writes them back to the cache (cache-aside).</li>
+  <li><strong>News Feed Service → Clients:</strong> JSON with 20 posts, each containing <strong>signed CDN URLs</strong> for several rendition sizes (never the bytes), plus <code>next_cursor</code>. Typical size ~30–60 KB, gzip/brotli compressed.</li>
+  <li><strong>Clients → CDN:</strong> the app picks the rendition for its screen and format support and fetches images in parallel. It prefetches the next few posts' media and the next page while the user scrolls.</li>
+  <li><strong>CDN → Clients:</strong> served from edge RAM/SSD on a hit (~10–30 ms). On a miss the edge goes through the origin shield to Object Storage. See <a href="cdn.html">CDN</a>.</li>
+  <li><strong>Clients → Kafka (via the gateway):</strong> the app batches <em>impression</em> and <em>view-time</em> events and sends them every few seconds. They flow into Analytics &amp; ML Training, which records what was seen (so it isn't shown again) and produces training labels for the ranking model.</li>
+</ol>
+
+<div class="diagram">
+<svg viewBox="0 0 820 300" width="820" xmlns="http://www.w3.org/2000/svg" font-size="12">
+  <text x="410" y="20" text-anchor="middle" font-weight="700" font-size="13">Assumed feed-load waterfall (1 ms ≈ 3 px)</text>
+  <g text-anchor="end">
+    <text x="200" y="53">Request to region (20 ms)</text>
+    <text x="200" y="77">LB + Gateway (4 ms)</text>
+    <text x="200" y="101">Timeline read, Redis (4 ms)</text>
+    <text x="200" y="125">Celebrity pull (18 ms)</text>
+    <text x="200" y="149">Ranking (50 ms)</text>
+    <text x="200" y="173">Hydrate + counters (12 ms)</text>
+    <text x="200" y="197">Serialize + response (22 ms)</text>
+    <text x="200" y="221">CDN: first images (34 ms)</text>
+    <text x="200" y="245">Prefetch next posts</text>
+  </g>
+  <rect x="210" y="40" width="60" height="18" rx="3" fill="#fff3e0" stroke="#ef6c00"/>
+  <rect x="270" y="64" width="12" height="18" rx="3" fill="#fff3e0" stroke="#ef6c00"/>
+  <rect x="282" y="88" width="12" height="18" rx="3" fill="#fff8e1" stroke="#f9a825"/>
+  <rect x="282" y="112" width="54" height="18" rx="3" fill="#fff8e1" stroke="#f9a825"/>
+  <rect x="336" y="136" width="150" height="18" rx="3" fill="#e8f5e9" stroke="#2e7d32"/>
+  <rect x="486" y="160" width="36" height="18" rx="3" fill="#fff8e1" stroke="#f9a825"/>
+  <rect x="522" y="184" width="66" height="18" rx="3" fill="#fff3e0" stroke="#ef6c00"/>
+  <rect x="588" y="208" width="102" height="18" rx="3" fill="#fff3e0" stroke="#ef6c00"/>
+  <rect x="690" y="232" width="120" height="18" rx="3" fill="#e1f5fe" stroke="#0277bd" stroke-dasharray="4 2"/>
+  <line x1="210" y1="262" x2="810" y2="262" stroke="#555"/>
+  <g font-size="11" fill="#555" text-anchor="middle">
+    <line x1="210" y1="262" x2="210" y2="267" stroke="#555"/><text x="210" y="281">0 ms</text>
+    <line x1="360" y1="262" x2="360" y2="267" stroke="#555"/><text x="360" y="281">50</text>
+    <line x1="510" y1="262" x2="510" y2="267" stroke="#555"/><text x="510" y="281">100</text>
+    <line x1="660" y1="262" x2="660" y2="267" stroke="#555"/><text x="660" y="281">150</text>
+    <line x1="810" y1="262" x2="810" y2="267" stroke="#555"/><text x="790" y="281">200 ms</text>
+  </g>
+  <text x="300" y="125" font-size="10.5" fill="#555" text-anchor="start" dx="40">‖ parallel with timeline read</text>
+</svg>
+<div class="caption">Ranking is the largest single server-side cost; the network and CDN dominate what the user feels. The timeline read and the celebrity pull run in parallel, so the slower of the two counts.</div>
+</div>
+
+<h3>5.1 Latency budget</h3>
+<div class="table-wrap"><table>
+  <tr><th>Stage</th><th>p50 (assumed)</th><th>p99 target</th><th>How it's kept low</th></tr>
+  <tr><td>Network to region and back</td><td>40 ms</td><td>150 ms</td><td>Nearest region via GeoDNS, warm HTTP/2 or QUIC connection</td></tr>
+  <tr><td>Gateway (auth, rate limit, route)</td><td>3 ms</td><td>10 ms</td><td>Local JWT validation, in-memory token buckets</td></tr>
+  <tr><td>Candidate fetch (timeline + celebrity pull, parallel)</td><td>18 ms</td><td>50 ms</td><td>Precomputed timeline in Redis; celebrity posts cached</td></tr>
+  <tr><td>Ranking</td><td>50 ms</td><td>120 ms</td><td>Two-stage ranking, features prefetched, hard deadline with fallback</td></tr>
+  <tr><td>Hydration (post objects + counters)</td><td>12 ms</td><td>40 ms</td><td>Batched multi-gets; cache-aside with high hit ratio</td></tr>
+  <tr><td><b>Server total</b></td><td><b>~85 ms</b></td><td><b>&lt; 300 ms</b></td><td>Every downstream call has a deadline shorter than the parent's</td></tr>
+  <tr><td>First images from CDN</td><td>30 ms</td><td>200 ms</td><td>Edge hits, right-sized renditions, prefetching</td></tr>
+</table></div>
+
+<h3>5.2 What happens on failure</h3>
+<ul>
+  <li><strong>Timeline missing from Redis</strong> (new user, evicted inactive user, or a lost cache node): fall back to <em>fan-out-on-read</em>. Fetch the user's followees from the Social Graph store, read each one's recent posts from Cassandra, merge, then write the result back into Redis. This is slower (hundreds of ms) but correct, and it only happens once.</li>
+  <li><strong>The ranking service is slow or down:</strong> after its deadline (say 80 ms) the News Feed Service <strong>degrades gracefully</strong> to a simple reverse-chronological order of the candidates. A slightly worse feed beats an error screen. See <a href="resilience-patterns.html">resilience patterns</a>.</li>
+  <li><strong>Some Cassandra replicas are slow:</strong> hedged requests or a lower consistency level (e.g. <code>ONE</code>) keep reads fast. Posts that can't be hydrated in time are dropped from this page rather than blocking it.</li>
+  <li><strong>A cache node holding a celebrity's post gets hot:</strong> replicate hot keys across nodes or keep a small in-process cache in each News Feed Service instance (see <a href="caching.html">caching</a> on hot keys).</li>
+  <li><strong>The whole feed backend is unavailable:</strong> the app keeps showing its cached feed with a "Couldn't refresh feed" banner and retries with backoff. A <a href="resilience-patterns.html">circuit breaker</a> at the gateway stops retries from overwhelming a recovering service.</li>
+  <li><strong>CDN edge miss storm or PoP failure:</strong> the origin shield collapses requests. Anycast or DNS moves users to the next PoP. Images load more slowly but still load.</li>
+</ul>
+
+<!-- ============================ FLOW 4 ============================ -->
+<h2>6. Flow 4 — Liking a post</h2>
+<p>Likes are the highest-volume <em>write</em> in Instagram (assume ~5 billion a day, ~60k/s on average, with heavy spikes on viral posts). Each one is tiny, but together they create two classic problems: <strong>hot keys</strong> (millions of people liking the same celebrity post) and <strong>counting at scale</strong>. The user, meanwhile, expects the heart to turn red instantly.</p>
+
+<pre class="ascii">
+  Clients      LB +       Like &amp;     Post Meta   Feed Cache    Kafka   Notification    Analytics
+            API Gateway   Comment   (Cassandra)    (Redis)                Service        &amp; ML
+     |           |           |           |            |          |           |             |
+     |-- 1 heart turns red, count+1 (optimistic)      |          |           |             |
+     | 2 PUT /v1/posts/{id}/like         |            |          |           |             |
+     |----------&gt;|           |           |            |          |           |             |
+     |           | 3 route   |           |            |          |           |             |
+     |           |----------&gt;|           |            |          |           |             |
+     |           |           | 4 upsert likes_by_post |          |           |             |
+     |           |           |----------&gt;|            |          |           |             |
+     |           |           | 5 was it new?          |          |           |             |
+     |           |           |&lt;..........|            |          |           |             |
+     |           |           | 6 INCR like_count:{post}:{shard}  |           |             |
+     |           |           |-----------------------&gt;|          |           |             |
+     |           |           | 7 like.created         |          |           |             |
+     |           |           |~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~&gt;|           |             |
+     | 8 200 OK  |           |           |            |          |           |             |
+     |&lt;......................|           |            |          |           |             |
+     |           |           |           |            |          | 9 aggregate, push       |
+     |           |           |           |            |          |~~~~~~~~~~&gt;|             |
+     |           |           |           |            |          | 10 ranking signal       |
+     |           |           |           |            |          |~~~~~~~~~~~~~~~~~~~~~~~~&gt;|
+     |           |           |           |            |          |           |             |
+
+legend:  ----&gt; synchronous call    ....&gt; response    ~~~~&gt; asynchronous event (Kafka)    -- local work
+</pre>
+<ol class="steps">
+  <li><strong>Clients (local):</strong> the heart turns red and the count goes up by one <em>immediately</em>. This is <strong>optimistic UI</strong>: the app assumes success and reconciles later (see <a href="clients.html">clients</a>).</li>
+  <li><strong>Clients → LB + API Gateway:</strong> <code>PUT /v1/posts/{post_id}/like</code>. <code>PUT</code> rather than <code>POST</code> because liking is naturally idempotent: "make it so that I like this post".</li>
+  <li><strong>API Gateway → Like &amp; Comment:</strong> authenticated and rate limited (bots that like 1,000 posts a minute get throttled), then routed.</li>
+  <li><strong>Like &amp; Comment → Post/Comment/Story Metadata (Cassandra):</strong> upserts a row into <code>likes_by_post</code> (partition key <code>post_id</code>, clustering key <code>user_id</code>), plus a mirror row in <code>likes_by_user</code> for "posts you've liked". The primary key <code>(post_id, user_id)</code> means a repeated like overwrites the same row, so the write is idempotent. See <a href="likes-comments.html">likes &amp; comments</a>.</li>
+  <li><strong>Post/Comment/Story Metadata → Like &amp; Comment:</strong> the service needs to know whether this like is <em>new</em> before touching the counter. It can do a cheap read-before-write, or a set-add in Redis that returns 1 for new and 0 for existing.</li>
+  <li><strong>Like &amp; Comment → Feed Cache (Redis):</strong> if new, <code>INCR like_count:{post_id}:{shard}</code>, where <code>shard</code> is random in 0..N−1 for hot posts. Splitting one hot counter into N sub-counters spreads the writes across N keys and nodes; reads sum them. A periodic job flushes counts durably into Cassandra.</li>
+  <li><strong>Like &amp; Comment → Kafka:</strong> publishes <code>like.created {post_id, liker_id, owner_id}</code> keyed by <code>post_id</code>.</li>
+  <li><strong>Like &amp; Comment → Clients:</strong> <code>200 OK</code>. Total server time ~10–20 ms.</li>
+  <li><strong>Kafka → Notification Service:</strong> aggregates likes rather than sending one push per like. You get "alice and 23 others liked your photo", sent at most once every few minutes per post, then delivered through Flow 9.</li>
+  <li><strong>Kafka → Analytics &amp; ML Training:</strong> likes are among the strongest signals for feed and Explore ranking, and early like velocity is a ranking feature for the post itself.</li>
+</ol>
+
+<h3>6.1 Latency budget</h3>
+<div class="table-wrap"><table>
+  <tr><th>Stage</th><th>Assumed time</th></tr>
+  <tr><td>UI feedback</td><td><b>0 ms</b> (optimistic)</td></tr>
+  <tr><td>Network RTT</td><td>40 ms</td></tr>
+  <tr><td>Gateway</td><td>3 ms</td></tr>
+  <tr><td>Cassandra upsert (quorum write across replicas in one region)</td><td>3–8 ms</td></tr>
+  <tr><td>Redis INCR + Kafka publish (async, acks from the leader)</td><td>2–5 ms</td></tr>
+  <tr><td><b>Request complete</b></td><td><b>~55 ms</b>, invisible to the user</td></tr>
+  <tr><td>Post owner gets a push</td><td>seconds to minutes (aggregation window)</td></tr>
+</table></div>
+
+<h3>6.2 What happens on failure</h3>
+<ul>
+  <li><strong>The request fails or times out:</strong> the app retries in the background with exponential backoff. Because the operation is idempotent, a retry after a "lost" success does no harm. If it finally gives up, the heart quietly turns back to grey.</li>
+  <li><strong>Double-tap, like, unlike, like in one second:</strong> the client debounces and sends only the final state. The server applies requests in order per user, and each request carries a client timestamp so a stale "unlike" can't overwrite a newer "like".</li>
+  <li><strong>Redis counter node lost:</strong> counts are approximate anyway. They can be rebuilt from the durable Cassandra totals plus a replay of recent <code>like.created</code> events. Users may briefly see a count that's slightly off, which is an acceptable eventual-consistency trade (see <a href="cap-consistency.html">consistency models</a>).</li>
+  <li><strong>Viral post hot partition:</strong> the <code>likes_by_post</code> partition for one post can grow to tens of millions of rows. Bucket it as <code>(post_id, bucket)</code> so no single Cassandra partition grows unbounded (see <a href="sharding.html">sharding</a> on hot spots).</li>
+  <li><strong>Notification Service lagging:</strong> likes still succeed. Notifications arrive late, which nobody notices.</li>
+</ul>
+
+<!-- ============================ FLOW 5 ============================ -->
+<h2>7. Flow 5 — Following a user</h2>
+<p>Alice taps <em>Follow</em> on Bob's profile. The source of truth is a single relationship, but it must be stored <strong>twice</strong>, once on each user's side, because Instagram needs both "whom does Alice follow?" (to build Alice's feed) and "who follows Bob?" (to fan out Bob's posts). Those two lists live on different shards.</p>
+
+<pre class="ascii">
+  Clients      LB +       Follow/     User DB     Social Graph   Feed Cache    Kafka    Fan-out  Notification
+            API Gateway    Graph   (PostgreSQL)       store        (Redis)              Workers     Service
+     |           |           |           |              |             |          |         |           |
+     |-- 1 button shows Following (optimistic)          |             |          |         |           |
+     | 2 POST /v1/users/{bob}/follow     |              |             |          |         |           |
+     |----------&gt;|           |           |              |             |          |         |           |
+     |           | 3 rate limit, route   |              |             |          |         |           |
+     |           |----------&gt;|           |              |             |          |         |           |
+     |           |           | 4 bob private? blocked?  |             |          |         |           |
+     |           |           |----------&gt;|              |             |          |         |           |
+     |           |           | 5 following(alice -&gt; bob)|             |          |         |           |
+     |           |           |-------------------------&gt;|             |          |         |           |
+     |           |           | 6 followers(bob &lt;- alice)|             |          |         |           |
+     |           |           |-------------------------&gt;|             |          |         |           |
+     |           |           | 7 INCR follower counts   |             |          |         |           |
+     |           |           |---------------------------------------&gt;|          |         |           |
+     |           |           | 8 follow.created         |             |          |         |           |
+     |           |           |~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~&gt;|         |           |
+     | 9 200 {state: following}          |              |             |          |         |           |
+     |&lt;......................|           |              |             |          |         |           |
+     |           |           |           |              |             |          | 10 consume          |
+     |           |           |           |              |             |          |~~~~~~~~&gt;|           |
+     |           |           |           |              |             | 11 backfill bob's posts        |
+     |           |           |           |              |             |&lt;-------------------|           |
+     |           |           |           |              |             |          | 12 'alice followed you'
+     |           |           |           |              |             |          |~~~~~~~~~~~~~~~~~~~~&gt;|
+     |           |           |           |              |             |          |         |           |
+
+legend:  ----&gt; synchronous call    ....&gt; response    ~~~~&gt; asynchronous event (Kafka)    -- local work
+</pre>
+<ol class="steps">
+  <li><strong>Clients (local):</strong> the button changes to <em>Following</em> optimistically, or <em>Requested</em> if the app already knows the account is private.</li>
+  <li><strong>Clients → LB + API Gateway:</strong> <code>POST /v1/users/{bob_id}/follow</code>.</li>
+  <li><strong>API Gateway → Follow/Graph:</strong> authenticated and rate limited. Follow limits (e.g. 200 per hour) are a key anti-spam measure. The gateway then routes the request.</li>
+  <li><strong>Follow/Graph → User DB (PostgreSQL):</strong> is Bob's account private? Has Bob blocked Alice? These settings are read through a cache. A private account creates a <code>follow_request</code> instead of an edge, and the flow ends with <code>{state: requested}</code>.</li>
+  <li><strong>Follow/Graph → Social Graph store:</strong> writes the forward edge <code>following(alice_id → bob_id, created_at)</code> on Alice's shard.</li>
+  <li><strong>Follow/Graph → Social Graph store:</strong> writes the reverse edge <code>followers(bob_id ← alice_id, created_at)</code> on Bob's shard. These are two writes on two shards with no distributed transaction. See the failure section for how they're kept consistent, and <a href="social-graph.html">social graph</a> for the data model.</li>
+  <li><strong>Follow/Graph → Feed Cache (Redis):</strong> increments Alice's <code>following_count</code> and Bob's <code>follower_count</code>.</li>
+  <li><strong>Follow/Graph → Kafka:</strong> publishes <code>follow.created {follower: alice, followee: bob}</code>.</li>
+  <li><strong>Follow/Graph → Clients:</strong> <code>200 {state: "following"}</code>.</li>
+  <li><strong>Kafka → Feed Fan-out Workers:</strong> consume the follow event.</li>
+  <li><strong>Feed Fan-out Workers → Feed Cache (Redis):</strong> <strong>backfill</strong>. Bob's last ~10–20 posts are inserted into Alice's timeline, so his content appears the next time she pulls to refresh, instead of only after his next post. Celebrities are skipped because they're pulled at read time anyway.</li>
+  <li><strong>Kafka → Notification Service:</strong> "alice started following you" to Bob (Flow 9). Kafka → Analytics &amp; ML Training also consumes the event: new edges feed "Suggested for you" and affinity features.</li>
+</ol>
+<p><strong>Unfollow</strong> is the mirror image: delete both edges, decrement counters, publish <code>follow.deleted</code>. Rather than deleting Bob's posts from Alice's Redis timeline eagerly, the News Feed Service filters them out at read time because Bob is no longer in her following set, and they age out of the timeline naturally.</p>
+
+<h3>7.1 What happens on failure</h3>
+<ul>
+  <li><strong>Forward edge written, reverse edge write fails:</strong> the graph is now inconsistent: Alice "follows" Bob, but Bob's follower list doesn't include her, so she won't receive his posts. Fixes, from simplest to most robust: (a) retry the second write with backoff; (b) write only the forward edge synchronously and let a Kafka consumer of <code>follow.created</code> write the reverse edge idempotently, which gives at-least-once delivery and eventual consistency; (c) run a periodic repair job that compares the two indexes. A <a href="resilience-patterns.html">saga</a> mindset ("every step has a retry or a compensation") is the right frame.</li>
+  <li><strong>Double tap or retries:</strong> edge writes are upserts keyed on <code>(follower, followee)</code>, so they're idempotent. Counters are only incremented when the edge was actually new.</li>
+  <li><strong>Backfill lags:</strong> Alice doesn't see Bob's old posts for a few seconds. That's harmless.</li>
+  <li><strong>Follow/unfollow spam bots:</strong> rate limits at the gateway and abuse models in Analytics &amp; ML Training throttle or block them (see <a href="security.html">security</a>).</li>
+</ul>
+
+<!-- ============================ FLOW 6 ============================ -->
+<h2>8. Flow 6 — Posting and viewing a story</h2>
+<p>Stories look like posts, but they behave differently in three ways. They <strong>expire after 24 hours</strong>, so every storage layer needs a TTL. They're consumed as a <strong>tray</strong> of accounts at the top of the feed rather than as individual items. And they're mostly <strong>video</strong>, so playback must start instantly. See <a href="stories.html">stories &amp; TTL data</a>.</p>
+
+<h3>8.1 Posting a story</h3>
+<pre class="ascii">
+  Clients      LB +       Stories   Object    Story Meta    Kafka    Media Proc.   Fan-out  Feed Cache
+            API Gateway   Service   Storage   (Cassandra)              Workers     Workers    (Redis)
+     |           |           |         |           |          |           |           |          |
+     | 1 POST /v1/stories/uploads      |           |          |           |           |          |
+     |----------&gt;|           |         |           |          |           |           |          |
+     |           | 2 route   |         |           |          |           |           |          |
+     |           |----------&gt;|         |           |          |           |           |          |
+     | 3 pre-signed PUT URL  |         |           |          |           |           |          |
+     |&lt;......................|         |           |          |           |           |          |
+     | 4 PUT photo/video     |         |           |          |           |           |          |
+     |--------------------------------&gt;|           |          |           |           |          |
+     | 5 POST /v1/stories (via LB+GW)  |           |          |           |           |          |
+     |----------------------&gt;|         |           |          |           |           |          |
+     |           |           | 6 INSERT ... USING TTL 86400   |           |           |          |
+     |           |           |--------------------&gt;|          |           |           |          |
+     |           |           | 7 story.created     |          |           |           |          |
+     |           |           |~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~&gt;|           |           |          |
+     | 8 201 (your ring updates)       |           |          |           |           |          |
+     |&lt;......................|         |           |          |           |           |          |
+     |           |           |         |           |          | 9 transcode HLS, thumbnails      |
+     |           |           |         |           |          |~~~~~~~~~~&gt;|           |          |
+     |           |           |         | 10 PUT segments      |           |           |          |
+     |           |           |         |&lt;---------------------------------|           |          |
+     |           |           |         |           |          | 11 consume|           |          |
+     |           |           |         |           |          |~~~~~~~~~~~~~~~~~~~~~~&gt;|          |
+     |           |           |         |           |          |           |           | 12 ZADD author to trays
+     |           |           |         |           |          |           |           |---------&gt;|
+     |           |           |         |           |          |           |           |          |
+
+legend:  ----&gt; synchronous call    ....&gt; response    ~~~~&gt; asynchronous event (Kafka)    -- local work
+</pre>
+<ol class="steps">
+  <li><strong>Clients → LB + API Gateway:</strong> <code>POST /v1/stories/uploads</code> to request an upload slot.</li>
+  <li><strong>API Gateway → Stories Service:</strong> authenticated, routed.</li>
+  <li><strong>Stories Service → Clients:</strong> a new <code>story_id</code> and a pre-signed PUT URL, exactly as in Flow 2 (see <a href="media-upload.html">media upload</a>).</li>
+  <li><strong>Clients → Object Storage:</strong> the photo or the 15-second video clip is uploaded directly. The object goes under a <code>stories/</code> prefix that has a lifecycle rule to delete objects after ~24–48 h unless they were archived.</li>
+  <li><strong>Clients → Stories Service (via LB + API Gateway):</strong> <code>POST /v1/stories {story_id, stickers, close_friends_only}</code>.</li>
+  <li><strong>Stories Service → Post/Comment/Story Metadata (Cassandra):</strong> <code>INSERT INTO stories_by_user (...) USING TTL 86400</code>. Cassandra deletes the row automatically after 24 h. No cron job is needed, though tombstone compaction must be tuned (see <a href="indexing.html">LSM trees</a>).</li>
+  <li><strong>Stories Service → Kafka:</strong> <code>story.created</code>.</li>
+  <li><strong>Stories Service → Clients:</strong> <code>201</code>. Your own avatar gets the coloured ring immediately.</li>
+  <li><strong>Kafka → Media Processing Workers:</strong> transcode the video into short HLS segments at 2–4 bitrates and produce a thumbnail. Photos get renditions as in Flow 2.</li>
+  <li><strong>Media Processing Workers → Object Storage:</strong> write the segments and manifests, then mark the story as ready.</li>
+  <li><strong>Kafka → Feed Fan-out Workers:</strong> consume <code>story.created</code> once the media is ready.</li>
+  <li><strong>Feed Fan-out Workers → Feed Cache (Redis):</strong> for each (non-celebrity) author, <code>ZADD tray:{follower_id} {ts} {author_id}</code> with a key TTL just over 24 h. Note that the tray stores <em>authors</em>, not individual stories: posting 10 stories updates the tray once.</li>
+</ol>
+
+<h3>8.2 Viewing the stories tray</h3>
+<pre class="ascii">
+  Clients      LB +       Stories  Feed Cache    Follow/   Story Meta     CDN     Kafka
+            API Gateway   Service    (Redis)      Graph    (Cassandra)
+     |           |           |          |           |           |          |        |
+     | 13 GET /v1/stories/tray          |           |           |          |        |
+     |----------&gt;|           |          |           |           |          |        |
+     |           | 14 route  |          |           |           |          |        |
+     |           |----------&gt;|          |           |           |          |        |
+     |           |           | 15 tray:{uid} (pushed authors)   |          |        |
+     |           |           |---------&gt;|           |           |          |        |
+     |           |           | 16 followed celebs with live story          |        |
+     |           |           |---------------------&gt;|           |          |        |
+     |           |           | 17 live items per author         |          |        |
+     |           |           |---------------------------------&gt;|          |        |
+     |           |           |-- 18 drop expired, rank by closeness        |        |
+     | 19 tray + signed CDN URLs        |           |           |          |        |
+     |&lt;......................|          |           |           |          |        |
+     | 20 prefetch first segments       |           |           |          |        |
+     |--------------------------------------------------------------------&gt;|        |
+     | 21 POST /v1/stories/seen (batched)           |           |          |        |
+     |----------------------&gt;|          |           |           |          |        |
+     |           |           | 22 story.seen        |           |          |        |
+     |           |           |~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~&gt;|
+     |           |           |          |           |           |          |        |
+
+legend:  ----&gt; synchronous call    ....&gt; response    ~~~~&gt; asynchronous event (Kafka)    -- local work
+</pre>
+<ol class="steps" start="13">
+  <li><strong>Clients → LB + API Gateway:</strong> <code>GET /v1/stories/tray</code>, fired in parallel with the feed request on app open.</li>
+  <li><strong>API Gateway → Stories Service:</strong> routed.</li>
+  <li><strong>Stories Service → Feed Cache (Redis):</strong> reads <code>tray:{uid}</code>, the authors pushed by fan-out.</li>
+  <li><strong>Stories Service → Follow/Graph:</strong> followed celebrities whose stories weren't pushed (pull side of the hybrid), filtered by a cached "has active story" flag.</li>
+  <li><strong>Stories Service → Post/Comment/Story Metadata (Cassandra):</strong> live story items for the first ~10 authors (rows past their TTL simply don't come back), plus the viewer's <em>seen</em> state.</li>
+  <li><strong>Stories Service (local):</strong> drops expired or fully-seen authors, then ranks the tray with unseen first, ordered by closeness (how often you interact with them).</li>
+  <li><strong>Stories Service → Clients:</strong> the ordered tray with signed CDN URLs for the first items.</li>
+  <li><strong>Clients → CDN:</strong> the app prefetches the first segment of the first few stories, so tapping an avatar starts playback in under ~100 ms.</li>
+  <li><strong>Clients → Stories Service:</strong> as the user watches, seen events are batched (e.g. every 5 s) into <code>POST /v1/stories/seen</code>.</li>
+  <li><strong>Stories Service → Kafka:</strong> <code>story.seen</code>. Consumers append the viewer to the author's "seen by" list, which is also stored with a TTL, and feed Analytics &amp; ML Training.</li>
+</ol>
+
+<h3>8.3 Latency budget &amp; failure handling</h3>
+<div class="table-wrap"><table>
+  <tr><th>Stage</th><th>Assumed time</th><th>If it fails…</th></tr>
+  <tr><td>Tray request (server)</td><td>~40 ms</td><td>Show the tray cached on the device. The tray is non-critical, so the feed still loads.</td></tr>
+  <tr><td>First segment from CDN (prefetched)</td><td>~0–30 ms</td><td>Miss → origin pull (~150 ms). Player shows the thumbnail meanwhile.</td></tr>
+  <tr><td>Adaptive bitrate switches</td><td>per segment (~2 s)</td><td>Bad network → player drops to a lower bitrate rather than stalling.</td></tr>
+  <tr><td>Seen events</td><td>async, batched</td><td>Lost batch → the story may show as unseen again. Retried with idempotent (viewer, story) keys.</td></tr>
+  <tr><td>Expiry</td><td>exactly 24 h</td><td>TTLs in Cassandra and Redis plus lifecycle rules in Object Storage. The API also filters <code>created_at &lt; now − 24h</code> as a safety net, so a late deletion is never <em>visible</em>.</td></tr>
+</table></div>
+
+<!-- ============================ FLOW 7 ============================ -->
+<h2>9. Flow 7 — Search with typeahead</h2>
+<p>The user types <code>s</code>, <code>se</code>, <code>sel</code>… and suggestions (accounts, hashtags, places) must appear <em>as they type</em>. Every keystroke is potentially a request, so typeahead traffic is many times larger than "real" search traffic, and the latency target is aggressive: <strong>under ~100 ms</strong> end to end, or the suggestions lag behind the fingers. See <a href="search.html">search &amp; inverted indexes</a>.</p>
+
+<pre class="ascii">
+  Clients      LB +       Search   Feed Cache    Follow/    Search Index      CDN
+            API Gateway   Service    (Redis)      Graph    (Elasticsearch)
+     |           |           |          |           |             |            |
+     |-- 1 debounce ~100 ms, show local recents     |             |            |
+     | 2 GET /v1/search/typeahead?q=sel |           |             |            |
+     |----------&gt;|           |          |           |             |            |
+     |           | 3 rate limit, route  |           |             |            |
+     |           |----------&gt;|          |           |             |            |
+     |           |           | 4 prefix cache 'sel'?|             |            |
+     |           |           |---------&gt;|           |             |            |
+     |           |           | 5 miss   |           |             |            |
+     |           |           |&lt;.........|           |             |            |
+     |           |           | 6 completion / edge-ngram query    |            |
+     |           |           |-----------------------------------&gt;|            |
+     |           |           | 7 my followees &amp; affinities        |            |
+     |           |           |---------------------&gt;|             |            |
+     |           |           |-- 8 blend + personal boost, top 10 |            |
+     |           |           | 9 SET prefix cache (TTL)           |            |
+     |           |           |---------&gt;|           |             |            |
+     | 10 results + avatar URLs         |           |             |            |
+     |&lt;......................|          |           |             |            |
+     | 11 GET avatars        |          |           |             |            |
+     |------------------------------------------------------------------------&gt;|
+     |           |           |          |           |             |            |
+
+legend:  ----&gt; synchronous call    ....&gt; response    ~~~~&gt; asynchronous event (Kafka)    -- local work
+</pre>
+<ol class="steps">
+  <li><strong>Clients (local):</strong> the app shows recent searches and a client-side cache of earlier results instantly, and <strong>debounces</strong>: it waits ~100 ms after the last keystroke before sending, so typing "selena" quickly sends one or two requests instead of six.</li>
+  <li><strong>Clients → LB + API Gateway:</strong> <code>GET /v1/search/typeahead?q=sel&amp;seq=17</code>. The <code>seq</code> lets the app discard responses that arrive out of order.</li>
+  <li><strong>API Gateway → Search Service:</strong> rate limited per user, since typeahead is an easy target for scraping, then routed.</li>
+  <li><strong>Search Service → Feed Cache (Redis):</strong> checks a <strong>prefix result cache</strong> for <code>sel</code>. Short, popular prefixes have a very high hit ratio because millions of people type the same first letters.</li>
+  <li><strong>Feed Cache → Search Service:</strong> miss in this example.</li>
+  <li><strong>Search Service → Search Index (Elasticsearch):</strong> a prefix query against fields indexed with edge n-grams or a completion suggester (a trie-like structure in memory), across the users, hashtags and places indexes. Results are pre-sorted by global popularity (follower count, hashtag volume).</li>
+  <li><strong>Search Service → Follow/Graph:</strong> fetches the user's followees and top interaction partners (cached) for personalisation, in parallel with step 6.</li>
+  <li><strong>Search Service (local):</strong> blends the results and boosts accounts you follow or talk to. "sel" should show your friend <em>selin_k</em> above a global celebrity if you message her daily. Keeps the top ~10.</li>
+  <li><strong>Search Service → Feed Cache (Redis):</strong> stores the <em>global</em> (non-personalised) part under the prefix key with a short TTL (minutes). Personalisation is re-applied on every request.</li>
+  <li><strong>Search Service → Clients:</strong> the results, with usernames, verified badges and avatar CDN URLs.</li>
+  <li><strong>Clients → CDN:</strong> avatars, tiny 150 px renditions that are almost always edge hits.</li>
+</ol>
+<p><strong>How results get into the index</strong> is the asynchronous half. When a user signs up, changes their username or posts with a new hashtag, an event flows like this:</p>
+<div class="flow">
+  <div class="fnode svc">User/Auth Service<small>username changed</small></div><div class="farrow">→<small>user.updated</small></div>
+  <div class="fnode async">Kafka</div><div class="farrow">→<small>consume</small></div>
+  <div class="fnode async">Search Indexer<small>build document</small></div><div class="farrow">→<small>bulk index</small></div>
+  <div class="fnode store">Search Index<small>Elasticsearch, ~1 s refresh</small></div>
+</div>
+<p>Elasticsearch makes new documents searchable after its <em>refresh interval</em> (~1 s by default), so search is <strong>near-real-time</strong> and eventually consistent with the source-of-truth databases.</p>
+
+<h3>9.1 Latency budget</h3>
+<div class="table-wrap"><table>
+  <tr><th>Stage</th><th>Assumed time</th></tr>
+  <tr><td>Debounce (client, not counted as server time)</td><td>~100 ms after last keystroke</td></tr>
+  <tr><td>Network RTT</td><td>40 ms</td></tr>
+  <tr><td>Gateway</td><td>3 ms</td></tr>
+  <tr><td>Prefix cache hit / Elasticsearch on miss</td><td>1 ms / 15–40 ms</td></tr>
+  <tr><td>Personalisation (parallel) + blend</td><td>5 ms</td></tr>
+  <tr><td><b>Total per keystroke</b></td><td><b>~50 ms on hit, ~90 ms on miss</b></td></tr>
+</table></div>
+
+<h3>9.2 What happens on failure</h3>
+<ul>
+  <li><strong>Elasticsearch slow or a shard down:</strong> a query fans out to all shards, so it's as slow as the slowest one. The Search Service sets a tight timeout and returns <em>partial results</em> from the shards that answered. The user rarely notices a slightly incomplete suggestion list.</li>
+  <li><strong>The whole index is unavailable:</strong> serve from the prefix cache and the client's recent searches only. Full search shows "Try again later". Search is non-critical, so the rest of the app is unaffected (a <a href="resilience-patterns.html">bulkhead</a>).</li>
+  <li><strong>Indexer lag:</strong> a renamed account is unfindable by its new name for a few seconds or minutes. Acceptable eventual consistency, and recovery is automatic as the consumer catches up.</li>
+  <li><strong>Out-of-order responses:</strong> the response for "se" arrives after the one for "sel". The client compares <code>seq</code> and ignores stale responses.</li>
+</ul>
+
+<!-- ============================ FLOW 8 ============================ -->
+<h2>10. Flow 8 — Sending a direct message</h2>
+<p>DMs are different from everything above. They need <strong>real-time push</strong> from server to client, <strong>strict ordering</strong> within a conversation, <strong>exactly-once display</strong> despite retries, and <strong>delivery receipts</strong>. The connection model therefore changes from request/response HTTP to a long-lived <strong>WebSocket</strong> (or MQTT, which public talks describe Meta using for its messaging apps). See <a href="direct-messaging.html">direct messaging</a> and <a href="api-design.html">API design</a>.</p>
+
+<h3>10.1 Recipient online</h3>
+<pre class="ascii">
+    Alice        LB +        Direct    Messages      Redis         Bob
+  (Clients)   API Gateway   Messaging    Store    (presence)    (Clients)
+      |            |            |          |           |            |
+      | 1 WebSocket upgrade (JWT)          |           |            |
+      |-----------&gt;|            |          |           |            |
+      |            | 2 pinned to a connection server   |            |
+      |            |-----------&gt;|          |           |            |
+      |            |            | 3 SET online:alice = host-3       |
+      |            |            |---------------------&gt;|            |
+      | 4 send {client_msg_id, thread, text}           |            |
+      |------------------------&gt;|          |           |            |
+      |            |            |-- 5 authz + assign per-thread seq |
+      |            |            | 6 INSERT (thread_id, seq, ...)    |
+      |            |            |---------&gt;|           |            |
+      | 7 ack seq=42 (sent)     |          |           |            |
+      |&lt;........................|          |           |            |
+      |            |            | 8 where is bob?      |            |
+      |            |            |---------------------&gt;|            |
+      |            |            | 9 host-17|           |            |
+      |            |            |&lt;.....................|            |
+      |            |            | 10 push over bob's WebSocket      |
+      |            |            |----------------------------------&gt;|
+      |            |            | 11 delivered ack     |            |
+      |            |            |&lt;..................................|
+      | 12 delivered receipt    |          |           |            |
+      |&lt;........................|          |           |            |
+      |            |            |          |           |            |
+
+legend:  ----&gt; synchronous call    ....&gt; response    ~~~~&gt; asynchronous event (Kafka)    -- local work
+</pre>
+<ol class="steps">
+  <li><strong>Alice's Clients → LB + API Gateway:</strong> when the app opens it upgrades an HTTPS connection to a WebSocket, authenticating once with the JWT. The connection then stays open for the whole session, with heartbeats every ~30 s.</li>
+  <li><strong>LB → Direct Messaging:</strong> the connection is pinned to one connection server (a "chat gateway" host inside the Direct Messaging tier). The connection is stateful, so this is one of the few places where <a href="load-balancer.html">sticky routing</a> matters.</li>
+  <li><strong>Direct Messaging → Redis (presence):</strong> <code>SET online:alice host-3 EX 60</code>, refreshed by heartbeats. This presence and connection registry is a Redis cluster like the Feed Cache, and tells the system <em>which</em> server holds a user's socket.</li>
+  <li><strong>Alice → Direct Messaging:</strong> sends <code>{client_msg_id: uuid, thread_id, text: "hey!"}</code> over the socket. The <code>client_msg_id</code> is the idempotency key for retries.</li>
+  <li><strong>Direct Messaging (local):</strong> checks Alice is a member of the thread and not blocked, deduplicates on <code>client_msg_id</code>, and assigns the next <strong>per-thread sequence number</strong> (e.g. 42). Ordering per conversation is what matters; global ordering is unnecessary and expensive.</li>
+  <li><strong>Direct Messaging → Messages Store:</strong> <code>INSERT</code> into a table partitioned by <code>thread_id</code> and clustered by <code>seq</code>. A conversation is one partition, read sequentially, which suits Cassandra or HBase.</li>
+  <li><strong>Direct Messaging → Alice:</strong> ack with <code>seq = 42</code>. Alice's app now shows the message as <em>sent</em> (one tick). The message is durable before it's acknowledged.</li>
+  <li><strong>Direct Messaging → Redis (presence):</strong> where is Bob connected?</li>
+  <li><strong>Redis → Direct Messaging:</strong> <code>host-17</code>.</li>
+  <li><strong>Direct Messaging → Bob's Clients:</strong> host-3 forwards the message to host-17 (via internal RPC or a pub/sub channel), which pushes it down Bob's open WebSocket.</li>
+  <li><strong>Bob's Clients → Direct Messaging:</strong> a <em>delivered</em> ack for seq 42. The app also records that it has everything up to seq 42 for this thread.</li>
+  <li><strong>Direct Messaging → Alice:</strong> a delivered receipt. When Bob opens the thread, a <em>read</em> receipt follows the same path.</li>
+</ol>
+
+<h3>10.2 Recipient offline</h3>
+<pre class="ascii">
+    Alice      Direct    Messages      Redis      Kafka   Notification   Push Providers       Bob
+  (Clients)   Messaging    Store    (presence)               Service        APNs/FCM       (Clients)
+      |           |          |           |          |           |               |              |
+      | 1 send message (WebSocket)       |          |           |               |              |
+      |----------&gt;|          |           |          |           |               |              |
+      |           | 2 INSERT (thread_id, seq)       |           |               |              |
+      |           |---------&gt;|           |          |           |               |              |
+      | 3 sent    |          |           |          |           |               |              |
+      |&lt;..........|          |           |          |           |               |              |
+      |           | 4 where is bob?      |          |           |               |              |
+      |           |---------------------&gt;|          |           |               |              |
+      |           | 5 no live connection |          |           |               |              |
+      |           |&lt;.....................|          |           |               |              |
+      |           | 6 message.created (offline)     |           |               |              |
+      |           |~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~&gt;|           |               |              |
+      |           |          |           |          | 7 consume |               |              |
+      |           |          |           |          |~~~~~~~~~~&gt;|               |              |
+      |           |          |           |          |           | 8 push 'Alice: hey!'         |
+      |           |          |           |          |           |--------------&gt;|              |
+      |           |          |           |          |           |               | 9 OS shows banner
+      |           |          |           |          |           |               |-------------&gt;|
+      |           |          |           |          |           |               |              |-- 10 Bob taps
+      |           | 11 reconnect + sync(after seq N)|           |               |              |
+      |           |&lt;---------------------------------------------------------------------------|
+      |           | 12 read thread where seq &gt; N    |           |               |              |
+      |           |---------&gt;|           |          |           |               |              |
+      |           | 13 missed messages   |          |           |               |              |
+      |           |...........................................................................&gt;|
+      | 14 delivered receipt |           |          |           |               |              |
+      |&lt;..........|          |           |          |           |               |              |
+      |           |          |           |          |           |               |              |
+
+legend:  ----&gt; synchronous call    ....&gt; response    ~~~~&gt; asynchronous event (Kafka)    -- local work
+</pre>
+<ol class="steps">
+  <li><strong>Alice's Clients → Direct Messaging:</strong> sends over her WebSocket, exactly as before.</li>
+  <li><strong>Direct Messaging → Messages Store:</strong> persists with the next sequence number. The store is the <em>mailbox</em>, so nothing depends on Bob being online.</li>
+  <li><strong>Direct Messaging → Alice:</strong> <em>sent</em> ack.</li>
+  <li><strong>Direct Messaging → Redis (presence):</strong> where is Bob?</li>
+  <li><strong>Redis → Direct Messaging:</strong> no key, because Bob's presence entry expired when his heartbeats stopped.</li>
+  <li><strong>Direct Messaging → Kafka:</strong> <code>message.created {thread_id, seq, recipient: bob, offline: true}</code>.</li>
+  <li><strong>Kafka → Notification Service:</strong> consumes it, checks Bob's preferences (thread muted?), and collapses bursts ("Alice sent 5 messages").</li>
+  <li><strong>Notification Service → Push Providers APNs/FCM:</strong> sends a push with a short preview (or just "New message" if previews are disabled). Details in Flow 9.</li>
+  <li><strong>Push Providers APNs/FCM → Bob's Clients:</strong> the phone OS displays the banner even though the app isn't running.</li>
+  <li><strong>Bob's Clients (local):</strong> Bob taps the notification.</li>
+  <li><strong>Bob's Clients → Direct Messaging:</strong> the app opens a WebSocket and sends <code>sync {thread_id, after_seq: N}</code> for each thread, where N is the last seq it has stored locally. This is the key idea: the client <em>pulls the gap</em>, so delivery stays correct even if pushes are lost or arrive out of order.</li>
+  <li><strong>Direct Messaging → Messages Store:</strong> <code>SELECT ... WHERE thread_id = ? AND seq &gt; N</code>, a single-partition range scan.</li>
+  <li><strong>Direct Messaging → Bob's Clients:</strong> the missed messages, in order.</li>
+  <li><strong>Direct Messaging → Alice:</strong> delivered receipts flow back to Alice, if she's online.</li>
+</ol>
+
+<h3>10.3 Latency budget &amp; failure handling</h3>
+<div class="table-wrap"><table>
+  <tr><th>Stage</th><th>Assumed time</th><th>Failure behaviour</th></tr>
+  <tr><td>Alice → server → durable write → ack</td><td>~50 ms (RTT + ~5 ms write)</td><td>No ack within ~5 s → client resends the same <code>client_msg_id</code>; the server dedupes. Unsent messages show a red "!" with retry.</td></tr>
+  <tr><td>Server → Bob (online)</td><td>~25 ms extra (cross-host hop + half RTT)</td><td>Bob's socket died silently → no delivered ack → the message stays in the store and is fetched on reconnect via sync.</td></tr>
+  <tr><td>End-to-end online delivery</td><td><b>~100 ms</b></td><td>Connection server crashes → all its clients reconnect (with jittered backoff to avoid a thundering herd) to other hosts and resync.</td></tr>
+  <tr><td>Offline push</td><td>~1–3 s (APNs/FCM are best-effort)</td><td>Push lost → no data lost; Bob still gets everything on the next app open.</td></tr>
+</table></div>
+<div class="callout warn"><span class="callout-title">⚠️ Push is a hint, not a transport</span>
+A common interview mistake is to treat APNs/FCM as the delivery channel. Push providers may delay, collapse or drop notifications. The Messages Store plus <em>sync-from-last-seq</em> is the real delivery guarantee; push only wakes the user up.</div>
+
+<!-- ============================ FLOW 9 ============================ -->
+<h2>11. Flow 9 — Notification delivery</h2>
+<p>Flows 2, 4, 5 and 8 all end with "→ Notification Service". This flow follows a notification from the event to a banner on the lock screen. Notifications sound trivial, but at Instagram scale (assume billions per day) the hard parts are <strong>not annoying people</strong> (aggregation, rate caps, preferences), <strong>handling dead device tokens</strong>, and <strong>coping with third-party providers</strong> you don't control. See <a href="notifications.html">notifications</a>.</p>
+
+<pre class="ascii">
+  Kafka   Notification      User DB     Feed Cache    Post Meta   Push Providers    Clients   Analytics
+             Service     (PostgreSQL)     (Redis)    (activity)      APNs/FCM                   &amp; ML
+    |           |              |             |            |              |             |          |
+    | 1 like/comment/follow/message events   |            |              |             |          |
+    |~~~~~~~~~~&gt;|              |             |            |              |             |          |
+    |           |-- 2 drop self-actions, blocked, muted   |              |             |          |
+    |           | 3 prefs + device tokens    |            |              |             |          |
+    |           |-------------&gt;|             |            |              |             |          |
+    |           | 4 dedupe/aggregate, rate cap            |              |             |          |
+    |           |---------------------------&gt;|            |              |             |          |
+    |           | 5 append to activity feed  |            |              |             |          |
+    |           |----------------------------------------&gt;|              |             |          |
+    |           | 6 send (HTTP/2, token auth)|            |              |             |          |
+    |           |-------------------------------------------------------&gt;|             |          |
+    |           | 7 200 | 410 gone | 429     |            |              |             |          |
+    |           |&lt;.......................................................|             |          |
+    |           |              |             |            |              | 8 deliver to device    |
+    |           |              |             |            |              |------------&gt;|          |
+    |           |              |             |            |              |             |-- 9 tap -&gt; deep link
+    |           |              |             |            |              |             | 10 opened events
+    |           |              |             |            |              |             |~~~~~~~~~&gt;|
+    |           |              |             |            |              |             |          |
+
+legend:  ----&gt; synchronous call    ....&gt; response    ~~~~&gt; asynchronous event (Kafka)    -- local work
+</pre>
+<ol class="steps">
+  <li><strong>Kafka → Notification Service:</strong> consumes <code>like.created</code>, <code>comment.created</code>, <code>follow.created</code>, <code>post.ready</code> (for mentions and post notifications) and <code>message.created</code>. Each event type can have its own consumer pool and priority. DMs are urgent; "someone you may know joined" is not.</li>
+  <li><strong>Notification Service (local):</strong> drops events that shouldn't notify anyone: liking your own post, actors the recipient has blocked or muted, or recipients who disabled that category.</li>
+  <li><strong>Notification Service → User DB (PostgreSQL):</strong> loads the recipient's notification preferences, language and <strong>device tokens</strong> (one per installed device, registered in Flow 1). These are read through a cache.</li>
+  <li><strong>Notification Service → Feed Cache (Redis):</strong> <strong>dedupe and aggregate</strong>. A key like <code>notif:{owner}:{post}:likes</code> collects likers over a window of a few minutes, so 50 likes become one push ("alice and 49 others…"). A per-user counter enforces a <strong>rate cap</strong> (e.g. at most N pushes per hour).</li>
+  <li><strong>Notification Service → Post/Comment/Story Metadata (activity):</strong> appends an entry to the recipient's in-app <em>Activity</em> feed (the heart tab). This in-app record is written even when no push is sent.</li>
+  <li><strong>Notification Service → Push Providers APNs/FCM:</strong> renders the localised text and sends over persistent HTTP/2 connections with token-based auth: APNs for iOS, FCM for Android. Bursts are smoothed with an internal queue.</li>
+  <li><strong>Push Providers → Notification Service:</strong> the response code matters. <code>200</code> means accepted. <code>410 Unregistered</code> or an invalid token means the app was uninstalled, so the token is deleted from the User DB. <code>429</code> or <code>5xx</code> means retry with exponential backoff and jitter, and after N attempts move the message to a <strong>dead-letter queue</strong>.</li>
+  <li><strong>Push Providers APNs/FCM → Clients:</strong> the OS displays the notification. Delivery is best-effort; a phone that's off receives only the latest notification per collapse key when it comes back.</li>
+  <li><strong>Clients (local):</strong> the user taps, and a <strong>deep link</strong> (<code>instagram://media?id=…</code>) opens the right screen, triggering Flow 3-style reads for that post.</li>
+  <li><strong>Clients → Analytics &amp; ML Training:</strong> delivered, opened and dismissed events flow back via Kafka. Models learn which notifications people value, and send fewer of the kind people ignore.</li>
+</ol>
+
+<h3>11.1 What happens on failure</h3>
+<ul>
+  <li><strong>Notification Service is down:</strong> events accumulate in Kafka (retention of days), and nothing is lost. On recovery, stale notifications (e.g. likes older than an hour) are skipped rather than sent late; the Activity feed is still backfilled.</li>
+  <li><strong>APNs/FCM outage:</strong> a <a href="resilience-patterns.html">circuit breaker</a> stops hammering the provider, messages wait in a retry queue, and the in-app Activity feed still shows everything.</li>
+  <li><strong>Duplicate events</strong> (at-least-once Kafka): a dedupe key per (recipient, event_id) in Redis with a TTL prevents double pushes.</li>
+  <li><strong>Notification storm</strong> (a celebrity's post tagging 1M users, or a bug): per-user rate caps and global <a href="rate-limiting.html">rate limiting</a> on the sender protect both users and provider quotas.</li>
+</ul>
+
+<!-- ============================ SUMMARY ============================ -->
+<h2>12. Summary: synchronous vs asynchronous in every flow</h2>
+<p>Put the nine flows side by side and the pattern is obvious. The synchronous part writes one source-of-truth record and returns; the asynchronous part does the expensive, fan-out-heavy work.</p>
+<div class="table-wrap"><table>
+  <tr><th>Flow</th><th>Synchronous (the user waits)</th><th>Asynchronous (after the response)</th><th>Consistency the user sees</th></tr>
+  <tr><td><b>1. App open &amp; login</b></td><td>DNS, TLS, gateway rate limit, password check, session write, tokens</td><td><code>user.logged_in</code> → fraud analytics, "new login" alert</td><td>Strong (you're either logged in or not)</td></tr>
+  <tr><td><b>2. Upload photo</b></td><td>Pre-signed URL, direct PUT to Object Storage, post row insert, publish event</td><td>Renditions, moderation, fan-out to timelines, search indexing, notifications, analytics</td><td>Author: read-your-writes. Followers: eventual (seconds).</td></tr>
+  <tr><td><b>3. Home feed</b></td><td>Timeline read, celebrity pull, ranking, hydration, CDN image fetch</td><td>Impression/view events → ranking training and seen-state</td><td>Eventual (may lag new posts by seconds)</td></tr>
+  <tr><td><b>4. Like</b></td><td>Upsert like row, counter increment, publish</td><td>Aggregated notification, ranking signals, counter flush to durable store</td><td>Your like: immediate. Counts: approximate/eventual.</td></tr>
+  <tr><td><b>5. Follow</b></td><td>Privacy/block check, edge write(s), counters, publish</td><td>Reverse edge (if async), timeline backfill, notification, suggestions</td><td>Edge: immediate for you. Feed backfill: eventual.</td></tr>
+  <tr><td><b>6. Story post / view</b></td><td>Post: URL, upload, TTL insert. View: tray read, item fetch, CDN prefetch.</td><td>Transcoding to HLS, tray fan-out, seen-state, viewer lists, expiry</td><td>Eventual for followers. Expiry enforced at read time.</td></tr>
+  <tr><td><b>7. Search typeahead</b></td><td>Prefix cache / Elasticsearch query, personalisation, avatars from CDN</td><td>Indexing of new users, renames and hashtags via Search Indexer</td><td>Near-real-time (~1 s+ index lag)</td></tr>
+  <tr><td><b>8. Direct message</b></td><td>Durable write with per-thread seq, ack to sender, push over recipient's WebSocket if online</td><td>Offline: Kafka → Notification Service → APNs/FCM. Receipts.</td><td>Ordered per thread. At-least-once, deduped to exactly-once display.</td></tr>
+  <tr><td><b>9. Notifications</b></td><td>(none on the user's request path)</td><td>Filter, preferences, aggregate, rate-cap, activity write, push, token cleanup</td><td>Best-effort push. Activity feed is the source of truth.</td></tr>
+</table></div>
+
+<h2>13. How Instagram uses these patterns</h2>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+Public engineering talks and blog posts describe how Instagram's request flows evolved. It started as a Python/Django application tier talking to <strong>sharded PostgreSQL</strong>, with IDs generated <em>inside</em> PostgreSQL using a 64-bit time + shard + sequence scheme (see <a href="id-generation.html">ID generation</a>). Later it added <strong>Cassandra</strong> for high-write data such as feeds, activity and direct messages, <strong>Memcache/Redis</strong> caches, and async task queues for fan-out and media work. After joining Facebook, it moved onto Meta's data centers, edge network and shared infrastructure. The exact internals are private, but the <em>shape</em> described in this lesson matches what has been made public: a thin synchronous path, direct-to-storage media, a CDN for bytes, precomputed feeds with special handling for celebrity accounts, and heavy use of asynchronous pipelines for everything else.</div>
+
+<p>Three cross-cutting patterns run through all nine flows:</p>
+<ol>
+  <li><strong>Event-carried state.</strong> Every write publishes a domain event (<code>post.created</code>, <code>like.created</code>, <code>follow.created</code>…). New features (a new notification type, a new ML signal, a new index) are added as <em>new consumers</em> without touching the write path. That is the main architectural payoff of <a href="message-queues.html">Kafka</a>.</li>
+  <li><strong>Optimistic clients plus idempotent servers.</strong> The app assumes success (heart turns red, post appears, "Following" shows) and retries in the background. That is only safe because every server operation is idempotent: idempotency keys for posts, natural primary keys for likes and follows, <code>client_msg_id</code> for DMs.</li>
+  <li><strong>Graceful degradation per feature.</strong> Each service has a fallback: feed → chronological or cached, search → recents, tray → cached, push → Activity feed. A failure in one feature doesn't take down the app. These are <a href="resilience-patterns.html">bulkheads</a> in practice.</li>
+</ol>
+
+<div class="callout instagram"><span class="callout-title">📸 Rough end-to-end numbers (assumptions)</span>
+With 500M daily active users: ~60k feed requests/s on average (~150k peak), ~60k likes/s, ~1.2k photo uploads/s, ~100k typeahead requests/s at peak, tens of millions of concurrent WebSocket connections for DMs, and media egress around 1 Tbps from the CDN. Notice that the <em>async</em> side multiplies these numbers: one upload by an account with 1,000 followers creates 1,000 timeline writes, so fan-out workers perform over a million Redis writes per second. See <a href="capacity-estimation.html">capacity estimation</a>.</div>
+
+<h2>14. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Benefits of the "thin sync, fat async" shape</h4><ul>
+    <li>Low, predictable user-facing latency regardless of follower counts or video length</li>
+    <li>Failures in background work don't fail the user's request</li>
+    <li>Natural load levelling: Kafka absorbs spikes and workers drain at their own pace</li>
+    <li>Easy extensibility: add consumers without changing producers</li>
+    <li>Media path scales independently through Object Storage and the CDN</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs</h4><ul>
+    <li>Eventual consistency everywhere: followers, counts, search and notifications lag</li>
+    <li>Harder debugging: one user action becomes ~10 asynchronous hops (needs tracing)</li>
+    <li>Duplicate delivery means every consumer must be idempotent</li>
+    <li>Dual-write risk between DB and Kafka (needs an outbox or CDC)</li>
+    <li>Operational weight: Kafka, worker fleets, DLQs, lag monitoring</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls when describing flows</h4>
+<ul>
+  <li><strong>Sending media through the API servers.</strong> It ties up app servers on slow uploads and wastes bandwidth twice. Always use pre-signed URLs and the CDN.</li>
+  <li><strong>Doing fan-out synchronously in the post request.</strong> A user with 2M followers would wait minutes. Fan-out belongs in workers, and celebrities belong on the pull path.</li>
+  <li><strong>Forgetting the failure path.</strong> For each hop, say what happens if it's slow or down: retry, fallback, degrade, or fail.</li>
+  <li><strong>Treating push notifications as reliable delivery.</strong> They're hints. Durable stores plus client sync are the guarantee.</li>
+  <li><strong>Ignoring idempotency.</strong> Mobile networks guarantee retries, so without idempotency keys you get duplicate posts and double-counted likes.</li>
+  <li><strong>Publishing the event before (or without) committing the DB write.</strong> Consumers then act on data that doesn't exist. Commit first; use an outbox.</li>
+  <li><strong>Calling the Auth service on every request.</strong> Validate signed tokens at the gateway instead.</li>
+  <li><strong>Unbounded timeouts.</strong> Each hop needs a deadline smaller than its caller's, or one slow dependency cascades into a site-wide outage.</li>
+</ul>
+
+<h2>15. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Concern in the flows</th><th>Technologies</th><th>When to use</th></tr>
+  <tr><td>Edge routing</td><td>Route 53, NS1, Cloudflare DNS; Anycast</td><td>GeoDNS for region choice; Anycast for edge/CDN IPs</td></tr>
+  <tr><td>Load balancer / gateway</td><td>Envoy, NGINX, HAProxy, AWS ALB/NLB, Kong, Meta's Katran (L4) and Proxygen (L7)</td><td>L4 for raw connection spreading; L7 for auth, routing and rate limiting</td></tr>
+  <tr><td>Service calls</td><td>gRPC, Thrift, Finagle</td><td>Low-latency internal RPC with deadlines and retries</td></tr>
+  <tr><td>Event bus</td><td>Apache Kafka, Pulsar, AWS Kinesis, Google Pub/Sub</td><td>Durable, replayable, multi-consumer events</td></tr>
+  <tr><td>Timelines, counters, presence</td><td>Redis Cluster, Memcached, Meta's TAO (graph cache)</td><td>Sub-ms reads of precomputed data</td></tr>
+  <tr><td>Metadata &amp; messages</td><td>Cassandra, ScyllaDB, HBase, DynamoDB</td><td>High write throughput, partition-per-entity access</td></tr>
+  <tr><td>Media pipeline</td><td>FFmpeg, libvips/ImageMagick, AWS Elemental, custom GPU encoders</td><td>Transcoding, resizing, thumbnailing at scale</td></tr>
+  <tr><td>Search</td><td>Elasticsearch, OpenSearch, Solr, Meta's Unicorn</td><td>Inverted-index full-text and prefix search</td></tr>
+  <tr><td>Real-time messaging</td><td>WebSockets, MQTT, Socket.IO; Erlang/Elixir, Netty</td><td>Millions of long-lived connections</td></tr>
+  <tr><td>Push</td><td>APNs, FCM, OneSignal, AWS SNS</td><td>Reaching phones whose app isn't running</td></tr>
+  <tr><td>Tracing the flow</td><td>OpenTelemetry, Jaeger, Zipkin, Datadog APM</td><td>Seeing every hop of one request with timings</td></tr>
+</table></div>
+
+<h2>16. Interview corner</h2>
+<details class="qa"><summary>Walk me through what happens, end to end, when a user posts a photo.</summary>
+<p>The client resizes and compresses the photo, then asks the Upload Service (through the LB and API Gateway, which authenticate and rate-limit) for an upload slot. The service generates a time-sortable media ID and a pre-signed URL. The client PUTs the bytes directly to Object Storage, then calls <code>POST /posts</code> with an idempotency key. The Upload Service verifies the object exists, writes the post row to Cassandra (status PROCESSING), publishes <code>post.created</code> to Kafka (via an outbox), and returns 201. The user is done after ~100 ms of server work plus upload time. Asynchronously, media workers create renditions and run moderation, mark the post READY and emit <code>post.ready</code>. Fan-out workers then push the post ID into each follower's Redis timeline (skipping celebrities, who are pulled at read time), the Search Indexer indexes hashtags, the Notification Service handles mentions, and analytics records the event. Followers fetch the images from the CDN, which origin-pulls from Object Storage.</p></details>
+<details class="qa"><summary>Why does the client upload directly to object storage instead of through the Upload Service?</summary>
+<p>Bytes through app servers would cost bandwidth twice, hold an app-server thread or connection for the full (possibly minutes-long) upload, and make the stateless tier scale with media volume instead of request count. A pre-signed URL keeps authorisation in our hands (it's scoped to one key, size and content type, and it expires) while Object Storage handles durability, multipart and resumable transfer at practically unlimited scale. The API path stays small and fast.</p></details>
+<details class="qa"><summary>A user follows 2,000 accounts, including 15 celebrities. How is their feed served within 200 ms?</summary>
+<p>Most of the work happened at write time. Normal accounts' posts were already pushed into the user's Redis timeline by fan-out workers, so one sorted-set read returns ~500 candidate IDs. Celebrities were excluded from push fan-out, so in parallel the service reads the recent posts of those 15 accounts. These are 15 partition reads, heavily cached because millions of users need the same data. It merges, filters and ranks (two-stage, with a deadline and a chronological fallback), hydrates the top 20 from the post-object cache, and returns JSON with CDN URLs. The server-side p50 is ~85 ms; images then come from the nearest CDN edge.</p></details>
+<details class="qa"><summary>How do you make sure a like isn't counted twice when the client retries?</summary>
+<p>Store likes keyed by <code>(post_id, user_id)</code>, so a repeat is an upsert of the same row, and only increment the counter when the like is new: check the insert result, or use a Redis set-add that returns whether the member was new. The client uses <code>PUT</code> semantics ("I like this"), and the server orders a user's like/unlike operations by client timestamp. Kafka consumers downstream (notifications, analytics) dedupe on an event ID. Counters on hot posts are sharded and periodically reconciled against the durable count, because display counts may be approximate but must converge.</p></details>
+<details class="qa"><summary>How does DM delivery differ when the recipient is offline?</summary>
+<p>In both cases the message is first durably written to the Messages Store with a per-thread sequence number and acked to the sender. If the presence registry shows a live connection, the server pushes it over the recipient's WebSocket. If not, it publishes an event that the Notification Service turns into an APNs/FCM push. Push is only a wake-up hint. When the recipient opens the app, it reconnects and asks for "all messages in thread X after seq N", which pulls the gap from the store. This makes delivery correct even if pushes are lost or duplicated, and the client dedupes by <code>client_msg_id</code>/seq.</p></details>
+<details class="qa"><summary>What happens if Kafka is down when a post is created?</summary>
+<p>With a naive dual write ("write DB, then publish"), you'd get posts that exist but are never fanned out, indexed or processed. Instead use the transactional outbox: the post row and an outbox record are committed together, and a relay (or CDC from the commit log) publishes outbox records when Kafka is reachable, retrying until acknowledged. The user's request succeeds. Followers see the post late, but they never miss it. Consumers must be idempotent because the relay may publish twice.</p></details>
+<details class="qa"><summary>Which parts of these flows need strong consistency and which can be eventual?</summary>
+<p>Strong (or at least read-your-writes): authentication and sessions, the author seeing their own new post, the per-thread order of DMs, privacy and block checks (showing a blocked user's content is a real harm), and payments if any. Eventual: follower feeds, like/view counters, search index, notifications, stories tray, analytics. The rule of thumb is to ask "what's the cost of the user seeing stale data for a few seconds?" For most social features it's negligible, and accepting it buys latency and availability (<a href="cap-consistency.html">CAP/PACELC</a>).</p></details>
+<details class="qa"><summary>How would you find out why feed loads became slow last night?</summary>
+<p>Start from the SLO dashboard (p99 latency per endpoint and region) to locate when and where. Then use distributed traces: each feed request has spans for the gateway, timeline read, celebrity pull, ranking and hydration, so you can see which span grew. Correlate with deploys, cache hit ratio, Redis and Cassandra latency, ranking model version, and Kafka consumer lag (a lagging fan-out pushes more work onto the read path). Logs with the trace ID give details for individual slow requests. See <a href="observability.html">observability</a>.</p></details>
+
+<h2>17. Check your understanding</h2>
+<details class="quiz"><summary>In Flow 2, which steps must succeed before the user sees "posted"? Which can fail without the user's request failing?</summary>
+<p>Must succeed: the upload slot (pre-signed URL), the PUT to Object Storage, the post row insert and the durable recording of the event (outbox). Can fail without failing the request, because they're retried asynchronously: renditions, moderation, fan-out, search indexing, notifications and analytics. If moderation later rejects the post, it's removed after the fact.</p></details>
+<details class="quiz"><summary>An account with 50,000 followers posts. Fan-out workers write to Redis with pipelines of 1,000 commands, ~2 ms per pipeline. Roughly how long does push fan-out take for one worker, and why is that acceptable?</summary>
+<p>50,000 / 1,000 = 50 pipelines × 2 ms ≈ 100 ms, plus paging through the follower list. It runs asynchronously, so nobody waits on it, and followers see the post within about a second. For a 50M-follower account it would be ~100 s of work per post and 50M writes, which is why such accounts use pull instead.</p></details>
+<details class="quiz"><summary>Why does the stories tray store author IDs rather than story IDs?</summary>
+<p>The tray shows one avatar per author. Storing authors means an author posting 10 stories updates each follower's tray once instead of 10 times (10× less fan-out). Individual story items are fetched from the per-author partition only for the authors actually displayed, and expired items disappear automatically via TTL.</p></details>
+<details class="quiz"><summary>The ranking service starts timing out. What does the user see, and why?</summary>
+<p>A feed in roughly reverse-chronological order (slightly less relevant), not an error. The News Feed Service calls ranking with a deadline and degrades gracefully to a simple ordering of the candidates it already has. Combined with a circuit breaker, this protects the user experience and gives the ranking service room to recover.</p></details>
+<details class="quiz"><summary>Typeahead: a user types "selena" in 600 ms. Without debouncing, how many requests are sent, and with a 100 ms debounce, roughly how many?</summary>
+<p>Without debouncing, 6 (one per keystroke). With a 100 ms debounce and keystrokes ~100 ms apart, typically 1–3, usually just the final "selena" plus perhaps an intermediate prefix. Across hundreds of millions of users that cuts typeahead QPS by 2–5×, and the prefix cache absorbs most of the rest.</p></details>
+<details class="quiz"><summary>Bob's phone was off for 6 hours and APNs dropped several notifications. Does Bob lose any DMs? Explain.</summary>
+<p>No. Messages were durably stored in the Messages Store before being acked to the sender. On reconnect, Bob's app syncs each thread from its last known sequence number and receives everything it missed, in order. Push notifications are only a hint to wake the user; they're not the delivery mechanism.</p></details>
+<details class="quiz"><summary>Which component(s) would you check first if new posts appear on the author's profile but not in followers' feeds?</summary>
+<p>The asynchronous path between the write and the timelines. Is <code>post.created</code> being published (outbox relay healthy)? Are media workers marking posts READY and emitting <code>post.ready</code>? What is the Kafka consumer lag for the Feed Fan-out Workers, and are any messages piling up in the dead-letter queue? Are the Redis timeline writes succeeding? The author's profile reads Cassandra directly, which is why it looks fine.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Every flow is <strong>thin synchronous + fat asynchronous</strong>: write the source of truth, publish an event, return. Kafka consumers do the rest.</li>
+    <li><strong>API path and media path are separate.</strong> Uploads go client → Object Storage via pre-signed URLs; downloads go CDN → client.</li>
+    <li>Reads are cheap because writes did the work: <strong>precomputed timelines</strong> (hybrid push/pull), renditions, counters and indexes.</li>
+    <li>Optimistic clients require <strong>idempotent servers</strong>: idempotency keys, natural primary keys and dedupe in consumers.</li>
+    <li>Know each flow's <strong>latency budget</strong> and each hop's <strong>failure behaviour</strong> (retry, fallback, degrade). That is what interviewers probe.</li>
+    <li>Push notifications are hints. <strong>Durable stores plus client sync</strong> are the delivery guarantee.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="interview-guide.html">Full interview walkthrough</a>: put these flows into a 45-minute "Design Instagram" answer</li>
+  <li><a href="media-upload.html">Media upload</a> and <a href="media-processing.html">media processing</a>: Flow 2 in depth</li>
+  <li><a href="news-feed.html">News feed</a>: fan-out on write vs read, ranking (Flow 3)</li>
+  <li><a href="likes-comments.html">Likes, comments &amp; counters</a>: sharded counters and hot keys (Flow 4)</li>
+  <li><a href="social-graph.html">Social graph</a>: edges in both directions (Flow 5)</li>
+  <li><a href="stories.html">Stories</a>: TTL data and the tray (Flow 6)</li>
+  <li><a href="search.html">Search</a>: inverted indexes and typeahead (Flow 7)</li>
+  <li><a href="direct-messaging.html">Direct messaging</a>: WebSockets, ordering, receipts (Flow 8)</li>
+  <li><a href="notifications.html">Notifications</a>: APNs/FCM, aggregation, preferences (Flow 9)</li>
+  <li><a href="message-queues.html">Kafka</a>: the backbone of every asynchronous half</li>
+  <li><a href="resilience-patterns.html">Resilience patterns</a>: timeouts, retries, circuit breakers and degradation used in every failure section</li>
+  <li><a href="glossary.html">Glossary</a>: quick definitions of every term used here</li>
+</ul>
+
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

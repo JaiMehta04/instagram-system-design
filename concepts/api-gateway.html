@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>API Gateway &amp; Reverse Proxy — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="api-gateway">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>An <strong>API gateway</strong> is the single, smart front door for all client API traffic. It sits behind the <a href="load-balancer.html">load balancer</a> and in front of Instagram's many <a href="microservices.html">microservices</a>.</li>
+    <li>It handles the <strong>cross-cutting concerns</strong> every service would otherwise re-implement: routing, <a href="authentication.html">token validation</a>, <a href="rate-limiting.html">rate limiting</a>, TLS termination, request validation, transformation, response aggregation, caching, CORS, and logging/metrics/tracing.</li>
+    <li>A <strong>reverse proxy</strong> forwards requests to hidden servers; a <strong>load balancer</strong> spreads requests over identical copies; an <strong>API gateway</strong> is a reverse proxy that understands your API (users, routes, versions, quotas).</li>
+    <li>The <strong>Backend-for-Frontend (BFF)</strong> pattern gives each client type (iOS/Android vs web) its own tailored gateway layer.</li>
+    <li>Gateways handle <strong>north-south</strong> traffic (client ⇄ data center); a <strong>service mesh</strong> handles <strong>east-west</strong> traffic (service ⇄ service).</li>
+    <li>The gateway must be <strong>stateless and horizontally scaled</strong>, or it becomes a single point of failure and a bottleneck; keep its per-request overhead to a few milliseconds.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why does Instagram need an API gateway?</h2>
+<p>Look at the main architecture diagram. Behind the load balancer there are at least eight application services: Upload, Stories, Like &amp; Comment, Follow/Graph, News Feed, Search, Direct Messaging and User/Auth. In a real company there are hundreds. Now imagine the mobile app talking to each of them directly:</p>
+<ul>
+  <li><strong>The client would need to know every service's address.</strong> If the Feed team splits their service into two, every installed copy of the app (some of which are years old and never updated) breaks.</li>
+  <li><strong>Every service would re-implement the same plumbing.</strong> Validating the login token, checking rate limits, terminating TLS, writing access logs, emitting metrics, adding trace IDs, handling CORS for the web client. Eight teams writing the same security-critical code eight slightly different ways is a recipe for bugs — one forgotten auth check and private photos leak.</li>
+  <li><strong>The attack surface would be huge.</strong> Every service would be exposed to the public internet and need its own hardening.</li>
+  <li><strong>Mobile networks are slow.</strong> Rendering one profile screen needs data from the User service, the Graph service (follower counts), the Post service (grid) and the Stories service (highlights). Four separate round trips over a 4G connection with 100&nbsp;ms latency each is painful.</li>
+</ul>
+<p>The fix is to put <strong>one well-defined front door</strong> in front of all the services. Clients talk to <code>i.instagram.com</code> (one host, one API surface); the gateway figures out who you are, whether you're allowed in, whether you're sending too much, and which internal service should handle your request.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  Think of a large hotel's <strong>reception desk</strong>. Guests don't wander the corridors looking for the kitchen, the laundry or the spa manager. They go to reception, which checks their room key (authentication), knows which department handles which request (routing), politely refuses the guest who has called 40 times in an hour (rate limiting), translates a request in French for the kitchen staff (transformation), and keeps a log of every request (observability). The departments behind the desk can be reorganised freely — guests never notice. That reception desk is the API gateway.
+</div>
+
+<h2>2. Reverse proxy vs load balancer vs API gateway</h2>
+<p>These three terms overlap and are often used loosely — the same piece of software (NGINX, Envoy) can play all three roles. It helps to define them by <em>what they know</em>.</p>
+
+<h3>2.1 Forward proxy vs reverse proxy</h3>
+<p>A <strong>proxy</strong> is a server that forwards traffic on someone else's behalf.</p>
+<ul>
+  <li>A <strong>forward proxy</strong> acts for <em>clients</em>: a corporate proxy that all employees' browsers go through. The destination website sees the proxy, not the employee.</li>
+  <li>A <strong>reverse proxy</strong> acts for <em>servers</em>: clients connect to it believing it is "the website", and it forwards requests to one or more hidden backend servers. The client never sees the backends' addresses. Typical jobs: TLS termination, compression, static file serving, caching, buffering slow clients, and hiding the internal topology.</li>
+</ul>
+
+<h3>2.2 The three roles compared</h3>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Reverse proxy</th><th>Load balancer</th><th>API gateway</th></tr>
+  <tr><td><b>Core job</b></td><td>Stand in front of servers and forward requests to them</td><td>Spread traffic across many identical instances</td><td>Be the managed entry point to an API made of many services</td></tr>
+  <tr><td><b>Knows about</b></td><td>Hosts, paths, headers</td><td>Pool members, their health and load</td><td>API routes, versions, consumers (users/apps), tokens, quotas, schemas</td></tr>
+  <tr><td><b>OSI layer</b></td><td>Usually L7 (HTTP)</td><td>L4 (TCP/UDP) or L7</td><td>L7 only — it must read HTTP methods, paths, headers, bodies</td></tr>
+  <tr><td><b>Typical features</b></td><td>TLS termination, caching, compression, buffering</td><td>Health checks, algorithms (round robin, least connections, consistent hashing), connection draining</td><td>Auth, rate limiting, request validation, transformation, aggregation, API keys, developer portal, analytics</td></tr>
+  <tr><td><b>Routes to</b></td><td>One or a few backends</td><td>Many copies of the <em>same</em> service</td><td><em>Different</em> services depending on the route</td></tr>
+  <tr><td><b>Example</b></td><td>NGINX in front of a Django app</td><td>AWS NLB, HAProxy, Maglev</td><td>Kong, AWS API Gateway, Apigee, Envoy with auth filters</td></tr>
+  <tr><td><b>In Instagram's diagram</b></td><td>Implicit — both the LB and gateway are reverse proxies</td><td>"Load Balancer" box</td><td>"API Gateway" box</td></tr>
+</table></div>
+<p>A useful mental model: <strong>every API gateway is a reverse proxy; every L7 load balancer is a reverse proxy; an API gateway usually contains a load balancer</strong> (once it decides "this goes to the Feed service", it still has to pick one of the 2,000 Feed service instances). See <a href="load-balancer.html">Load Balancing</a> for the balancing algorithms.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 300" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-gw-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600">
+    <rect x="15" y="60" width="120" height="44" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="75" y="87" text-anchor="middle">📱 iOS / Android</text>
+    <rect x="15" y="180" width="120" height="44" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="75" y="207" text-anchor="middle">💻 Web browser</text>
+    <rect x="175" y="110" width="120" height="70" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="235" y="140" text-anchor="middle">Load Balancer</text><text x="235" y="160" text-anchor="middle" font-weight="400" font-size="11.5">L4, spreads load</text>
+    <rect x="335" y="40" width="170" height="220" rx="10" fill="#fff3e0" stroke="#ef6c00"/>
+    <text x="420" y="64" text-anchor="middle">API Gateway fleet</text>
+  </g>
+  <g font-size="11.5">
+    <rect x="350" y="76" width="140" height="22" rx="4" fill="#fff" stroke="#ef6c00"/><text x="420" y="91" text-anchor="middle">TLS termination</text>
+    <rect x="350" y="102" width="140" height="22" rx="4" fill="#fff" stroke="#ef6c00"/><text x="420" y="117" text-anchor="middle">Token validation</text>
+    <rect x="350" y="128" width="140" height="22" rx="4" fill="#fff" stroke="#ef6c00"/><text x="420" y="143" text-anchor="middle">Rate limiting</text>
+    <rect x="350" y="154" width="140" height="22" rx="4" fill="#fff" stroke="#ef6c00"/><text x="420" y="169" text-anchor="middle">Validate + transform</text>
+    <rect x="350" y="180" width="140" height="22" rx="4" fill="#fff" stroke="#ef6c00"/><text x="420" y="195" text-anchor="middle">Route + balance</text>
+    <rect x="350" y="206" width="140" height="22" rx="4" fill="#fff" stroke="#ef6c00"/><text x="420" y="221" text-anchor="middle">Logs, metrics, traces</text>
+  </g>
+  <g font-weight="600">
+    <rect x="590" y="20" width="150" height="34" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="665" y="42" text-anchor="middle">Upload Service</text>
+    <rect x="590" y="66" width="150" height="34" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="665" y="88" text-anchor="middle">News Feed Service</text>
+    <rect x="590" y="112" width="150" height="34" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="665" y="134" text-anchor="middle">Like &amp; Comment</text>
+    <rect x="590" y="158" width="150" height="34" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="665" y="180" text-anchor="middle">Follow / Graph</text>
+    <rect x="590" y="204" width="150" height="34" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="665" y="226" text-anchor="middle">Search Service</text>
+    <rect x="590" y="250" width="150" height="34" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="665" y="272" text-anchor="middle">User / Auth</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" marker-end="url(#ar-gw-1)" fill="none">
+    <path d="M135,82 L173,130"/><path d="M135,202 L173,160"/><path d="M295,145 L333,145"/>
+    <path d="M505,110 L588,37"/><path d="M505,120 L588,83"/><path d="M505,135 L588,129"/><path d="M505,150 L588,175"/><path d="M505,165 L588,221"/><path d="M505,180 L588,267"/>
+  </g>
+  <text x="547" y="292" text-anchor="middle" font-size="11" fill="#555">path-based routing</text>
+</svg>
+<div class="caption">The load balancer spreads connections over gateway instances; each gateway instance applies cross-cutting policies and routes each request to the right service.</div>
+</div>
+
+<h2>3. Gateway responsibilities, one by one</h2>
+<p>Each responsibility below is a <strong>filter</strong> (also called a plugin, policy or middleware) in a pipeline. A request passes through them in order; any filter can short-circuit the pipeline by returning an error (e.g. 401, 429) without ever touching a backend service.</p>
+
+<pre class="ascii">
+  request ─▶ [TLS] ─▶ [CORS] ─▶ [AuthN] ─▶ [Rate limit] ─▶ [Validate] ─▶ [Transform] ─▶ [Route/LB] ─▶ service
+                                   │            │               │
+                                  401          429             400        (short-circuit, backend never sees it)
+  response ◀─ [Log/metrics/trace] ◀─ [Cache store] ◀─ [Transform response] ◀─ [Aggregate] ◀──────────── service
+</pre>
+
+<h3>3.1 Routing</h3>
+<p>The gateway maps an incoming request to an upstream service using rules on the <strong>host</strong>, <strong>path</strong>, <strong>method</strong> and sometimes <strong>headers</strong>:</p>
+<pre><code>routes:
+  - match: { method: POST,   path: "/v1/media/upload-url" }     -&gt; upload-service
+  - match: { method: POST,   path: "/v1/posts" }                -&gt; upload-service
+  - match: { method: GET,    path: "/v1/feed" }                 -&gt; feed-service
+  - match: { path_prefix: "/v1/posts/{id}/likes" }              -&gt; like-comment-service
+  - match: { path_prefix: "/v1/posts/{id}/comments" }           -&gt; like-comment-service
+  - match: { path_prefix: "/v1/users/{id}/follow" }             -&gt; graph-service
+  - match: { method: GET,    path: "/v1/search" }               -&gt; search-service
+  - match: { path_prefix: "/v1/stories" }                       -&gt; stories-service
+  - match: { path: "/v1/dm", header: "Upgrade: websocket" }     -&gt; dm-service  (long-lived)
+  - match: { path_prefix: "/v1/auth" }                          -&gt; auth-service</code></pre>
+<p>After picking the service, the gateway finds healthy instances through <strong>service discovery</strong> (a registry like Consul, ZooKeeper, Kubernetes endpoints or a DNS name) and picks one using a load-balancing algorithm. Because services can be moved, split or renamed by changing this table, the <strong>public API is decoupled from the internal topology</strong> — the single biggest architectural benefit.</p>
+
+<h3>3.2 Authentication (token validation)</h3>
+<p><strong>Authentication</strong> answers "who is this?". After login, the app holds an access token (often a JWT — see <a href="authentication.html">Authentication &amp; Authorization</a>). On every request the gateway:</p>
+<ol>
+  <li>Extracts the token from <code>Authorization: Bearer &lt;token&gt;</code>.</li>
+  <li>Validates it: for a signed JWT, it checks the signature using the auth service's public key (cached locally — no network call), the expiry (<code>exp</code>), the issuer and audience. For an opaque token, it looks it up in a fast session store (e.g. Redis) or calls the auth service's introspection endpoint, usually with a short local cache.</li>
+  <li>Rejects invalid/expired tokens with <code>401 Unauthorized</code>.</li>
+  <li>Strips the raw token (optional) and forwards <strong>trusted identity headers</strong> such as <code>X-User-Id: 1234</code>, <code>X-Device-Id</code>, <code>X-Auth-Scopes</code> to the backend, ideally inside an internal signed envelope so services can trust them.</li>
+</ol>
+<div class="callout warn"><span class="callout-title">⚠️ Gateway does AuthN, services do object-level AuthZ</span>
+The gateway can answer "is this a valid logged-in user?" and coarse questions like "does this third-party app have the <code>comments:write</code> scope?". It <strong>cannot</strong> answer "may user 1234 see post 987?" — that depends on whether the author's account is private, whether 1234 follows them, whether either has blocked the other. Those object-level checks belong in the service that owns the data. Relying only on the gateway leads to IDOR bugs (see <a href="authentication.html">Authentication</a>).</div>
+
+<h3>3.3 Rate limiting</h3>
+<p>The gateway is the natural place to enforce limits because it sees every request and already knows the caller's identity. Typical policies: "100 requests/second per user", "60 follow actions per hour per account", "5 login attempts per minute per IP", "5,000 calls/hour per third-party API key". Over the limit → <code>429 Too Many Requests</code> with a <code>Retry-After</code> header. Counters usually live in a shared <a href="caching.html">Redis</a> cluster so all gateway instances agree. The algorithms (token bucket, sliding window…) are covered in depth in <a href="rate-limiting.html">Rate Limiting</a>.</p>
+
+<h3>3.4 TLS termination</h3>
+<p><strong>TLS termination</strong> means the gateway (or the LB in front of it) performs the HTTPS handshake and decrypts traffic, so backend services receive plain HTTP or re-encrypted internal mTLS. Benefits:</p>
+<ul>
+  <li>Certificates and private keys live in one hardened place instead of on hundreds of services.</li>
+  <li>The expensive asymmetric crypto of the handshake is done once, on machines tuned for it (session resumption, TLS 1.3, hardware acceleration).</li>
+  <li>The gateway can <em>see</em> the HTTP request — it must, to route by path or validate tokens.</li>
+</ul>
+<p>Options: <strong>terminate at the edge</strong> (simplest), <strong>terminate and re-encrypt</strong> to backends (zero-trust networks — usually mTLS via a service mesh), or <strong>TLS passthrough</strong> (an L4 LB forwards encrypted bytes; the gateway terminates). See <a href="networking-basics.html">Networking Basics</a> for how the handshake works.</p>
+
+<h3>3.5 Request validation</h3>
+<p>Reject malformed requests before they consume backend resources: required fields present, types correct, string lengths within limits (caption ≤ 2,200 characters, comment ≤ 300 characters — assume these limits), body size ≤ a maximum, content type allowed, no unknown enum values. Usually driven by a schema (OpenAPI/JSON Schema, or protobuf definitions). Failures return <code>400 Bad Request</code> or <code>413 Payload Too Large</code>. This also blunts some attacks (giant payloads, deeply nested JSON bombs).</p>
+
+<h3>3.6 Transformation (request and response)</h3>
+<p>The gateway can rewrite traffic so clients and services evolve independently:</p>
+<ul>
+  <li><strong>Protocol translation:</strong> client speaks HTTP/JSON, internal services speak <a href="api-design.html">gRPC/protobuf</a>. The gateway converts (e.g. Envoy's gRPC-JSON transcoder).</li>
+  <li><strong>Path rewriting:</strong> <code>/v1/users/42/posts</code> → <code>/internal/posts?author_id=42</code>.</li>
+  <li><strong>Header manipulation:</strong> add <code>X-Request-Id</code>, <code>X-User-Id</code>; remove internal headers from responses (<code>Server</code>, debug headers) so internals don't leak.</li>
+  <li><strong>Version adaptation:</strong> an old app sends the v1 shape; the gateway maps it to the v2 internal shape. Useful when you cannot force-upgrade millions of installed apps.</li>
+  <li><strong>Response shaping:</strong> strip fields a given client does not need, rename fields, compress (gzip/brotli).</li>
+</ul>
+
+<h3>3.7 Response aggregation / composition</h3>
+<p>One client request fans out to several services in parallel, and the gateway merges the results. This turns N round trips over a slow mobile network into one, and the fan-out happens over the fast data-center network (sub-millisecond hops).</p>
+<pre class="ascii">
+ App ── GET /v1/profile/natgeo ──▶ Gateway / BFF
+                                     ├──▶ User service      (name, bio, avatar)         12 ms
+                                     ├──▶ Graph service     (followers, following)       8 ms
+                                     ├──▶ Post service      (first 12 grid thumbnails)  20 ms
+                                     └──▶ Stories service   (highlights, active story)  10 ms
+                                     (all in parallel → total ≈ max = 20 ms + merge)
+ App ◀── one JSON document ──────────┘
+</pre>
+<p>Worked example: on a 4G connection with an 80&nbsp;ms round-trip time, four sequential client calls cost ≈ 4 × 80 = 320&nbsp;ms of network alone. With aggregation: one 80&nbsp;ms round trip + ~20&nbsp;ms of parallel internal calls ≈ 100&nbsp;ms. That's a 3× faster profile screen.</p>
+<p>Aggregation needs care: set a <strong>timeout per dependency</strong> and decide what's optional. If the Stories service is slow, return the profile without highlights (a <em>partial response</em>) rather than failing the whole page — see <a href="resilience-patterns.html">Resilience patterns</a>. Heavy aggregation logic is better placed in a BFF or GraphQL layer (below) than in a generic gateway.</p>
+
+<h3>3.8 Caching</h3>
+<p>A gateway can cache responses for <strong>public, non-personalised</strong> GET requests: e.g. a hashtag's top posts for 30 seconds, public profile metadata for 10 seconds, config/feature-flag payloads for a minute. Cache keys must include anything that changes the response (path, query, <code>Accept-Language</code>, API version, and the user ID if the response is personalised — in which case shared caching rarely pays off). Personalised data like the feed is cached deeper, in the <a href="caching.html">Redis feed cache</a> owned by the Feed service. Media bytes are cached by the <a href="cdn.html">CDN</a>, not the gateway.</p>
+
+<h3>3.9 CORS</h3>
+<p><strong>CORS (Cross-Origin Resource Sharing)</strong> is the browser mechanism that decides whether JavaScript on one origin (say <code>https://www.instagram.com</code>) may call an API on another origin (<code>https://i.instagram.com</code>). For "non-simple" requests (e.g. with an <code>Authorization</code> header or JSON body), the browser first sends an <code>OPTIONS</code> <em>preflight</em> request. The gateway answers it centrally:</p>
+<pre><code>HTTP/1.1 204 No Content
+Access-Control-Allow-Origin: https://www.instagram.com
+Access-Control-Allow-Methods: GET, POST, DELETE
+Access-Control-Allow-Headers: Authorization, Content-Type, Idempotency-Key
+Access-Control-Allow-Credentials: true
+Access-Control-Max-Age: 600</code></pre>
+<p>Handling CORS at the gateway means one consistent allow-list, and preflights never reach backend services. Never reflect arbitrary <code>Origin</code> values together with <code>Allow-Credentials: true</code> — that effectively disables the browser's protection. CORS only matters for browsers; native mobile apps are not subject to it.</p>
+
+<h3>3.10 Logging, metrics and tracing</h3>
+<p>Because every request passes through it, the gateway is the best place to observe the whole API (see <a href="observability.html">Observability</a>):</p>
+<ul>
+  <li><strong>Access logs:</strong> timestamp, request ID, user ID, route, status, latency, bytes, client version, region. (Never log tokens or passwords.)</li>
+  <li><strong>Metrics:</strong> requests/sec, error rate and p50/p99 latency <em>per route</em> and <em>per upstream service</em> — the "RED" metrics (Rate, Errors, Duration). These drive dashboards and alerts.</li>
+  <li><strong>Distributed tracing:</strong> the gateway generates a trace ID (W3C <code>traceparent</code> header) and propagates it; every downstream service adds spans, so one request can be followed across 20 services.</li>
+</ul>
+
+<h3>3.11 Canary releases and A/B routing</h3>
+<p>Since the gateway decides where requests go, it can split traffic deliberately:</p>
+<ul>
+  <li><strong>Canary release:</strong> deploy feed-service v2 to a few instances and route 1% of traffic to it. Watch error rate and latency; ramp 1% → 5% → 25% → 100%, or roll back instantly by changing the weight. Bad releases hurt 1% of users for minutes instead of everyone.</li>
+  <li><strong>Sticky splitting:</strong> choose the bucket by hashing the user ID — <code>hash(user_id) % 100 &lt; 5</code> — so the same user consistently sees the same version (no flip-flopping between requests).</li>
+  <li><strong>A/B experiments:</strong> route users in the experiment group to a new ranking model or a new endpoint implementation; metrics are tagged with the variant. (Many product experiments are instead decided <em>inside</em> services by an experimentation framework; the gateway handles infrastructure-level splits.)</li>
+  <li><strong>Header-based routing:</strong> internal employees (<code>X-Dogfood: 1</code>) or a specific app build go to a staging backend.</li>
+  <li><strong>Shadow traffic (mirroring):</strong> copy live requests to a new service version and discard its responses — test at production load with zero user impact.</li>
+</ul>
+<pre><code>route: GET /v1/feed
+  split:
+    - weight: 99   upstream: feed-service-stable
+    - weight: 1    upstream: feed-service-canary      # sticky on hash(user_id)
+  mirror: feed-service-shadow (10% of requests, responses ignored)</code></pre>
+
+<h3>3.12 Other responsibilities you'll hear about</h3>
+<div class="cards">
+  <div class="card"><h4>🔌 Circuit breaking &amp; retries</h4><p>Stop sending traffic to an upstream that's failing; retry idempotent GETs on another instance. See <a href="resilience-patterns.html">Resilience patterns</a>.</p></div>
+  <div class="card"><h4>🧯 Load shedding</h4><p>When overloaded, drop low-priority traffic (prefetch, analytics) first so core actions (posting, DMs) survive.</p></div>
+  <div class="card"><h4>🔑 API keys &amp; developer portal</h4><p>For third-party apps: issue keys, enforce quotas and plans, show usage analytics.</p></div>
+  <div class="card"><h4>🛡️ WAF / IP filtering</h4><p>Block known-bad IPs, SQL-injection-like patterns, bots. Often done even earlier, at the CDN/edge. See <a href="security.html">Security</a>.</p></div>
+</div>
+
+<h2>4. The Backend-for-Frontend (BFF) pattern</h2>
+<p>A single generic gateway serving every client eventually becomes awkward. The iOS app, the Android app and the web app need <strong>different shapes of data</strong>:</p>
+<ul>
+  <li>Mobile wants <strong>compact payloads</strong> (metered data, slow networks), smaller image renditions, and aggregated screens ("everything for the feed screen in one call").</li>
+  <li>Web wants larger renditions, SEO-friendly server-side rendering data, and can tolerate more requests over fast broadband.</li>
+  <li>Mobile apps live for years in the wild; old versions must keep working. Web is redeployed instantly.</li>
+</ul>
+<p>The <strong>Backend-for-Frontend</strong> pattern (coined at SoundCloud) gives each client experience its own thin backend layer, usually <em>owned by the team that builds that client</em>:</p>
+
+<div class="diagram">
+<svg viewBox="0 0 800 280" width="800" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-gw-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600">
+    <rect x="20" y="40" width="130" height="40" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="85" y="65" text-anchor="middle">📱 iOS app</text>
+    <rect x="20" y="110" width="130" height="40" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="85" y="135" text-anchor="middle">📱 Android app</text>
+    <rect x="20" y="200" width="130" height="40" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="85" y="225" text-anchor="middle">💻 Web app</text>
+    <rect x="200" y="60" width="130" height="200" rx="10" fill="#fff3e0" stroke="#ef6c00"/><text x="265" y="150" text-anchor="middle">Edge gateway</text><text x="265" y="168" text-anchor="middle" font-weight="400" font-size="11.5">TLS, AuthN,</text><text x="265" y="184" text-anchor="middle" font-weight="400" font-size="11.5">rate limits</text>
+    <rect x="380" y="70" width="140" height="56" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="450" y="94" text-anchor="middle">Mobile BFF</text><text x="450" y="112" text-anchor="middle" font-weight="400" font-size="11.5">compact, aggregated</text>
+    <rect x="380" y="190" width="140" height="56" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="450" y="214" text-anchor="middle">Web BFF</text><text x="450" y="232" text-anchor="middle" font-weight="400" font-size="11.5">SSR data, richer</text>
+    <rect x="590" y="30" width="180" height="34" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="680" y="52" text-anchor="middle">User service</text>
+    <rect x="590" y="80" width="180" height="34" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="680" y="102" text-anchor="middle">Feed service</text>
+    <rect x="590" y="130" width="180" height="34" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="680" y="152" text-anchor="middle">Post service</text>
+    <rect x="590" y="180" width="180" height="34" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="680" y="202" text-anchor="middle">Graph service</text>
+    <rect x="590" y="230" width="180" height="34" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="680" y="252" text-anchor="middle">Stories service</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" marker-end="url(#ar-gw-2)" fill="none">
+    <path d="M150,60 L198,100"/><path d="M150,130 L198,135"/><path d="M150,220 L198,215"/>
+    <path d="M330,120 L378,100"/><path d="M330,200 L378,215"/>
+    <path d="M520,90 L588,50"/><path d="M520,96 L588,97"/><path d="M520,104 L588,145"/><path d="M520,112 L588,195"/>
+    <path d="M520,210 L588,55"/><path d="M520,218 L588,150"/><path d="M520,226 L588,245"/>
+  </g>
+</svg>
+<div class="caption">A shared edge gateway does generic policies; per-experience BFFs shape and aggregate data for their client; domain services stay client-agnostic.</div>
+</div>
+
+<div class="table-wrap"><table>
+  <tr><th></th><th>Single general-purpose gateway</th><th>BFF per client type</th></tr>
+  <tr><td><b>Payload shape</b></td><td>One-size-fits-all; clients over- or under-fetch</td><td>Exactly what each screen needs</td></tr>
+  <tr><td><b>Ownership</b></td><td>Central platform team becomes a bottleneck for every client change</td><td>Client teams own their BFF and ship independently</td></tr>
+  <tr><td><b>Duplication</b></td><td>None</td><td>Some logic duplicated across BFFs (mitigate with shared libraries)</td></tr>
+  <tr><td><b>Operational cost</b></td><td>One fleet</td><td>Several fleets to deploy and monitor</td></tr>
+  <tr><td><b>Old-client support</b></td><td>Version shims pile up in one place</td><td>Mobile BFF holds mobile-specific compatibility code</td></tr>
+</table></div>
+<div class="callout tip"><span class="callout-title">💡 Rule of thumb</span>
+Put <strong>generic, security-critical</strong> policies (TLS, AuthN, rate limits, WAF) in the shared edge gateway. Put <strong>client-specific</strong> composition and shaping in BFFs. Put <strong>business rules</strong> (who can see what, how a like is counted) in domain services. Never put business rules in the gateway.</div>
+<p>BFF granularity: "one per platform" (iOS, Android, web) is common; many companies use one <em>mobile</em> BFF for both iOS and Android because their needs are nearly identical. A GraphQL layer (Section 7) can replace multiple BFFs by letting each client ask for exactly the fields it wants.</p>
+
+<h2>5. North-south vs east-west traffic: gateway vs service mesh</h2>
+<p>Data-center diagrams are usually drawn with the internet at the top and servers below, so:</p>
+<ul>
+  <li><strong>North-south traffic</strong> enters or leaves the data center: client ⇄ backend. This goes through the <strong>API gateway</strong>.</li>
+  <li><strong>East-west traffic</strong> flows <em>between</em> services inside the data center: Feed service → Graph service, Like service → Kafka, etc. At Instagram scale, east-west traffic is many times larger than north-south — one feed request may fan out to dozens of internal calls.</li>
+</ul>
+<p>East-west traffic needs many of the same features (load balancing, retries, timeouts, mTLS, metrics, tracing) but routing it all through a central gateway would add a hop and create a giant bottleneck. Instead, a <strong>service mesh</strong> (Istio, Linkerd, Consul Connect) puts a small proxy — a <strong>sidecar</strong>, usually Envoy — next to every service instance. Services talk to <code>localhost</code>; the sidecar does discovery, load balancing, mTLS encryption and identity, retries, circuit breaking and telemetry. A central <strong>control plane</strong> pushes configuration to all sidecars.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 800 260" width="800" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-gw-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600">
+    <rect x="320" y="10" width="160" height="36" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="400" y="33" text-anchor="middle">📱 Clients (internet)</text>
+    <rect x="320" y="76" width="160" height="36" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="400" y="99" text-anchor="middle">API Gateway</text>
+    <rect x="40" y="150" width="200" height="80" rx="10" fill="#e8f5e9" stroke="#2e7d32"/><text x="140" y="176" text-anchor="middle">Feed service</text>
+    <rect x="300" y="150" width="200" height="80" rx="10" fill="#e8f5e9" stroke="#2e7d32"/><text x="400" y="176" text-anchor="middle">Graph service</text>
+    <rect x="560" y="150" width="200" height="80" rx="10" fill="#e8f5e9" stroke="#2e7d32"/><text x="660" y="176" text-anchor="middle">Post service</text>
+  </g>
+  <g font-size="11.5">
+    <rect x="80" y="190" width="120" height="26" rx="5" fill="#eceff1" stroke="#455a64"/><text x="140" y="208" text-anchor="middle">Envoy sidecar</text>
+    <rect x="340" y="190" width="120" height="26" rx="5" fill="#eceff1" stroke="#455a64"/><text x="400" y="208" text-anchor="middle">Envoy sidecar</text>
+    <rect x="600" y="190" width="120" height="26" rx="5" fill="#eceff1" stroke="#455a64"/><text x="660" y="208" text-anchor="middle">Envoy sidecar</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" marker-end="url(#ar-gw-3)" fill="none">
+    <path d="M400,46 L400,74"/><path d="M370,112 L180,148"/>
+    <path d="M200,203 L338,203" stroke="#6a1b9a"/><path d="M460,203 L598,203" stroke="#6a1b9a"/>
+  </g>
+  <text x="560" y="62" font-size="11.5" fill="#ef6c00" font-weight="600">north-south (gateway)</text>
+  <text x="400" y="250" text-anchor="middle" font-size="11.5" fill="#6a1b9a" font-weight="600">east-west (service mesh, mTLS between sidecars)</text>
+</svg>
+<div class="caption">The gateway guards the front door; sidecar proxies in a service mesh manage traffic between services.</div>
+</div>
+
+<div class="table-wrap"><table>
+  <tr><th></th><th>API gateway</th><th>Service mesh</th></tr>
+  <tr><td><b>Traffic</b></td><td>North-south (external clients)</td><td>East-west (service-to-service)</td></tr>
+  <tr><td><b>Deployment</b></td><td>Centralised fleet at the edge</td><td>Distributed sidecar per instance + control plane</td></tr>
+  <tr><td><b>Main concerns</b></td><td>End-user auth, API keys, rate limits per user, CORS, API versioning, aggregation</td><td>Service identity (mTLS), retries, timeouts, circuit breaking, internal load balancing, telemetry</td></tr>
+  <tr><td><b>Trust model</b></td><td>Caller is untrusted (the internet)</td><td>Caller is another service — still verified (zero trust)</td></tr>
+  <tr><td><b>Examples</b></td><td>Kong, AWS API Gateway, Apigee, Envoy Gateway</td><td>Istio, Linkerd, Consul Connect</td></tr>
+</table></div>
+<p>They are complementary, and often built on the same proxy (Envoy) — the gateway is sometimes called the mesh's "ingress gateway".</p>
+
+<h2>6. Keeping the gateway from becoming a SPOF or bottleneck</h2>
+<p>Every single API request passes through the gateway, so if it's down, <em>Instagram is down</em>; if it's slow, <em>everything</em> is slow. Design principles:</p>
+
+<h3>6.1 Stateless and horizontally scaled</h3>
+<ul>
+  <li><strong>Stateless:</strong> a gateway instance keeps no per-user state in memory that another instance would need. Session data lives in the token (JWT) or in a shared store; rate-limit counters live in Redis (plus small local buckets). Any instance can serve any request, so you scale by adding instances behind the load balancer and can kill any instance at any time.</li>
+  <li><strong>Many instances across availability zones and regions:</strong> e.g. assume peak 1.5M API requests/sec and one gateway instance handles ~15k req/s with headroom → ~100 instances, then add N+2 per zone and spread them across 3 zones in each region. See <a href="multi-region.html">Multi-region</a>.</li>
+  <li><strong>Redundant layers in front:</strong> DNS returns multiple IPs; anycast or multiple L4 load balancers; health checks remove dead gateway instances within seconds.</li>
+</ul>
+
+<h3>6.2 Fail sensibly when dependencies fail</h3>
+<ul>
+  <li><strong>Auth without a network call:</strong> validating JWT signatures locally with cached public keys means the gateway keeps working even if the auth service hiccups.</li>
+  <li><strong>Rate-limiter outage:</strong> if Redis is unreachable, decide in advance whether to <em>fail open</em> (allow requests, with local per-instance limits as a safety net) or <em>fail closed</em> (reject). Most consumer products fail open for general traffic and closed for sensitive endpoints like login.</li>
+  <li><strong>Config errors are the #1 risk:</strong> a bad routing rule pushed globally takes down everything at once. Roll out gateway config like code: validation, staged rollout region by region, instant rollback.</li>
+  <li><strong>Isolation:</strong> separate gateway pools (or bulkheads) for very different traffic — e.g. long-lived WebSocket connections for DMs vs short HTTP calls — so a surge in one can't starve the other.</li>
+</ul>
+
+<h3>6.3 Latency overhead budget</h3>
+<p>The gateway adds an extra network hop plus processing. Typical costs:</p>
+<div class="table-wrap"><table>
+  <tr><th>Step</th><th>Typical cost</th><th>How to keep it low</th></tr>
+  <tr><td>Extra hop inside the data center</td><td>0.2–0.5 ms</td><td>Keep-alive connection pools to upstreams; HTTP/2 multiplexing</td></tr>
+  <tr><td>TLS handshake (new connection)</td><td>1–2 RTTs (client-side)</td><td>TLS 1.3, session resumption, long-lived connections from the app</td></tr>
+  <tr><td>JWT signature check</td><td>~0.05–0.2 ms (asymmetric verify)</td><td>Cache keys; prefer fast algorithms (Ed25519/ECDSA)</td></tr>
+  <tr><td>Rate-limit check in Redis</td><td>~0.3–1 ms</td><td>Pipelining, Lua scripts, local token buckets with periodic sync</td></tr>
+  <tr><td>Logging/metrics</td><td>~0</td><td>Asynchronous, batched, sampled tracing</td></tr>
+</table></div>
+<p>Target: total gateway overhead of <strong>~1–5&nbsp;ms at p99</strong> on a request whose end-to-end budget is ~200&nbsp;ms. Avoid putting slow work (synchronous calls to many services, heavy transformations, large body buffering) in the generic gateway path. Media uploads should <em>bypass</em> the gateway entirely by using <a href="media-upload.html">pre-signed URLs</a> straight to object storage — the gateway only hands out the URL.</p>
+
+<div class="callout danger"><span class="callout-title">🚫 Anti-pattern: the "smart gateway" monolith</span>
+Teams sometimes keep adding business logic to the gateway ("just compute the badge count here"). Soon the gateway is a distributed monolith that every team must change and deploy, with no clear owner. Keep the gateway <strong>dumb about the business and smart about traffic</strong>.</div>
+
+<h2>7. GraphQL gateways</h2>
+<p><strong>GraphQL</strong> (created at Facebook, open-sourced in 2015) lets the client send a <em>query</em> describing exactly the fields it wants; the server returns exactly that shape. A <strong>GraphQL gateway</strong> exposes one unified schema and resolves each field by calling the appropriate backend service.</p>
+<pre><code>query ProfileScreen {
+  user(username: "natgeo") {
+    fullName
+    avatarUrl(size: 150)
+    followerCount
+    isFollowedByViewer
+    posts(first: 12) { edges { node { id thumbnailUrl likeCount } } }
+    storyHighlights { id title coverUrl }
+  }
+}</code></pre>
+<p>The gateway's resolvers map <code>user</code> → User service, <code>followerCount</code>/<code>isFollowedByViewer</code> → Graph service, <code>posts</code> → Post service, <code>storyHighlights</code> → Stories service, run them in parallel, and assemble one response. This gives aggregation and per-client shaping without writing a separate BFF endpoint for every screen.</p>
+<ul>
+  <li><strong>Federation:</strong> in large companies each team owns a <em>subgraph</em> (part of the schema), and a federated gateway (e.g. Apollo Router) composes them into one supergraph.</li>
+  <li><strong>The N+1 problem:</strong> resolving <code>author</code> for each of 12 posts naively makes 12 calls; a <strong>DataLoader</strong> batches them into one <code>getUsers([ids])</code> call.</li>
+  <li><strong>Protecting the gateway:</strong> clients can write expensive queries, so enforce depth limits, cost analysis, and <strong>persisted queries</strong> (the app sends a query hash; the server only runs pre-registered queries). Persisted queries also shrink request size and make GET-caching possible.</li>
+  <li><strong>Rate limiting by cost</strong> rather than by request count, since one query may be cheap or enormous.</li>
+</ul>
+<p>Comparison with REST and gRPC is in <a href="api-design.html">API Design</a>.</p>
+
+<h2>8. How Instagram uses its API gateway</h2>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+Instagram began as a Django (Python) monolith behind NGINX/load balancers. As it grew inside Meta, it adopted Meta's edge infrastructure — public engineering talks describe Meta's <em>Proxygen</em>-based edge and data-center load balancers terminating TLS and routing to app servers, and Meta is publicly known as the creator of GraphQL, which Instagram clients use for many surfaces. In this course's diagram, those layers are drawn simply as <strong>Load Balancer → API Gateway</strong>, where the gateway owns AuthN/Z, rate limiting, routing and TLS.</div>
+
+<h3>8.1 One request, step by step: liking a post</h3>
+<p>Let's follow <code>POST /v1/posts/987/likes</code> from the app:</p>
+<ol class="steps">
+  <li><strong>DNS + connection.</strong> The app already has a warm HTTP/2 (or HTTP/3/QUIC) connection to <code>i.instagram.com</code>, resolved via <a href="dns.html">DNS</a> to the nearest edge. No new handshake needed.</li>
+  <li><strong>Load balancer.</strong> The L4 load balancer hashes the connection to one healthy gateway instance in the region.</li>
+  <li><strong>TLS termination.</strong> The gateway decrypts the request. It now sees method, path, headers and body.</li>
+  <li><strong>Assign a request ID and start a trace.</strong> <code>X-Request-Id: 7f3c…</code> and a <code>traceparent</code> header are added; a timer starts.</li>
+  <li><strong>Basic hygiene.</strong> Body size within limits? Content-Type allowed? Client version still supported (very old app builds get <code>426 Upgrade Required</code> / a force-upgrade message)?</li>
+  <li><strong>Authenticate.</strong> Parse <code>Authorization: Bearer …</code>, verify signature and expiry with the cached public key → user ID 1234, device ID d-55. Invalid → <code>401</code>; the app uses its refresh token to get a new access token.</li>
+  <li><strong>Rate limit.</strong> Check buckets in Redis: the general per-user request limit and the action-specific "likes per hour" limit used against spam bots. Over the limit → <code>429</code> with <code>Retry-After</code>.</li>
+  <li><strong>Validate.</strong> Is <code>987</code> a well-formed post ID? Is an <code>Idempotency-Key</code> present for this write?</li>
+  <li><strong>Route.</strong> The routing table says <code>/v1/posts/{id}/likes</code> → Like &amp; Comment Service. Service discovery returns healthy instances; the gateway picks one (least-outstanding-requests) and forwards over a pooled connection, adding <code>X-User-Id: 1234</code>.</li>
+  <li><strong>Service does the real work.</strong> The Like service checks object-level permission (is the post visible to 1234? is 1234 blocked by the author?), writes the like, increments the counter in Redis, and publishes a <code>like.created</code> event to <a href="message-queues.html">Kafka</a> (consumed by the <a href="notifications.html">Notification service</a> to push "user liked your photo").</li>
+  <li><strong>Response path.</strong> The gateway receives <code>200 {"liked": true, "like_count": 10431}</code>, strips internal headers, adds rate-limit headers, compresses, and returns it.</li>
+  <li><strong>Observe.</strong> The gateway asynchronously emits an access-log line and metrics (route=<code>likes.create</code>, status=200, latency=18 ms) and closes its trace span.</li>
+</ol>
+
+<div class="flow">
+  <div class="fnode client">📱 App<small>POST like</small></div><div class="farrow">→</div>
+  <div class="fnode edge">Load Balancer<small>L4</small></div><div class="farrow">→</div>
+  <div class="fnode edge">API Gateway<small>TLS · AuthN · 429 · route</small></div><div class="farrow">→<small>X-User-Id</small></div>
+  <div class="fnode svc">Like &amp; Comment<small>AuthZ + write</small></div><div class="farrow">→<small>event</small></div>
+  <div class="fnode async">Kafka<small>like.created</small></div>
+</div>
+
+<h3>8.2 Rough numbers</h3>
+<p>Assume 500M daily active users, each making ~200 API calls/day (feed pages, stories, likes, prefetch, telemetry):</p>
+<pre><code>500M × 200 = 100 billion API requests/day
+100e9 / 86,400 s ≈ 1.16M requests/s average; assume peak ≈ 2–3× → ~3M req/s
+If one gateway instance comfortably handles ~20k req/s at p99 &lt; 5 ms:
+   3M / 20k = 150 instances at peak, ×1.5 headroom for zone failure ≈ 225 instances worldwide
+Gateway overhead 2 ms × 100B requests/day ≈ 200M seconds of added latency per day —
+   which is why every millisecond in the gateway path is engineered away.</code></pre>
+<p>Note what does <em>not</em> go through the gateway: photo/video bytes (served by the <a href="cdn.html">CDN</a> and uploaded directly to <a href="object-storage.html">object storage</a> via pre-signed URLs). This keeps the gateway handling small JSON requests only.</p>
+
+<h2>9. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Benefits</h4><ul>
+    <li>One stable public API; internal services can be split, moved or rewritten freely</li>
+    <li>Cross-cutting concerns implemented once, consistently and securely</li>
+    <li>Smaller attack surface — only the gateway is internet-facing</li>
+    <li>Fewer client round trips via aggregation</li>
+    <li>Central visibility: per-route metrics, logs, traces</li>
+    <li>Safe deploys: canaries, A/B splits, shadow traffic</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs</h4><ul>
+    <li>Extra hop and a few ms of latency on every request</li>
+    <li>Potential single point of failure and bottleneck if not scaled and isolated</li>
+    <li>A misconfiguration can take down the whole API at once</li>
+    <li>Risk of becoming a "smart" monolith that every team must change</li>
+    <li>Another critical system to operate, upgrade and secure</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Trusting the gateway for object-level authorization</strong> — services must still check "can this user see this post?".</li>
+  <li><strong>Trusting identity headers from the outside.</strong> If a client sends <code>X-User-Id: 1</code>, the gateway must strip it and set its own; services must accept identity only from the gateway/mesh (mTLS).</li>
+  <li><strong>Stateful gateways</strong> (in-memory sessions) that break when an instance dies or traffic shifts.</li>
+  <li><strong>Routing big uploads through the gateway</strong> — ties up connections and memory; use pre-signed URLs.</li>
+  <li><strong>Missing timeouts</strong> to upstreams — one slow service exhausts the gateway's connection pool and takes down unrelated routes. Set per-route timeouts and use bulkheads.</li>
+  <li><strong>Retrying non-idempotent requests</strong> (POST) at the gateway can create duplicate posts or comments unless idempotency keys are used (see <a href="api-design.html">API Design</a>).</li>
+  <li><strong>Logging sensitive data</strong> (tokens, passwords, full request bodies) in access logs.</li>
+  <li><strong>Global config pushes without staging</strong> — roll out gateway changes gradually.</li>
+</ul>
+
+<h2>10. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Tool</th><th>What it is</th><th>When to use it</th></tr>
+  <tr><td><b>NGINX / OpenResty</b></td><td>High-performance reverse proxy and web server; OpenResty adds Lua scripting</td><td>Classic reverse proxy, TLS termination, simple routing and rate limiting; base for many gateways</td></tr>
+  <tr><td><b>Envoy</b></td><td>Modern L4/L7 proxy (from Lyft) with dynamic config APIs, gRPC, HTTP/2/3, rich observability</td><td>Service-mesh sidecars and edge gateways (Envoy Gateway, Istio ingress); gRPC-JSON transcoding</td></tr>
+  <tr><td><b>Kong</b></td><td>API gateway built on NGINX/OpenResty with a plugin ecosystem (auth, rate limiting, transformations)</td><td>Self-hosted, plugin-driven API management, API keys and developer portals</td></tr>
+  <tr><td><b>AWS API Gateway</b></td><td>Fully managed gateway: REST, HTTP and WebSocket APIs, Lambda integration, usage plans</td><td>Serverless and AWS-native APIs where you don't want to run gateway servers</td></tr>
+  <tr><td><b>Google Apigee</b></td><td>Enterprise API management: policies, monetisation, analytics, developer portal</td><td>Exposing APIs to partners/third parties with quotas, billing and analytics</td></tr>
+  <tr><td><b>Azure API Management, Tyk, KrakenD, Traefik</b></td><td>Other managed/open-source gateways; KrakenD focuses on aggregation, Traefik on Kubernetes</td><td>Cloud-specific or Kubernetes-native setups</td></tr>
+  <tr><td><b>Apollo Router / GraphQL Mesh</b></td><td>GraphQL federation gateways</td><td>Unifying many team-owned GraphQL subgraphs</td></tr>
+  <tr><td><b>Istio / Linkerd</b></td><td>Service meshes (control plane + sidecar proxies)</td><td>East-west traffic: mTLS, retries, traffic splitting between services</td></tr>
+  <tr><td><b>Proxygen (Meta)</b></td><td>Meta's open-source C++ HTTP framework used in its edge proxies</td><td>Example of a hyperscaler building its own proxy layer</td></tr>
+</table></div>
+
+<h2>11. Interview corner</h2>
+<details class="qa"><summary>What's the difference between a load balancer, a reverse proxy and an API gateway?</summary>
+<p>A reverse proxy is any server that accepts client requests on behalf of hidden backends (TLS termination, caching, buffering). A load balancer is a reverse proxy (or L4 device) whose job is spreading traffic across many identical instances of one service using health checks and algorithms. An API gateway is an L7 reverse proxy that understands the <em>API</em>: it routes different paths to different services, authenticates users, enforces per-consumer rate limits and quotas, validates and transforms requests, and aggregates responses. In practice an API gateway also load-balances across instances of each upstream, and the same software (Envoy, NGINX) can fill all three roles.</p></details>
+<details class="qa"><summary>Where do you do authentication and where do you do authorization in a microservice architecture?</summary>
+<p>Authentication (verifying the token and establishing the user ID) at the gateway, once, so services don't each re-implement it; the gateway forwards a trusted identity (header within mTLS or a signed internal token). Coarse authorization (scopes for third-party apps, "is this an admin endpoint") can also be at the gateway. Fine-grained, object-level authorization — can user A see post B, given private accounts, blocks and close-friends lists — must be in the service that owns the data, because only it has that data. Defense in depth: services should still reject requests that didn't come through the gateway.</p></details>
+<details class="qa"><summary>Isn't the API gateway a single point of failure? How do you avoid that?</summary>
+<p>It's a single <em>logical</em> point, not a single machine. Make it stateless (identity in tokens, counters in Redis), run many instances across availability zones and regions behind redundant L4 load balancers/anycast, health-check and auto-scale them. Avoid hard runtime dependencies: verify JWTs locally with cached keys, fail open with local limits if the rate-limit store is down. Isolate traffic classes with separate pools. The biggest real risk is a bad config push, so stage config rollouts region by region with automated rollback.</p></details>
+<details class="qa"><summary>How would you design the API layer so mobile and web clients both get good performance?</summary>
+<p>A shared edge gateway for generic concerns (TLS, auth, rate limiting) plus a Backend-for-Frontend per experience: a mobile BFF returning compact, screen-oriented aggregated payloads with smaller image renditions and holding compatibility shims for old app versions, and a web BFF for richer/SSR data. Alternatively a GraphQL layer with persisted queries, letting each client request exactly the fields it needs. Domain services remain client-agnostic.</p></details>
+<details class="qa"><summary>How would you roll out a new version of the Feed service safely?</summary>
+<p>Use the gateway's weighted routing: deploy v2 beside v1, optionally mirror shadow traffic first to compare responses and latency, then route 1% of users (sticky by <code>hash(user_id)</code>) to v2, watch error rate, p99 latency and business metrics (feed engagement), and ramp 5% → 25% → 100% with automated rollback if SLOs degrade. Because routing is config, rollback takes seconds.</p></details>
+<details class="qa"><summary>What's the difference between an API gateway and a service mesh? Do you need both?</summary>
+<p>The gateway manages north-south traffic from untrusted clients: user auth, API keys, per-user rate limits, CORS, versioning, aggregation. The mesh manages east-west traffic between services via sidecar proxies: mTLS service identity, retries, timeouts, circuit breaking, load balancing and telemetry. Large systems with many services typically use both — often both built on Envoy. Small systems can skip the mesh and use client libraries.</p></details>
+<details class="qa"><summary>A client uploads a 200 MB Reel. Should that go through the gateway?</summary>
+<p>No. The app calls the gateway for a small request (<code>POST /v1/media/upload-url</code>), which is authenticated and rate-limited; the Upload service returns a short-lived pre-signed URL; the app uploads bytes directly to object storage (often resumable/chunked). This keeps gateway instances from tying up memory and connections for minutes and avoids paying double bandwidth. See <a href="media-upload.html">Media Upload</a>.</p></details>
+
+<h2>12. Check your understanding</h2>
+<details class="quiz"><summary>Which of these belong in the gateway: (a) JWT signature validation, (b) "is user 42 blocked by the author of post 9?", (c) per-user rate limits, (d) computing a post's like count, (e) CORS preflight responses?</summary>
+<p><strong>(a), (c) and (e).</strong> They're generic cross-cutting concerns that need no domain data. (b) is object-level authorization requiring the block list — it belongs in the service that owns posts/graph. (d) is business logic owned by the Like &amp; Comment service.</p></details>
+<details class="quiz"><summary>The profile screen needs 4 backend calls. Mobile RTT is 100 ms; each internal call takes ~15 ms. Estimate the time with and without gateway aggregation (ignore server think time beyond that).</summary>
+<p>Without aggregation (sequential client calls): 4 × (100 + 15) ≈ 460 ms. Even if the client parallelises them, it's ≈ 115 ms but uses 4 requests and more radio/battery. With aggregation: 1 × 100 ms + ~15 ms (parallel internal calls) + ~1–2 ms gateway overhead ≈ 117 ms, using a single request. The big win is avoiding sequential mobile round trips.</p></details>
+<details class="quiz"><summary>An attacker sends <code>X-User-Id: 1</code> in their request headers. What should happen?</summary>
+<p>The gateway must strip any incoming identity headers and set them only from the validated token. Services should accept identity headers only over authenticated internal channels (mTLS from the gateway/mesh). Otherwise an attacker could impersonate any user — a classic header-spoofing vulnerability.</p></details>
+<details class="quiz"><summary>Why must a gateway be stateless, and where does the "state" go instead?</summary>
+<p>So any instance can handle any request, instances can be added or killed freely, and failures don't lose user data. State moves to: the token itself (JWT claims), shared stores (Redis for rate-limit counters, session stores), and config distributed from a control plane.</p></details>
+<details class="quiz"><summary>Is traffic from the Feed service to the Graph service north-south or east-west? What component typically manages it?</summary>
+<p>East-west (service-to-service inside the data center). A service mesh's sidecar proxies (or RPC client libraries) manage it — not the public API gateway, which would add an unnecessary hop and bottleneck.</p></details>
+<details class="quiz"><summary>You route 2% of users to a canary using a random number per request rather than <code>hash(user_id)</code>. What goes wrong?</summary>
+<p>Each user's requests bounce randomly between versions, so a single session mixes v1 and v2 behaviour (inconsistent UI, cache confusion), and you can't attribute user-level metrics to a version. Hash-based sticky bucketing keeps each user on one version and makes rollouts and experiments measurable.</p></details>
+<details class="quiz"><summary>Gateway overhead rises from 2 ms to 12 ms at p99 after enabling a new plugin. Name two likely causes and fixes.</summary>
+<p>(1) A synchronous network call per request (e.g. token introspection or a remote policy check) — fix with local JWT verification or a short-TTL local cache. (2) Buffering/transforming full request bodies — fix by streaming, or moving heavy transformation to a BFF. Others: rate-limit checks without pipelining (use Lua scripts / local buckets), synchronous logging (make it async).</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>The API gateway is the <strong>single managed front door</strong> for client API traffic: it decouples the public API from internal services.</li>
+    <li>It centralises <strong>cross-cutting concerns</strong>: routing, AuthN, rate limiting, TLS, validation, transformation, aggregation, caching, CORS, observability and traffic splitting.</li>
+    <li><strong>Gateway = identity; services = object-level permissions.</strong> Never put business rules in the gateway.</li>
+    <li>Use <strong>BFFs</strong> (or GraphQL) to give mobile and web tailored payloads; use a <strong>service mesh</strong> for east-west traffic.</li>
+    <li>Keep it <strong>stateless, horizontally scaled, multi-zone</strong>, with a few ms of overhead — and keep big media bytes off it entirely.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="load-balancer.html">Load Balancing</a> — the layer in front of the gateway and the algorithms it uses for upstreams</li>
+  <li><a href="rate-limiting.html">Rate Limiting</a> — the algorithms behind the gateway's 429s</li>
+  <li><a href="authentication.html">Authentication &amp; Authorization</a> — tokens the gateway validates and the checks services must still do</li>
+  <li><a href="api-design.html">API Design</a> — REST/gRPC/GraphQL contracts the gateway exposes and translates</li>
+  <li><a href="microservices.html">Microservices &amp; Stateless Services</a> — the services behind the gateway</li>
+  <li><a href="resilience-patterns.html">Resilience patterns</a> — timeouts, retries and circuit breakers at the gateway and mesh</li>
+  <li><a href="observability.html">Monitoring, Logging &amp; Tracing</a> — what to do with the gateway's logs, metrics and traces</li>
+  <li><a href="request-flows.html">End-to-End Request Flows</a> — see the gateway's place in every Instagram flow</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

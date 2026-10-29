@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Resilience: Timeouts, Retries &amp; Circuit Breakers — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="resilience-patterns">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>At Instagram's scale something is <strong>always</strong> failing: a crashed host, a slow disk, a flaky network link, an overloaded dependency. Resilience is designing so that <strong>partial failure stays partial</strong>.</li>
+    <li>The worst failures are <strong>slow</strong>, not dead: a slow dependency ties up threads and connections upstream and causes a <strong>cascading failure</strong>.</li>
+    <li>Core toolkit: <strong>timeouts</strong> (with deadline propagation), <strong>retries with exponential backoff + jitter</strong> (within a <strong>retry budget</strong>), <strong>idempotency</strong>, <strong>circuit breakers</strong>, <strong>bulkheads</strong>, <strong>load shedding</strong>, <strong>backpressure</strong> and <strong>hedged requests</strong>.</li>
+    <li><strong>Graceful degradation</strong>: when a dependency fails, serve something useful — a cached/chronological feed, hidden like counts, queued uploads — instead of an error page.</li>
+    <li>Use <strong>liveness vs readiness</strong> health checks correctly, and prove it all works with <strong>chaos engineering</strong> and failure drills.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why do systems need resilience patterns?</h2>
+<p>Opening the Instagram home feed looks like one request, but behind the <a href="api-gateway.html">API Gateway</a> the <a href="news-feed.html">News Feed Service</a> fans out to many others: the feed cache (Redis), the ranking service, the post metadata store, the <a href="likes-comments.html">like &amp; comment counters</a>, the user service for profile pictures, the <a href="stories.html">Stories</a> tray, ads, and more. Each of those talks to its own databases and caches.</p>
+<p>Now do the arithmetic. Suppose each of 10 dependencies is independently available 99.9% of the time. If the feed needs <em>all</em> of them:</p>
+<pre><code>P(feed works) = 0.999^10 ≈ 0.990  → 99.0% — about 7 hours of failure per month
+With 30 dependencies: 0.999^30 ≈ 0.970  → 97% — the app is broken ~22 hours/month</code></pre>
+<p>Adding dependencies <em>multiplies</em> failure probability. At scale, with tens of thousands of servers, hardware failure is not an exception — it is a constant background rate. Disks die daily, a top-of-rack switch fails weekly, a deploy introduces a bug, a garbage-collection pause freezes a JVM for 2 seconds. The goal of resilience engineering is to make the system <strong>degrade gracefully</strong>: a failure in the like counter should mean "like counts are missing for a minute", not "Instagram is down". (See <a href="core-principles.html">availability and reliability</a> for the definitions of nines.)</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  A house's electrical system has a <strong>circuit breaker</strong> for each room: a short circuit in the kitchen trips the kitchen breaker and the rest of the house keeps its lights on. Ships are divided by watertight <strong>bulkheads</strong> so one hole floods one compartment, not the whole hull. A restaurant that's overwhelmed stops seating new guests (<strong>load shedding</strong>) rather than letting the kitchen collapse and serving nobody. Software resilience patterns borrow all three ideas.
+</div>
+
+<h2>2. Kinds of failure</h2>
+<div class="table-wrap"><table>
+  <tr><th>Failure type</th><th>What happens</th><th>Instagram example</th><th>Why it's tricky</th></tr>
+  <tr><td><b>Crash (fail-stop)</b></td><td>Process or machine dies; connections are refused or reset.</td><td>A Feed Service pod is OOM-killed.</td><td>Easiest kind: fast, obvious errors. The <a href="load-balancer.html">load balancer</a> removes it via health checks.</td></tr>
+  <tr><td><b>Slow / gray failure</b></td><td>Still "up" and passing health checks, but responses take 5 s instead of 20 ms, or 5% of requests fail.</td><td>A Cassandra node with a degrading disk; a Redis shard swapping memory.</td><td>Hardest kind. Callers wait instead of failing fast, holding threads and connections. Health checks often say "fine".</td></tr>
+  <tr><td><b>Network partition</b></td><td>Nodes are alive but can't reach each other (or only some can).</td><td>A link between two data centers drops; half the Kafka brokers can't see ZooKeeper/controller.</td><td>From one side, "the other side is dead" and "the network is broken" look identical. Ties into <a href="cap-consistency.html">CAP</a>.</td></tr>
+  <tr><td><b>Dependency overload</b></td><td>A dependency receives more work than its capacity and its latency explodes (queueing).</td><td>A celebrity posts; millions of like requests hit one counter shard.</td><td>Often <em>caused</em> by callers: retries and traffic spikes. Overload spreads.</td></tr>
+  <tr><td><b>Bad deploy / bad data</b></td><td>Code or config bug, a poison message that crashes every consumer.</td><td>A malformed image crashes the media-processing workers in a loop.</td><td>Affects all replicas at once — redundancy doesn't help. Needs canaries and fast rollback.</td></tr>
+</table></div>
+<p>A key lesson from industry incident reports: <strong>slow is worse than dead</strong>. A dead dependency returns an error in milliseconds; you handle it and move on. A slow one silently consumes your resources while you wait.</p>
+
+<h2>3. Anatomy of a cascading failure</h2>
+<p>A <strong>cascading failure</strong> is when the failure of one component causes the failure of the components that depend on it, and so on, until a large part of the system is down. Walk through a realistic one:</p>
+
+<div class="diagram">
+<svg viewBox="0 0 860 280" width="860" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-res-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600">
+    <rect x="15" y="110" width="110" height="50" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="70" y="131" text-anchor="middle">📱 Apps</text><text x="70" y="148" text-anchor="middle" font-weight="400" font-size="11">retry on error</text>
+    <rect x="170" y="110" width="120" height="50" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="230" y="131" text-anchor="middle">API Gateway</text><text x="230" y="148" text-anchor="middle" font-weight="400" font-size="11">connections pile up</text>
+    <rect x="340" y="110" width="140" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="410" y="131" text-anchor="middle">Feed Service</text><text x="410" y="148" text-anchor="middle" font-weight="400" font-size="11">all 200 threads busy</text>
+    <rect x="540" y="30" width="150" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="615" y="51" text-anchor="middle">Ranking</text><text x="615" y="68" text-anchor="middle" font-weight="400" font-size="11">healthy, starved</text>
+    <rect x="540" y="110" width="150" height="50" rx="8" fill="#e8f5e9" stroke="#c62828" stroke-width="2.5"/><text x="615" y="131" text-anchor="middle">Counter Service</text><text x="615" y="148" text-anchor="middle" font-weight="400" font-size="11">slow: 3 s per call</text>
+    <rect x="540" y="190" width="150" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="615" y="211" text-anchor="middle">User Service</text><text x="615" y="228" text-anchor="middle" font-weight="400" font-size="11">healthy, starved</text>
+    <rect x="735" y="110" width="110" height="50" rx="8" fill="#fff8e1" stroke="#c62828" stroke-width="2.5"/><text x="790" y="131" text-anchor="middle">Redis shard</text><text x="790" y="148" text-anchor="middle" font-weight="400" font-size="11">hot key, 100% CPU</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-res-1)">
+    <path d="M125,135 L168,135"/><path d="M290,135 L338,135"/>
+    <path d="M480,125 L538,60"/><path d="M480,135 L538,135"/><path d="M480,145 L538,210"/>
+    <path d="M690,135 L733,135"/>
+  </g>
+  <g fill="#c62828" font-size="11.5" font-weight="600">
+    <text x="790" y="190" text-anchor="middle">① origin</text>
+    <text x="615" y="100" text-anchor="middle">② slow</text>
+    <text x="410" y="190" text-anchor="middle">③ thread pool exhausted</text>
+    <text x="230" y="190" text-anchor="middle">④ timeouts → 5xx</text>
+    <text x="70" y="190" text-anchor="middle">⑤ retries ×3 load</text>
+  </g>
+</svg>
+<div class="caption">One hot Redis shard makes the Counter Service slow; the Feed Service's threads all end up waiting on it, so even requests that need only healthy services fail; client retries multiply the load.</div>
+</div>
+
+<ol class="steps">
+  <li><strong>Origin.</strong> A celebrity's post goes viral; one Redis shard holding its like counter hits 100% CPU. Its latency rises from 1 ms to 300 ms.</li>
+  <li><strong>Slowness propagates.</strong> The Counter Service calls that shard for every feed that contains the post. Its own latency rises to 3 s. It's not erroring — just slow.</li>
+  <li><strong>Resource exhaustion.</strong> The Feed Service has a pool of, say, 200 worker threads per instance. Normally a feed request takes 100 ms, so each instance handles 2,000 req/s. Now every request waits 3 s on the counter call: capacity drops to 200 / 3 s ≈ <strong>67 req/s</strong> — a 30× collapse. Requests queue; queue latency grows; memory grows.</li>
+  <li><strong>Healthy dependencies starve.</strong> Requests that don't even touch the slow counter can't get a thread. Ranking and User Service sit idle while the feed is "down".</li>
+  <li><strong>Retries amplify.</strong> The gateway times out and returns 5xx; apps retry; the gateway may retry too. Load triples exactly when capacity has collapsed.</li>
+  <li><strong>Death spiral.</strong> Overloaded Feed instances fail health checks and get removed, concentrating traffic on the remaining ones, which then fail too. Autoscaling adds instances that immediately receive the backlog and also fall over.</li>
+</ol>
+<p>Every pattern in the rest of this lesson breaks one link in this chain: <strong>timeouts</strong> limit how long you wait (step 3), <strong>bulkheads</strong> stop one dependency consuming all threads (step 4), <strong>circuit breakers</strong> stop calling a sick dependency, <strong>retry budgets</strong> stop amplification (step 5), <strong>load shedding</strong> keeps an overloaded service doing useful work (step 6), and <strong>fallbacks</strong> let the feed render without counts.</p>
+
+<h2>4. Timeouts</h2>
+<p>A <strong>timeout</strong> is the maximum time a caller will wait for a response before giving up. Without one, a single hung dependency can hold a thread forever. Many HTTP clients and database drivers default to <em>no timeout</em> or to very long ones (60 s+) — one of the most common root causes of cascading failures.</p>
+
+<h3>4.1 Kinds of timeout</h3>
+<ul>
+  <li><strong>Connect timeout</strong>: how long to wait to establish a TCP/TLS connection. Should be short (e.g. 100–500 ms inside a data center) — if a host doesn't accept connections quickly, it's likely dead.</li>
+  <li><strong>Request (read) timeout</strong>: how long to wait for the response once connected.</li>
+  <li><strong>Overall deadline</strong>: the total time budget for an operation including retries.</li>
+  <li><strong>Idle timeout</strong>: close pooled connections unused for a while (so a silently broken connection isn't reused).</li>
+</ul>
+
+<h3>4.2 Choosing values</h3>
+<p>Too long and you get the cascade above; too short and you fail requests that would have succeeded (and trigger retries). A practical method:</p>
+<ol>
+  <li>Measure the dependency's latency distribution (see <a href="observability.html">percentiles</a>). Suppose the Counter Service has p50 = 5 ms, p99 = 40 ms, p99.9 = 90 ms.</li>
+  <li>Set the timeout a bit above a high percentile — e.g. ~100–150 ms. You accept that ~0.1% of calls time out (and maybe get one retry), in exchange for never waiting seconds.</li>
+  <li>Check it fits in the caller's own budget. If the feed endpoint has a 500 ms SLO and calls 3 dependencies sequentially, their timeouts plus retries must sum to less than that.</li>
+  <li>Make timeouts configurable at runtime, and alert on timeout rates.</li>
+</ol>
+
+<h3>4.3 Deadline propagation</h3>
+<p>Per-hop timeouts alone waste work. Imagine the app gives up after 2 s, but deeper services each have a 1.5 s timeout and work sequentially — they keep computing an answer nobody is waiting for. <strong>Deadline propagation</strong> fixes this: the first service sets an absolute deadline ("must finish by 10:00:00.500") and passes the <em>remaining</em> time downstream in a header or RPC metadata. gRPC does this natively (<code>grpc-timeout</code>).</p>
+<pre class="ascii">
+Gateway  deadline = now + 800 ms
+  └─► Feed Service           receives "remaining 790 ms"
+        ├─► Feed cache (Redis)    gets min(own 50 ms, remaining) → 50 ms
+        ├─► Ranking               remaining now 720 ms → its own cap 300 ms
+        │     └─► Feature store   remaining 280 ms → cap 40 ms
+        └─► Counter Service       remaining 380 ms → cap 100 ms
+If remaining ≤ 0 at any hop → don't even start; return DEADLINE_EXCEEDED immediately.
+</pre>
+<pre><code>def call_with_deadline(stub, request, ctx, own_timeout_s):
+    remaining = ctx.deadline - time.monotonic()
+    if remaining &lt;= 0.005:                       # less than 5 ms left: pointless to try
+        raise DeadlineExceeded()
+    timeout = min(own_timeout_s, remaining)
+    return stub.Call(request, timeout=timeout)   # gRPC forwards the deadline downstream</code></pre>
+
+<h2>5. Retries with exponential backoff and jitter</h2>
+<p>Many failures are <strong>transient</strong>: a packet was dropped, a pod was restarting, a leader election took 2 seconds. Retrying often succeeds. But retries done naively are one of the main causes of outages, so do them carefully.</p>
+
+<h3>5.1 What to retry</h3>
+<div class="table-wrap"><table>
+  <tr><th>Retry ✅</th><th>Don't retry ❌</th></tr>
+  <tr><td>Connection refused/reset, timeouts on <em>idempotent</em> operations, HTTP 502/503/504, gRPC <code>UNAVAILABLE</code>, 429 <em>after</em> the <code>Retry-After</code> delay.</td><td>400 Bad Request, 401/403, 404, validation errors (will fail again); non-idempotent writes without an idempotency key; <code>DEADLINE_EXCEEDED</code> when the overall deadline has passed.</td></tr>
+</table></div>
+
+<h3>5.2 Exponential backoff + jitter</h3>
+<p><strong>Backoff</strong> = wait between attempts, growing exponentially (100 ms, 200 ms, 400 ms…) so a struggling dependency gets breathing room. <strong>Jitter</strong> = randomise the wait. Without jitter, 10,000 clients that failed at the same instant all retry at exactly +100 ms, then +200 ms — synchronised waves that knock the recovering service over again (a <em>thundering herd</em>). "Full jitter" picks a random wait between 0 and the exponential cap, spreading retries evenly.</p>
+<pre><code>import random, time
+
+def call_with_retries(op, max_attempts=3, base=0.1, cap=2.0, deadline=None):
+    for attempt in range(max_attempts):
+        try:
+            return op()
+        except RetryableError as e:
+            if attempt == max_attempts - 1:
+                raise
+            if not retry_budget.try_acquire():          # see 5.4 — global brake on retries
+                raise
+            backoff = min(cap, base * (2 ** attempt))    # 0.1, 0.2, 0.4, ... capped
+            sleep_s = random.uniform(0, backoff)         # FULL JITTER
+            if e.retry_after:                            # server told us when to come back
+                sleep_s = max(sleep_s, e.retry_after)
+            if deadline and time.monotonic() + sleep_s &gt;= deadline:
+                raise                                    # no time left: fail fast
+            time.sleep(sleep_s)</code></pre>
+<pre class="ascii">
+No jitter (10k clients):     ████          ████              ████        ← synchronized spikes
+                             t+0.1         t+0.2             t+0.4
+Full jitter (10k clients):   ▂▃▂▃▂▂▃▂▂▃▂▂▃▂▃▂▂▃▂▂▃▂▂▃▂▂▃▂▂▃▂▂▃▂▂          ← smooth, survivable
+</pre>
+
+<h3>5.3 Retry storms</h3>
+<p>Retries multiply across layers. Suppose the app, the gateway, the Feed Service and the Counter Service client each make up to 3 attempts. If the bottom dependency is failing, one user action becomes:</p>
+<pre><code>attempts at the bottom = 3 (app) × 3 (gateway) × 3 (feed) × 3 (counter client) = 81</code></pre>
+<p>An 81× load multiplier, applied precisely when the dependency is already failing — a <strong>retry storm</strong>. It can keep a service down long after the original cause is gone, because recovery capacity is consumed by retries of requests whose users have already given up.</p>
+
+<h3>5.4 Retry budgets and other brakes</h3>
+<ul>
+  <li><strong>Retry at one layer only</strong> — usually the layer closest to the failure that knows whether the operation is safe, or the edge (the app). Inner layers fail fast and propagate the error.</li>
+  <li><strong>Retry budget</strong>: a client may only add retries up to, e.g., <strong>10% of its normal request volume</strong>. Implemented as a token bucket: each successful request deposits 0.1 tokens, each retry spends 1. When the dependency is healthy, occasional retries are free; when it's failing broadly, the budget runs dry and retries stop automatically, capping amplification at 1.1×.</li>
+  <li><strong>Respect <code>Retry-After</code></strong> and 429/503 from overloaded servers.</li>
+  <li><strong>Don't retry on overload signals</strong> from a server that is explicitly shedding load.</li>
+  <li>Combine with a <strong>circuit breaker</strong> (section 7) so a clearly dead dependency isn't retried at all.</li>
+</ul>
+
+<h2>6. Idempotency: making retries safe</h2>
+<p>An operation is <strong>idempotent</strong> if doing it twice has the same effect as doing it once. <code>GET</code>, <code>PUT profile.bio = "hi"</code> and <code>DELETE like(user=7, post=42)</code> are naturally idempotent. <code>POST /comments</code> or <code>INCR like_count</code> are not: a retried comment after a timeout (where the first attempt actually succeeded but the response was lost) creates a <strong>duplicate comment</strong>.</p>
+<p>The standard fix is an <strong>idempotency key</strong>: the client generates a unique ID (UUID) per logical action and sends it with every attempt; the server records processed keys and returns the stored result for repeats.</p>
+<pre><code>POST /v1/media/42/comments
+Idempotency-Key: 6f1c2b9e-0d4a-4c11-9a77-3b2e5f8a9d10
+{"text": "Beautiful shot!"}
+
+def create_comment(user_id, post_id, text, idem_key):
+    # atomic "insert if absent": only the first attempt wins
+    existing = idem_store.get(f"{user_id}:{idem_key}")
+    if existing:
+        return existing                                  # replay the original response
+    comment = comments.insert(post_id, user_id, text)
+    idem_store.set(f"{user_id}:{idem_key}", comment, ttl=24*3600)
+    return comment</code></pre>
+<p>(In production the check-and-insert must be atomic — e.g. a unique constraint on <code>(user_id, idem_key)</code> or <code>SET NX</code> in Redis — to handle two concurrent attempts.) Other idempotency techniques used across Instagram-style systems:</p>
+<ul>
+  <li><strong>Natural keys</strong>: a like is a row keyed by <code>(user_id, post_id)</code>; inserting it twice is a no-op. Counters are then derived, not blindly incremented.</li>
+  <li><strong>Client-generated IDs</strong> for uploads: the app creates an upload ID before uploading, so a retried <a href="media-upload.html">upload</a> resumes rather than creating a second post. See also <a href="id-generation.html">ID generation</a>.</li>
+  <li><strong>Consumer de-duplication</strong>: Kafka consumers (fan-out, notifications) track processed event IDs because delivery is at-least-once — you don't want two push <a href="notifications.html">notifications</a> for one like. See <a href="message-queues.html">Message Queues</a>.</li>
+</ul>
+
+<h2>7. Circuit breaker</h2>
+<p>If a dependency is clearly broken, continuing to call it wastes time (each call waits for a timeout), wastes resources, and adds load to something trying to recover. A <strong>circuit breaker</strong> wraps calls to a dependency and tracks failures; when failures exceed a threshold it "trips" and subsequent calls <strong>fail immediately</strong> (or go straight to a fallback) for a cool-down period, then cautiously tests whether the dependency has recovered.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 300" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-res-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600">
+    <rect x="40" y="110" width="180" height="70" rx="35" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/><text x="130" y="140" text-anchor="middle">CLOSED</text><text x="130" y="160" text-anchor="middle" font-weight="400" font-size="11">calls pass through</text>
+    <rect x="600" y="110" width="180" height="70" rx="35" fill="#ffebee" stroke="#c62828" stroke-width="2"/><text x="690" y="140" text-anchor="middle">OPEN</text><text x="690" y="160" text-anchor="middle" font-weight="400" font-size="11">fail fast / fallback</text>
+    <rect x="320" y="215" width="180" height="70" rx="35" fill="#fff8e1" stroke="#f9a825" stroke-width="2"/><text x="410" y="245" text-anchor="middle">HALF-OPEN</text><text x="410" y="265" text-anchor="middle" font-weight="400" font-size="11">allow a few probes</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-res-2)">
+    <path d="M220,125 Q410,40 600,125"/>
+    <path d="M690,180 Q650,250 502,250"/>
+    <path d="M320,250 Q170,250 130,182"/>
+    <path d="M440,215 Q560,190 640,182"/>
+  </g>
+  <g font-size="11.5" fill="#333">
+    <text x="410" y="38" text-anchor="middle">failure rate ≥ 50% over last 20+ calls</text>
+    <text x="410" y="54" text-anchor="middle" fill="#666">(or N consecutive failures / timeouts)</text>
+    <text x="650" y="292" text-anchor="middle">cool-down (10 s) expires</text>
+    <text x="150" y="270" text-anchor="middle">probes succeed</text>
+    <text x="560" y="168" text-anchor="middle">a probe fails</text>
+  </g>
+</svg>
+<div class="caption">Circuit breaker states. CLOSED = normal; OPEN = stop calling and fail fast; HALF-OPEN = let a few trial requests through to decide whether to close again or reopen.</div>
+</div>
+
+<pre><code>class CircuitBreaker:
+    def __init__(self, failure_threshold=0.5, min_calls=20, open_seconds=10, probes=3):
+        self.state, self.window = "CLOSED", RollingWindow(seconds=10)
+        self.failure_threshold, self.min_calls = failure_threshold, min_calls
+        self.open_seconds, self.probes, self.opened_at, self.probe_ok = open_seconds, probes, 0, 0
+
+    def call(self, fn, fallback):
+        if self.state == "OPEN":
+            if time.monotonic() - self.opened_at &lt; self.open_seconds:
+                return fallback()                          # fail fast: no waiting, no load
+            self.state, self.probe_ok = "HALF_OPEN", 0     # cool-down over: test the water
+        try:
+            result = fn()                                  # fn has its own timeout!
+        except Exception:
+            self.on_failure()
+            return fallback()
+        self.on_success()
+        return result
+
+    def on_failure(self):
+        if self.state == "HALF_OPEN":
+            self.trip()                                    # still broken → back to OPEN
+            return
+        self.window.record(ok=False)
+        if self.window.count() &gt;= self.min_calls and self.window.failure_rate() &gt;= self.failure_threshold:
+            self.trip()
+
+    def on_success(self):
+        if self.state == "HALF_OPEN":
+            self.probe_ok += 1
+            if self.probe_ok &gt;= self.probes:
+                self.state = "CLOSED"; self.window.reset()
+        else:
+            self.window.record(ok=True)
+
+    def trip(self):
+        self.state, self.opened_at = "OPEN", time.monotonic()</code></pre>
+<p>Design notes:</p>
+<ul>
+  <li><strong>Count timeouts and 5xx as failures</strong>, but not 4xx (a 404 means the dependency is healthy and answered correctly).</li>
+  <li><strong>Use a minimum call volume</strong> (here 20) so two failures out of three calls at 3 a.m. don't trip it.</li>
+  <li><strong>Scope matters.</strong> One breaker per dependency <em>per host or shard</em> is often better than one per whole service: if 1 of 64 Redis shards is sick, you want to stop calling that shard only.</li>
+  <li><strong>Limit probes</strong> in half-open (only a few requests, not a flood).</li>
+  <li><strong>Always pair with a fallback</strong> and with metrics/alerts on state changes — an open breaker is a symptom someone should know about.</li>
+</ul>
+
+<h2>8. Bulkheads</h2>
+<p>A <strong>bulkhead</strong> isolates resources so that one failing part can only exhaust <em>its own</em> compartment. In the cascade above, the Feed Service shared one pool of 200 threads across all dependencies, so the slow Counter Service starved everything. With bulkheads:</p>
+<pre class="ascii">
+                 Feed Service instance (200 threads total)
+ ┌───────────────────┬───────────────────┬───────────────────┬──────────────────┐
+ │ Ranking pool: 80  │ Feed cache: 50    │ Counters: 30      │ User svc: 40     │
+ │ ✓ healthy         │ ✓ healthy         │ ✗ all 30 stuck    │ ✓ healthy        │
+ └───────────────────┴───────────────────┴───────────────────┴──────────────────┘
+ Counter calls beyond 30 concurrent are rejected instantly → fallback "hide counts".
+ The other 170 threads keep serving feeds.
+</pre>
+<p>Bulkheads exist at many levels:</p>
+<ul>
+  <li><strong>Per-dependency thread pools / semaphores / connection pools</strong> inside a service (as above).</li>
+  <li><strong>Separate service deployments per traffic class</strong>: e.g. a separate fleet for internal batch traffic vs user-facing traffic, or for the web vs mobile API, so a scraper storm on one doesn't affect the other.</li>
+  <li><strong>Per-tenant / per-customer limits</strong> so one abusive client can't use all capacity (see <a href="rate-limiting.html">Rate Limiting</a>).</li>
+  <li><strong>Cells</strong>: whole independent copies of the stack serving a subset of users, the ultimate bulkhead — see <a href="multi-region.html">Multi-Region &amp; cell-based architecture</a>.</li>
+</ul>
+
+<h2>9. Load shedding and admission control</h2>
+<p>Every server has a maximum throughput. When offered load exceeds it, queues grow without bound; every request waits longer; eventually <em>every</em> request exceeds its client's timeout and the server is doing 100% work for 0% useful output ("congestion collapse"). <strong>Load shedding</strong> deliberately rejects some requests early (cheaply, with HTTP 503/429) so that the rest are served fast.</p>
+
+<h3>9.1 Little's law and concurrency limits</h3>
+<p><strong>Little's law</strong>: <code>L = λ × W</code> — the average number of requests in the system equals arrival rate times time in system. If a Feed instance can process 2,000 req/s at 50 ms each, it naturally has ~100 requests in flight. If in-flight climbs to 400, requests must be queueing (W ≈ 200 ms) — a clear overload signal. <strong>Admission control</strong> caps in-flight requests (or queue length / queue wait time) and rejects new arrivals above the cap. Adaptive limiters (inspired by TCP congestion control, e.g. Netflix's concurrency-limits library) adjust the cap automatically from observed latency.</p>
+
+<h3>9.2 Smarter shedding</h3>
+<ul>
+  <li><strong>Shed early and cheaply</strong>: reject at the <a href="load-balancer.html">load balancer</a> or <a href="api-gateway.html">gateway</a> before doing expensive work (auth, DB reads).</li>
+  <li><strong>Priority shedding</strong>: drop the least important traffic first. For Instagram: background prefetch of the next feed page and analytics log uploads before user-initiated feed loads; feed loads before… nothing — sending a DM or posting is top priority.</li>
+  <li><strong>Queue-time based</strong>: if a request has already waited longer than its deadline, drop it — the client has given up. Facebook's publicly described "Fail at Scale" practices include <em>controlled delay</em> (shorten queue timeouts when the queue hasn't been empty recently) and <em>adaptive LIFO</em> (under overload, serve the newest requests first, because the oldest are likely already abandoned).</li>
+  <li><strong>Client cooperation</strong>: on 429/503 with <code>Retry-After</code>, apps back off instead of hammering.</li>
+</ul>
+
+<h2>10. Backpressure</h2>
+<p><strong>Backpressure</strong> is how a slow consumer tells a fast producer "slow down", instead of silently buffering until memory runs out. Load shedding drops work; backpressure <em>pushes the waiting back upstream</em> to where it can be handled.</p>
+<ul>
+  <li><strong>Bounded queues</strong>: every in-memory queue has a maximum size. When full, the producer blocks or gets an error. An unbounded queue just converts overload into an out-of-memory crash later.</li>
+  <li><strong>Pull-based consumption</strong>: <a href="message-queues.html">Kafka</a> consumers <em>pull</em> at their own pace, so a slow fan-out worker builds up <em>consumer lag</em> (stored durably on disk) rather than being overwhelmed. Lag is then the signal to autoscale workers.</li>
+  <li><strong>Flow control in protocols</strong>: TCP windows, HTTP/2 and gRPC stream flow control, reactive streams (<code>request(n)</code>).</li>
+  <li><strong>Rate limits and 429s</strong> upstream: the <a href="rate-limiting.html">rate limiter</a> at the gateway is backpressure at the system boundary.</li>
+</ul>
+<div class="callout tip"><span class="callout-title">💡 Example: media processing</span>
+When many users upload Reels at once, the Upload Service doesn't call the transcoding workers directly — it publishes "video uploaded" events to Kafka. If transcoders fall behind, lag grows, autoscaling adds workers, and the user sees "processing…" a bit longer. Nothing crashes, and no upload is lost. See <a href="media-processing.html">Media Processing</a>.</div>
+
+<h2>11. Fallbacks and graceful degradation</h2>
+<p>A <strong>fallback</strong> is what you return when the real answer isn't available in time. <strong>Graceful degradation</strong> is the product-level design that makes those fallbacks acceptable: the app keeps doing its most important job with reduced quality, rather than failing completely. The key design exercise is to classify every dependency of a request as <em>critical</em> (no answer without it) or <em>optional</em> (nice to have), and to decide in advance what the optional ones degrade to.</p>
+<div class="table-wrap"><table>
+  <tr><th>Failure</th><th>Degraded behaviour (Instagram examples)</th><th>What the user notices</th></tr>
+  <tr><td>Ranking service down or slow</td><td>Serve the precomputed timeline from the <a href="caching.html">Redis feed cache</a> in reverse-chronological order, or a lighter ranking model; or the last feed cached on the device.</td><td>Feed is slightly less relevant. Still works.</td></tr>
+  <tr><td>Counter service fails</td><td>Render posts without like/view counts (or with last cached counts).</td><td>Counts missing for a while.</td></tr>
+  <tr><td>Media upload backend overloaded</td><td>App keeps the photo/video locally and <strong>queues the upload</strong>, retrying in the background with backoff; the post shows "Posting…" .</td><td>Post appears a bit later.</td></tr>
+  <tr><td>Stories tray service fails</td><td>Hide the stories tray; feed still loads.</td><td>No stories row temporarily.</td></tr>
+  <tr><td>Search index (Elasticsearch) degraded</td><td>Return results from a smaller cached "top accounts" index or recent searches.</td><td>Fewer / less fresh search results.</td></tr>
+  <tr><td>Recommendation (Explore) unavailable</td><td>Serve a cached generic popular grid per region.</td><td>Less personalised Explore.</td></tr>
+  <tr><td>Notification service backlog</td><td>Delay or drop low-priority pushes (e.g. "X liked your photo" aggregated later); keep DMs priority.</td><td>Late notifications.</td></tr>
+  <tr><td>User DB primary unavailable</td><td>Serve reads from replicas; temporarily disable profile edits ("read-only mode").</td><td>Can browse, can't edit profile.</td></tr>
+</table></div>
+<p>Rules for good fallbacks:</p>
+<ul>
+  <li><strong>Fallbacks must be cheaper and more reliable than the primary path</strong> — a fallback that calls another fragile service just moves the failure.</li>
+  <li><strong>Exercise fallbacks regularly</strong> (chaos tests). A fallback path that runs only during real incidents is likely broken when you need it.</li>
+  <li><strong>Make degradation visible</strong> in metrics and, if needed, to the user ("Couldn't refresh feed. Showing recent posts.").</li>
+  <li><strong>Never "fall back" in a way that violates correctness or security</strong> — e.g. if the auth/permission check fails, deny (fail closed), don't allow. Showing a private account's posts because the privacy service timed out is a far worse outcome than an error.</li>
+  <li><strong>Feature flags / kill switches</strong> let operators turn off expensive non-critical features (e.g. disable video autoplay prefetch) during an incident to free capacity.</li>
+</ul>
+
+<h2>12. Health checks: liveness vs readiness</h2>
+<p>Orchestrators (Kubernetes, or Meta's internal equivalents) and load balancers decide what to do with an instance based on health checks. There are two different questions, and mixing them up causes outages:</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Liveness</th><th>Readiness</th></tr>
+  <tr><td><b>Question</b></td><td>"Is this process fundamentally broken (deadlocked, wedged)?"</td><td>"Should this instance receive traffic <em>right now</em>?"</td></tr>
+  <tr><td><b>Action on failure</b></td><td><strong>Restart</strong> the process/container.</td><td><strong>Remove from load balancer</strong> rotation (don't restart).</td></tr>
+  <tr><td><b>What to check</b></td><td>Shallow: the process can respond to <code>/healthz</code>; event loop not stuck.</td><td>Warmed up (caches loaded, config fetched), not overloaded, not draining for shutdown, critical local resources OK.</td></tr>
+  <tr><td><b>Must NOT check</b></td><td>Downstream dependencies — if the DB is down, restarting every app server won't fix it and causes a restart storm.</td><td>Shared dependencies naively — if all instances depend on the same DB and mark themselves unready together, the LB has zero backends: a total outage instead of a partial one.</td></tr>
+</table></div>
+<ul>
+  <li>A <strong>startup probe</strong> gives slow-starting processes (loading an ML model of several GB) time before liveness checks begin.</li>
+  <li><strong>Graceful shutdown</strong>: on deploy, mark unready first, let the LB drain in-flight requests, then exit.</li>
+  <li>Load balancers often add <strong>passive health checks</strong> (outlier detection): eject a backend that returns many 5xx or is much slower than its peers — this catches gray failures that active <code>/healthz</code> pings miss. Cap ejection at a percentage (e.g. never eject more than 30% of backends) so a systemic issue doesn't empty the pool. See <a href="load-balancer.html">Load Balancing</a>.</li>
+</ul>
+
+<h2>13. Hedged requests: fighting tail latency</h2>
+<p>When a request fans out to many servers, the slowest one determines the response time. If each of 100 shards answers in 10 ms 99% of the time but takes 1 s 1% of the time (GC pause, noisy neighbour, disk hiccup):</p>
+<pre><code>P(at least one of 100 shards is slow) = 1 − 0.99^100 ≈ 63%
+→ the "rare" 1% tail becomes the COMMON case for the fan-out request.</code></pre>
+<p>A <strong>hedged request</strong> sends the request to one replica, and if no answer arrives within, say, the p95 latency, sends a second copy to another replica; use whichever answers first and cancel the other. Because only ~5% of requests trigger a hedge, extra load is ~5%, but the tail shrinks dramatically. (This technique was popularised by Google's "The Tail at Scale" paper.)</p>
+<pre class="ascii">
+t=0ms     send to replica A ─────────────────────────────── (A stuck in GC… answers at 900 ms)
+t=12ms    no answer by p95 → send to replica B ──► B answers at t=20 ms ✔ use it, cancel A
+</pre>
+<ul>
+  <li>Only hedge <strong>idempotent reads</strong> (e.g. Search shard queries, feed-cache reads, feature-store lookups).</li>
+  <li>Hedge <strong>after a delay</strong>, not immediately — immediate duplication doubles load.</li>
+  <li>Disable hedging under overload (it's a form of retry, so subject it to the retry budget).</li>
+</ul>
+
+<h2>14. Chaos engineering</h2>
+<p>You can't know a system is resilient until you've seen it survive failure. <strong>Chaos engineering</strong> is the practice of deliberately injecting failures in a controlled way to find weaknesses before real incidents do.</p>
+<ol class="steps">
+  <li><strong>Define steady state</strong>: measurable normal behaviour, e.g. feed load success rate &gt; 99.9%, p99 &lt; 800 ms.</li>
+  <li><strong>Hypothesise</strong>: "If one Redis feed-cache shard dies, feed success rate stays &gt; 99.9% because we fall back to the chronological path."</li>
+  <li><strong>Inject the failure</strong>: kill instances, add 500 ms latency to a dependency, drop packets between two services, fill a disk, fail a whole availability zone.</li>
+  <li><strong>Limit blast radius</strong>: start in staging, then 1% of production traffic or one cell; have an abort button.</li>
+  <li><strong>Observe and fix</strong>: if the hypothesis fails, you've found a bug cheaply. Automate the experiment so it runs continuously.</li>
+</ol>
+<p>Famous examples: Netflix's <strong>Chaos Monkey</strong> randomly terminates production instances, and <strong>Chaos Kong</strong> simulates losing a whole AWS region. Meta has publicly described a program of large-scale disaster-readiness drills (called <em>Storm</em> in public talks) that take entire data centers offline to verify that services — including Instagram — fail over correctly; see <a href="multi-region.html">Multi-Region</a>. Smaller-scale versions are <strong>game days</strong>: a team schedules an afternoon to break its own service and practise the response.</p>
+
+<h2>15. Patterns at a glance</h2>
+<div class="table-wrap"><table>
+  <tr><th>Pattern</th><th>Problem it solves</th><th>Instagram example</th></tr>
+  <tr><td>Timeout</td><td>Waiting forever on a hung/slow dependency</td><td>Feed → counter call capped at 100 ms</td></tr>
+  <tr><td>Deadline propagation</td><td>Downstream work continuing after the caller gave up</td><td>Gateway's 800 ms budget passed down to ranking and feature store</td></tr>
+  <tr><td>Retry + backoff + jitter</td><td>Transient errors; synchronised retry waves</td><td>App re-sends a failed feed fetch after a random 0–400 ms</td></tr>
+  <tr><td>Retry budget</td><td>Retry storms amplifying overload</td><td>≤ 10% extra calls per client</td></tr>
+  <tr><td>Idempotency key</td><td>Duplicates caused by retries</td><td>Comment/upload retried without double posting</td></tr>
+  <tr><td>Circuit breaker</td><td>Repeatedly calling a broken dependency</td><td>Stop calling a sick Redis shard for 10 s; hide counts</td></tr>
+  <tr><td>Bulkhead</td><td>One dependency exhausting shared resources</td><td>Separate thread pools per dependency in Feed Service</td></tr>
+  <tr><td>Load shedding / admission control</td><td>Congestion collapse under overload</td><td>Drop prefetch requests first at the gateway</td></tr>
+  <tr><td>Backpressure</td><td>Fast producers overwhelming slow consumers</td><td>Kafka lag for fan-out and transcoding workers</td></tr>
+  <tr><td>Fallback / graceful degradation</td><td>Total failure when an optional dependency fails</td><td>Chronological feed when ranking is down</td></tr>
+  <tr><td>Liveness / readiness checks</td><td>Routing to broken or not-yet-ready instances</td><td>New pod receives traffic only after loading its model</td></tr>
+  <tr><td>Hedged requests</td><td>Tail latency in fan-out</td><td>Search queries to 100 index shards</td></tr>
+  <tr><td>Chaos engineering</td><td>Unknown weaknesses; untested fallbacks</td><td>Data-center drills; killing cache shards in tests</td></tr>
+</table></div>
+
+<h2>16. How Instagram uses resilience patterns</h2>
+<div class="flow">
+  <div class="fnode client">📱 App<small>timeouts, jittered retries, offline queue</small></div><div class="farrow">→</div>
+  <div class="fnode edge">LB / Gateway<small>rate limits, shedding, outlier ejection</small></div><div class="farrow">→<small>deadline</small></div>
+  <div class="fnode svc">Feed Service<small>bulkheads, breakers, fallbacks</small></div><div class="farrow">→</div>
+  <div class="fnode store">Redis / Cassandra<small>replicas, hedged reads</small></div>
+</div>
+<p>Follow one feed load through the main diagram with resilience in mind:</p>
+<ol>
+  <li>The <strong>app</strong> requests the feed with a timeout of a few seconds. If it fails, it shows the feed cached on the device and retries with jittered backoff. Uploads and likes performed offline are kept in a local queue with client-generated idempotency keys and replayed when connectivity returns (see <a href="clients.html">Clients</a>).</li>
+  <li>The <strong>load balancer and API gateway</strong> enforce <a href="rate-limiting.html">rate limits</a>, eject outlier backends, and shed low-priority traffic (prefetch, logging) first under overload. They attach a deadline to the request.</li>
+  <li>The <strong>Feed Service</strong> calls its dependencies in parallel through per-dependency bulkheads and circuit breakers. Critical: the timeline from the feed cache (with a fallback to a slower rebuild from the post store). Optional: ranking (fallback: chronological), counters (fallback: hide), stories tray (fallback: hide), ads (fallback: none).</li>
+  <li><strong>Stores</strong> are replicated; reads can go to replicas, and latency-sensitive fan-out reads can be hedged.</li>
+  <li><strong>Async paths</strong> (fan-out, notifications, media processing) run through <a href="message-queues.html">Kafka</a> with backpressure via consumer lag, idempotent consumers and dead-letter queues for poison messages.</li>
+</ol>
+<div class="callout instagram"><span class="callout-title">📸 Publicly described practices</span>
+Instagram's engineering talks describe a Python/Django monolith (the "Django service") running on a very large fleet, where safe, gradual rollouts and the ability to turn features off quickly are core to reliability — code is deployed continuously through canary stages, and feature gates let engineers disable a misbehaving feature without a deploy. Facebook's publicly published "Fail at Scale" article describes the same family of techniques used across Meta: adaptive LIFO queues and controlled-delay queue timeouts for overload, concurrency limits, and regular drills. Exact thresholds and fallbacks are internal; the examples in this lesson are reasonable assumptions about how such a system degrades.</div>
+
+<h3>Rough numbers (assumptions)</h3>
+<pre><code>Feed Service instance: 200 threads, normal latency 100 ms → capacity ≈ 2,000 req/s
+If one dependency becomes 3 s slow and there is NO timeout / bulkhead:
+    capacity → 200 / 3 s ≈ 67 req/s   (≈ 30× collapse)
+With a 100 ms timeout + 30-thread bulkhead on that dependency:
+    worst case each request waits 100 ms extra → capacity ≈ 200 / 0.2 s = 1,000 req/s
+    and with an OPEN breaker (fail fast) → back to ≈ 2,000 req/s, counts hidden</code></pre>
+
+<h2>17. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Benefits</h4><ul>
+    <li>Partial failures stay partial; users get a degraded but working app</li>
+    <li>Fast failure frees resources and shortens incidents</li>
+    <li>Systems recover on their own once the root cause clears</li>
+    <li>Predictable behaviour under overload instead of collapse</li>
+    <li>Confidence from tested failure modes (chaos, drills)</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs</h4><ul>
+    <li>More code paths (fallbacks) to build, test and maintain</li>
+    <li>Many tunables (timeouts, thresholds, pool sizes) that can be mis-set</li>
+    <li>Degraded modes can hide real problems if not monitored</li>
+    <li>Retries and hedges add load; breakers can flap</li>
+    <li>Stale data from fallbacks (cached feed, old counts)</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>No timeout or library defaults</strong> (often infinite or 60 s+).</li>
+  <li><strong>Retrying at every layer</strong> → multiplicative retry storms; retrying non-idempotent operations → duplicates.</li>
+  <li><strong>Backoff without jitter</strong> → synchronised retry waves.</li>
+  <li><strong>Timeouts longer than the caller's timeout</strong> → wasted work after the caller gave up (use deadline propagation).</li>
+  <li><strong>Readiness/liveness checks that test shared dependencies</strong> → whole-fleet restarts or empty LB pools.</li>
+  <li><strong>Unbounded queues</strong> → memory blow-up and latency far past any deadline.</li>
+  <li><strong>Fallbacks that are never exercised</strong>, or that fail open on security checks.</li>
+  <li><strong>Autoscaling as the only defence</strong> — scaling takes minutes; overload kills in seconds. And a scaled-out caller can overwhelm a dependency that didn't scale.</li>
+</ul>
+
+<h2>18. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Tool</th><th>What it provides</th><th>When to use</th></tr>
+  <tr><td>Resilience4j (Java), Polly (.NET), failsafe-go, tenacity / backoff (Python)</td><td>Library-level retries, circuit breakers, bulkheads, rate limiters, timeouts</td><td>Adding patterns inside a service's code.</td></tr>
+  <tr><td>Netflix Hystrix</td><td>The original popular circuit-breaker/bulkhead library (now in maintenance mode)</td><td>Historic reference; prefer Resilience4j today.</td></tr>
+  <tr><td>Envoy, Istio, Linkerd (service mesh)</td><td>Timeouts, retries with budgets, outlier detection, circuit breaking, load balancing — in a sidecar, language-agnostic</td><td>Many services in many languages; consistent policy without code changes.</td></tr>
+  <tr><td>gRPC</td><td>Deadlines and cancellation propagation, retry policies, health checking protocol</td><td>Internal RPC between services.</td></tr>
+  <tr><td>Kubernetes probes</td><td>Liveness, readiness, startup probes; graceful termination</td><td>Container orchestration.</td></tr>
+  <tr><td>Netflix concurrency-limits, Envoy adaptive concurrency</td><td>Adaptive admission control</td><td>Automatic load shedding based on latency.</td></tr>
+  <tr><td>Chaos Monkey, Gremlin, LitmusChaos, AWS Fault Injection Service, Toxiproxy</td><td>Fault injection: kill instances, add latency, drop packets</td><td>Chaos experiments, game days, integration tests of fallbacks.</td></tr>
+</table></div>
+
+<h2>19. Interview corner</h2>
+<details class="qa"><summary>The like-count service is slow and the whole feed is timing out. Walk me through what's happening and how you'd design to prevent it.</summary>
+<p>Classic cascading failure: Feed Service threads block on slow counter calls, exhausting the shared pool so even requests that don't need counters stall; timeouts at the gateway cause client retries that multiply load. Prevention: (1) a tight timeout on the counter call derived from its p99.9 (~100 ms) and the propagated deadline; (2) a bulkhead — a bounded pool/semaphore for counter calls so it can't consume more than ~15% of threads; (3) a circuit breaker per counter shard that opens on high failure/timeout rates; (4) a fallback: render posts without counts, since counts are optional; (5) retries only at one layer, with a retry budget; (6) load shedding at the gateway; (7) fix the root cause — hot key on the counter shard: shard the counter, cache it, or use approximate counting (see <a href="likes-comments.html">Likes &amp; Counters</a>).</p></details>
+<details class="qa"><summary>Why add jitter to exponential backoff? Show the formula.</summary>
+<p>Without jitter, clients that failed together retry together (at +100, +200, +400 ms), creating synchronised spikes that re-overload the recovering service. Full jitter: <code>sleep = random(0, min(cap, base × 2^attempt))</code>. It spreads retries uniformly over the window so the arrival rate is smooth. Also cap attempts, respect the overall deadline and <code>Retry-After</code>, and gate retries with a retry budget.</p></details>
+<details class="qa"><summary>Explain the three states of a circuit breaker and how you'd tune it.</summary>
+<p>CLOSED: calls pass; failures are counted in a rolling window. When the failure rate (timeouts + 5xx, not 4xx) exceeds a threshold with a minimum call volume, it goes OPEN: calls fail immediately or use a fallback for a cool-down (e.g. 5–30 s). Then HALF-OPEN: a few probe calls are allowed; if they succeed it closes, if any fails it reopens. Tuning: minimum volume to avoid tripping on noise, failure threshold ~50%, cool-down long enough for a restart, scope per host/shard, alert on transitions, and make sure the fallback is cheap.</p></details>
+<details class="qa"><summary>A user taps "Post" on a comment, the request times out, and the app retries. How do you avoid a duplicate comment?</summary>
+<p>The app generates an idempotency key (UUID) when the user taps Post and sends it on every attempt. The server does an atomic insert-if-absent of <code>(user_id, idempotency_key)</code> (unique index or Redis <code>SET NX</code>) in the same transaction as the comment, storing the response; a repeat with the same key returns the original comment instead of inserting again. Keys expire after ~24 h. Downstream, the "comment created" Kafka event carries the comment ID so notification and counter consumers de-duplicate too.</p></details>
+<details class="qa"><summary>What's the difference between load shedding and backpressure? When would you use each?</summary>
+<p>Load shedding <em>rejects</em> excess work early (503/429) so the remaining work completes within deadlines — for synchronous, latency-sensitive traffic where waiting is useless (feed loads). Backpressure <em>slows the producer</em> by signalling capacity (bounded queues, pull-based consumers, flow control) so work waits safely upstream — for asynchronous work that must not be lost (media transcoding, fan-out via Kafka lag). Many systems use both: shed at the edge, apply backpressure internally.</p></details>
+<details class="qa"><summary>Liveness vs readiness — what goes wrong if you get them confused?</summary>
+<p>Liveness failure → restart; readiness failure → remove from LB. If liveness checks a shared dependency (DB), a DB blip restarts the entire fleet, causing a restart storm and cold caches — turning a brief DB issue into a long outage. If readiness checks a shared dependency, all instances go unready together, leaving the LB with zero backends instead of serving degraded responses. Keep liveness shallow (process responsive), readiness about the instance itself (warm, not overloaded, not draining), and handle dependency failures with breakers and fallbacks instead.</p></details>
+<details class="qa"><summary>How do hedged requests reduce tail latency, and what are their risks?</summary>
+<p>With fan-out to N shards, the request is as slow as the slowest shard, so rare per-shard slowness becomes common (1 − 0.99^100 ≈ 63%). Hedging sends a duplicate to another replica if no reply arrives by ~p95, using whichever answers first and cancelling the other — ~5% extra load for a large cut in p99/p99.9. Risks: extra load under overload (so disable or budget it), only safe for idempotent reads, and needs cancellation support to avoid wasted work.</p></details>
+
+<h2>20. Check your understanding</h2>
+<details class="quiz"><summary>A request depends on 20 services, each 99.95% available, all required. What is its availability?</summary>
+<p>0.9995^20 ≈ <strong>0.990</strong> → about 99.0%, i.e. ~7 hours of failure per month. This is why you make most dependencies <em>optional</em> with fallbacks: an optional dependency's failure doesn't fail the request.</p></details>
+<details class="quiz"><summary>Four layers each make up to 2 attempts (1 retry). A bottom-layer dependency is down. How many calls reach it per user action, and how would a retry budget change that?</summary>
+<p>2 × 2 × 2 × 2 = <strong>16</strong> calls. With a 10% retry budget per client, once failures are widespread each layer's budget is exhausted and retries stop, so the amplification approaches ~1.1× per layer (≈1.46× total worst case) instead of 16×. Better still, retry at only one layer.</p></details>
+<details class="quiz"><summary>The Counter Service has p50 = 4 ms, p99 = 35 ms, p99.9 = 80 ms. The feed endpoint has a 400 ms budget. What timeout would you pick and why not 5 seconds?</summary>
+<p>Around <strong>100 ms</strong>: just above p99.9, so ~0.1% of calls time out (and fall back to hidden counts) while fitting comfortably in the 400 ms budget. A 5 s timeout would let a slow counter hold feed threads for 5 s, causing the cascading failure described in section 3; it also exceeds the caller's own deadline, so the work would be wasted.</p></details>
+<details class="quiz"><summary>Your readiness probe checks that PostgreSQL is reachable. The DB primary fails over, taking 20 seconds. What happens?</summary>
+<p>All instances fail readiness simultaneously; the load balancer removes every backend and the whole service returns errors for 20+ seconds — even reads that could have been served from replicas or caches. Better: readiness reflects the instance's own state; the DB failure is handled by timeouts, breakers and degraded behaviour (e.g. read-only mode).</p></details>
+<details class="quiz"><summary>Which of these operations are safe to retry without an idempotency key: (a) GET feed, (b) POST create comment, (c) PUT set bio to "hi", (d) INCR like counter, (e) DELETE like(user, post)?</summary>
+<p><strong>(a), (c), (e)</strong> are naturally idempotent. (b) creates a duplicate comment on retry; (d) double-counts. Use idempotency keys for (b) and model likes as a set keyed by (user, post) with counts derived, instead of blind increments, for (d).</p></details>
+<details class="quiz"><summary>Under overload a server's queue has requests that have waited 3 s; clients time out at 1 s. Which requests should it serve first, and what should it do with the old ones?</summary>
+<p>Drop requests that have already exceeded their deadline — the clients have given up, so serving them is pure waste. Serving newest-first (adaptive LIFO) during overload maximises the number of requests completed within their deadlines. Also bound the queue and shed new arrivals early when it's full.</p></details>
+<details class="quiz"><summary>Ranking is down. Give a degraded feed design that keeps the app usable, and one thing you must NOT do as a fallback.</summary>
+<p>Serve the user's precomputed timeline from Redis in reverse-chronological order (or a light model), optionally merged with the device's cached feed; hide optional modules; log that the response was degraded. You must not bypass critical correctness/security checks — e.g. never skip privacy/block filtering because the service that provides it timed out; fail closed for those.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Partial failure is constant at scale; <strong>slow dependencies are more dangerous than dead ones</strong> because they exhaust upstream resources and cascade.</li>
+    <li>Every remote call needs a <strong>timeout</strong>, ideally derived from the dependency's p99.9 and a <strong>propagated deadline</strong>.</li>
+    <li>Retry only transient errors on idempotent operations, with <strong>exponential backoff + jitter</strong>, at <strong>one layer</strong>, within a <strong>retry budget</strong>; use <strong>idempotency keys</strong> for writes.</li>
+    <li><strong>Circuit breakers</strong> fail fast; <strong>bulkheads</strong> isolate; <strong>load shedding</strong> and <strong>backpressure</strong> keep overloaded systems productive.</li>
+    <li>Design <strong>graceful degradation</strong> per dependency (chronological feed, hidden counts, queued uploads) and never fail open on security.</li>
+    <li>Keep liveness shallow and readiness instance-local; prove resilience with <strong>chaos experiments</strong> and drills.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="core-principles.html">Scalability, Availability, Reliability &amp; Performance</a> — the definitions of nines and availability math</li>
+  <li><a href="load-balancer.html">Load Balancing</a> — health checks and outlier ejection</li>
+  <li><a href="rate-limiting.html">Rate Limiting</a> — admission control at the edge</li>
+  <li><a href="message-queues.html">Message Queues &amp; Kafka</a> — backpressure, at-least-once delivery, idempotent consumers</li>
+  <li><a href="microservices.html">Microservices</a> — why many dependencies make resilience patterns essential</li>
+  <li><a href="news-feed.html">News Feed</a> — the request whose fallbacks we designed</li>
+  <li><a href="multi-region.html">Multi-Region &amp; Disaster Recovery</a> — cells, failover and data-center drills</li>
+  <li><a href="observability.html">Monitoring, Logging &amp; Tracing</a> — seeing timeouts, breaker states and tail latency</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

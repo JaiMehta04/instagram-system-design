@@ -1,0 +1,795 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glossary — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="glossary">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>An A–Z reference of <strong>every system design term used in this guide</strong>, each explained in plain English in one to three sentences.</li>
+    <li>Wherever it helps, each entry includes an <strong>Instagram example</strong> showing where the idea appears in the architecture.</li>
+    <li>Every entry ends with a <strong>→ lesson</strong> link to the lesson that explains it in full depth.</li>
+    <li>Use the letter bar below to jump around. Each term has its own anchor (e.g. <code>glossary.html#term-cap-theorem</code>), so other pages can link straight to it.</li>
+  </ul>
+</div>
+
+<p style="font-size:1.05rem; line-height:2; word-spacing:4px;"><strong>Jump to:</strong>
+<a href="#letter-a">A</a> · <a href="#letter-b">B</a> · <a href="#letter-c">C</a> · <a href="#letter-d">D</a> · <a href="#letter-e">E</a> · <a href="#letter-f">F</a> · <a href="#letter-g">G</a> · <a href="#letter-h">H</a> · <a href="#letter-i">I</a> · <a href="#letter-j">J</a> · <a href="#letter-k">K</a> · <a href="#letter-l">L</a> · <a href="#letter-m">M</a> · <a href="#letter-n">N</a> · <a href="#letter-o">O</a> · <a href="#letter-p">P</a> · <a href="#letter-q">Q</a> · <a href="#letter-r">R</a> · <a href="#letter-s">S</a> · <a href="#letter-t">T</a> · <a href="#letter-u">U</a> · <a href="#letter-v">V</a> · <a href="#letter-w">W</a> · <a href="#letter-x">X</a> · <span style="color:#9aa5b1">Y</span> · <a href="#letter-z">Z</a></p>
+
+<div class="callout tip"><span class="callout-title">💡 How to use this page</span>
+Skim a letter when a word in another lesson is unfamiliar, or read it top to bottom as revision before an interview. If you can explain each term <em>and</em> say where it shows up in Instagram, you know the vocabulary of system design.</div>
+
+<!-- ================= A ================= -->
+<h2 id="letter-a">A</h2>
+<dl>
+<dt id="term-acid"><strong>ACID</strong></dt>
+<dd>The four guarantees of a classic database transaction. <em>Atomicity</em>: all or nothing. <em>Consistency</em>: rules and constraints hold. <em>Isolation</em>: concurrent transactions don't see each other's half-done work. <em>Durability</em>: committed data survives crashes. Instagram's User DB (PostgreSQL) relies on ACID for things like unique usernames. <a href="databases.html">→ Databases</a></dd>
+
+<dt id="term-active-active"><strong>Active-active</strong></dt>
+<dd>A multi-region setup where every region serves live traffic at the same time. Capacity is used efficiently and failover is fast, but writes in different regions can conflict. <a href="multi-region.html">→ Multi-region</a></dd>
+
+<dt id="term-active-passive"><strong>Active-passive</strong></dt>
+<dd>One region (or server) handles traffic while a standby copy waits to take over on failure. It's simpler than active-active, but the standby capacity sits idle and failover takes longer. <a href="multi-region.html">→ Multi-region</a></dd>
+
+<dt id="term-abr"><strong>Adaptive bitrate streaming (ABR)</strong></dt>
+<dd>Video is encoded at several qualities and cut into short segments, and the player switches quality segment by segment based on measured bandwidth. Reels and Stories play smoothly on both 5G and weak 3G because of ABR. <a href="media-processing.html">→ Media processing</a></dd>
+
+<dt id="term-anycast"><strong>Anycast</strong></dt>
+<dd>Many servers in different locations announce the <em>same</em> IP address, and internet routing (BGP) delivers each user's packets to the nearest one. CDNs and DNS providers use it for low latency and to spread DDoS traffic. <a href="cdn.html">→ CDN</a></dd>
+
+<dt id="term-api"><strong>API (Application Programming Interface)</strong></dt>
+<dd>The contract that defines how software components talk to each other: endpoints, parameters, responses and errors. The Instagram app talks to the backend only through its API, for example <code>GET /v1/feed</code>. <a href="api-design.html">→ API design</a></dd>
+
+<dt id="term-api-gateway"><strong>API Gateway</strong></dt>
+<dd>The single front door for all API calls. It terminates TLS, authenticates tokens, applies rate limits and routes each request to the right internal service. In the Instagram diagram it sits between the Load Balancer and the application services. <a href="api-gateway.html">→ API gateway</a></dd>
+
+<dt id="term-apns"><strong>APNs (Apple Push Notification service)</strong></dt>
+<dd>Apple's service for delivering push notifications to iPhones. Instagram's Notification Service sends to APNs, which wakes the phone even when the app isn't running. <a href="notifications.html">→ Notifications</a></dd>
+
+<dt id="term-async"><strong>Asynchronous processing</strong></dt>
+<dd>Doing work <em>after</em> responding to the user, usually by putting a message on a queue for background workers. Instagram returns "posted" immediately and does resizing, fan-out and indexing asynchronously. <a href="message-queues.html">→ Message queues</a></dd>
+
+<dt id="term-at-least-once"><strong>At-least-once delivery</strong></dt>
+<dd>A messaging guarantee that every message is delivered, but possibly more than once (e.g. after a consumer crash). Consumers must therefore be idempotent. This is Kafka's usual mode. <a href="message-queues.html">→ Message queues</a></dd>
+
+<dt id="term-at-most-once"><strong>At-most-once delivery</strong></dt>
+<dd>A message is delivered zero or one times: no duplicates, but it can be lost. It's acceptable for things like low-value metrics. <a href="message-queues.html">→ Message queues</a></dd>
+
+<dt id="term-authentication"><strong>Authentication (AuthN)</strong></dt>
+<dd>Verifying <em>who</em> a user or service is, using a password, token, certificate or similar. Instagram's User/Auth Service authenticates logins and issues tokens. <a href="authentication.html">→ Authentication</a></dd>
+
+<dt id="term-authorization"><strong>Authorization (AuthZ)</strong></dt>
+<dd>Deciding <em>what</em> an authenticated identity may do. Examples: can this user see that private account's posts, or delete this comment? <a href="authentication.html">→ Authentication</a></dd>
+
+<dt id="term-autoscaling"><strong>Autoscaling</strong></dt>
+<dd>Automatically adding or removing servers based on load (CPU, QPS, queue lag). Fan-out workers scale out when Kafka consumer lag grows. <a href="core-principles.html">→ Core principles</a></dd>
+
+<dt id="term-availability"><strong>Availability</strong></dt>
+<dd>The fraction of time a system works correctly, often expressed in "nines". 99.99% allows about 52 minutes of downtime a year. <a href="core-principles.html">→ Core principles</a></dd>
+
+<dt id="term-availability-zone"><strong>Availability zone (AZ)</strong></dt>
+<dd>An isolated data center (or group of them) within a region, with independent power and networking. Replicating across AZs survives a single building failing. <a href="multi-region.html">→ Multi-region</a></dd>
+</dl>
+
+<!-- ================= B ================= -->
+<h2 id="letter-b">B</h2>
+<dl>
+<dt id="term-backpressure"><strong>Backpressure</strong></dt>
+<dd>A way for a slow consumer to signal producers to slow down, instead of being overwhelmed or dropping data. Queues provide a natural form of it: work waits in Kafka until workers catch up. <a href="message-queues.html">→ Message queues</a></dd>
+
+<dt id="term-base"><strong>BASE</strong></dt>
+<dd>"Basically Available, Soft state, Eventually consistent". It describes many NoSQL systems that favour availability over strict consistency. It's the counterpart to ACID; Cassandra-style stores are BASE. <a href="databases.html">→ Databases</a></dd>
+
+<dt id="term-batch-processing"><strong>Batch processing</strong></dt>
+<dd>Processing large volumes of accumulated data at once, e.g. a nightly Spark job over yesterday's events. Instagram trains ranking models from batch jobs over the data warehouse. <a href="analytics-ml.html">→ Analytics &amp; ML</a></dd>
+
+<dt id="term-bff"><strong>BFF (Backend for Frontend)</strong></dt>
+<dd>A dedicated API layer tailored to one client type (iOS, Android, web) that aggregates calls to many services into the shape that client needs. <a href="api-gateway.html">→ API gateway</a></dd>
+
+<dt id="term-blob"><strong>Blob (Binary Large Object)</strong></dt>
+<dd>An unstructured chunk of bytes such as a photo or video file. Blobs belong in object storage, not in a database. <a href="object-storage.html">→ Object storage</a></dd>
+
+<dt id="term-bloom-filter"><strong>Bloom filter</strong></dt>
+<dd>A compact probabilistic data structure that answers "definitely not in the set" or "probably in the set". Databases like Cassandra use one to skip files that can't contain a key, and it can quickly rule out "has this user liked this post?". <a href="indexing.html">→ Indexing</a></dd>
+
+<dt id="term-b-tree"><strong>B-tree</strong></dt>
+<dd>A balanced tree structure used by most relational databases for indexes. It gives fast lookups and range scans with few disk reads, at the cost of in-place updates on writes. PostgreSQL indexes are B-trees by default. <a href="indexing.html">→ Indexing</a></dd>
+
+<dt id="term-broker"><strong>Broker</strong></dt>
+<dd>A server in a messaging system that stores messages and hands them to consumers. A Kafka cluster is made of many brokers, each holding some partitions. <a href="message-queues.html">→ Message queues</a></dd>
+
+<dt id="term-bucket"><strong>Bucket</strong></dt>
+<dd>A top-level container in object storage (e.g. an S3 bucket) with its own access policies and lifecycle rules. Instagram-style systems might keep raw uploads, renditions and story media in separate buckets or prefixes. <a href="object-storage.html">→ Object storage</a></dd>
+
+<dt id="term-bulkhead"><strong>Bulkhead</strong></dt>
+<dd>Isolating resources (thread pools, connection pools, clusters) per feature or dependency, so one failing part can't sink the whole ship. If search is slow, it must not exhaust the threads that serve the feed. <a href="resilience-patterns.html">→ Resilience patterns</a></dd>
+</dl>
+
+<!-- ================= C ================= -->
+<h2 id="letter-c">C</h2>
+<dl>
+<dt id="term-cache"><strong>Cache</strong></dt>
+<dd>A fast, usually in-memory copy of data kept close to where it's needed, to avoid repeating slow work. Instagram caches at every layer: on the phone, in the CDN, and in Redis/Memcache. <a href="caching.html">→ Caching</a></dd>
+
+<dt id="term-cache-aside"><strong>Cache-aside (lazy loading)</strong></dt>
+<dd>The application checks the cache first. On a miss it reads the database and writes the result into the cache. This is how the News Feed Service hydrates post objects. <a href="caching.html">→ Caching</a></dd>
+
+<dt id="term-cache-hit-ratio"><strong>Cache hit ratio</strong></dt>
+<dd>The fraction of requests served from the cache. Going from 90% to 99% cuts backend load by 10×, which is why it's the key CDN and cache metric. <a href="cdn.html">→ CDN</a></dd>
+
+<dt id="term-cache-invalidation"><strong>Cache invalidation</strong></dt>
+<dd>Removing or updating cached data when the source changes, so users don't see stale values. It's famously hard; deleting the entry on update and using versioned keys are common strategies. <a href="caching.html">→ Caching</a></dd>
+
+<dt id="term-cache-stampede"><strong>Cache stampede</strong></dt>
+<dd>Many requests miss the same expired key at once and all hit the database together. Fixed with request coalescing, locks or leases, and early refresh. <a href="caching.html">→ Caching</a></dd>
+
+<dt id="term-cap-theorem"><strong>CAP theorem</strong></dt>
+<dd>During a network <em>partition</em>, a distributed system must choose between <em>consistency</em> (everyone sees the same latest data) and <em>availability</em> (every request gets an answer). Instagram's feed chooses availability. <a href="cap-consistency.html">→ CAP &amp; consistency</a></dd>
+
+<dt id="term-cassandra"><strong>Cassandra</strong></dt>
+<dd>A distributed, leaderless wide-column database built for very high write throughput and linear horizontal scaling, with tunable consistency and built-in TTL. Instagram publicly describes using it for write-heavy data; in this guide it stores post, comment and story metadata and messages. <a href="databases.html">→ Databases</a></dd>
+
+<dt id="term-cdc"><strong>CDC (Change Data Capture)</strong></dt>
+<dd>Streaming every change committed to a database (from its log) to other systems, e.g. into Kafka. It's a reliable way to keep search indexes and caches in sync without dual writes. <a href="message-queues.html">→ Message queues</a></dd>
+
+<dt id="term-cdn"><strong>CDN (Content Delivery Network)</strong></dt>
+<dd>A worldwide network of edge cache servers that serve static content, such as photos and video segments, from locations near users. Instagram media is served from CDN edges that origin-pull from object storage. <a href="cdn.html">→ CDN</a></dd>
+
+<dt id="term-celebrity-problem"><strong>Celebrity (hot user) problem</strong></dt>
+<dd>Accounts with enormous followings break naive designs: pushing one post to 400M timelines is too slow, and their posts become hot keys. The solution is to pull celebrities at read time and replicate their hot data. <a href="news-feed.html">→ News feed</a></dd>
+
+<dt id="term-circuit-breaker"><strong>Circuit breaker</strong></dt>
+<dd>A wrapper around calls to a dependency that "trips open" after repeated failures and fails fast for a while instead of piling on more requests, then tests recovery with a few calls. It stops one failing service from cascading into a site-wide outage. <a href="resilience-patterns.html">→ Resilience patterns</a></dd>
+
+<dt id="term-clustering-key"><strong>Clustering key</strong></dt>
+<dd>In wide-column databases, the part of the primary key that sorts rows <em>within</em> a partition. In <code>posts_by_user</code>, <code>post_id DESC</code> keeps a user's posts newest-first. <a href="databases.html">→ Databases</a></dd>
+
+<dt id="term-compaction"><strong>Compaction</strong></dt>
+<dd>A background process in LSM-tree databases that merges sorted files and discards overwritten or deleted (tombstoned) data. Expired Stories rows in Cassandra are physically removed during compaction. <a href="indexing.html">→ Indexing</a></dd>
+
+<dt id="term-consistency"><strong>Consistency (models)</strong></dt>
+<dd>The rules for what a read may return after a write. They range from <em>strong</em> (always the latest) through <em>read-your-writes</em> and <em>causal</em> to <em>eventual</em> (converges later). <a href="cap-consistency.html">→ CAP &amp; consistency</a></dd>
+
+<dt id="term-consistent-hashing"><strong>Consistent hashing</strong></dt>
+<dd>A way to map keys to servers on a hash "ring" so that adding or removing a server moves only a small fraction of keys. Used by Cassandra, caches and load balancers. <a href="consistent-hashing.html">→ Consistent hashing</a></dd>
+
+<dt id="term-consumer-group"><strong>Consumer group</strong></dt>
+<dd>A set of consumers that share the work of reading a Kafka topic, with each partition read by exactly one member. Separate groups (fan-out, search indexer, notifications) each get their own full copy of the stream. <a href="message-queues.html">→ Message queues</a></dd>
+
+<dt id="term-counter-sharding"><strong>Counter sharding</strong></dt>
+<dd>Splitting one hot counter into N sub-counters that are incremented randomly and summed on read, so millions of likes on one post don't all hit one key. <a href="likes-comments.html">→ Likes &amp; counters</a></dd>
+
+<dt id="term-cqrs"><strong>CQRS (Command Query Responsibility Segregation)</strong></dt>
+<dd>Using separate models, and often separate stores, for writes (commands) and reads (queries). Instagram's precomputed feeds are a CQRS-style read model built from write events. <a href="microservices.html">→ Microservices</a></dd>
+
+<dt id="term-crdt"><strong>CRDT (Conflict-free Replicated Data Type)</strong></dt>
+<dd>A data structure, such as a counter or set, designed so that replicas updated independently can always be merged automatically into the same result. It's useful for multi-region counters and collaborative state. <a href="cap-consistency.html">→ CAP &amp; consistency</a></dd>
+
+<dt id="term-cursor-pagination"><strong>Cursor pagination</strong></dt>
+<dd>Paging through results using an opaque pointer to the last item seen, instead of page numbers. It stays correct while new items are inserted, so the Instagram feed and comments use cursors. <a href="api-design.html">→ API design</a></dd>
+</dl>
+
+<!-- ================= D ================= -->
+<h2 id="letter-d">D</h2>
+<dl>
+<dt id="term-dau-mau"><strong>DAU / MAU</strong></dt>
+<dd>Daily / Monthly Active Users, the starting point for every capacity estimate. This guide assumes ~500M DAU and ~2B MAU for Instagram. <a href="capacity-estimation.html">→ Capacity estimation</a></dd>
+
+<dt id="term-data-residency"><strong>Data residency</strong></dt>
+<dd>Legal requirements that certain users' data be stored or processed within specific countries or regions, e.g. the EU. It influences where a user's home region is. <a href="multi-region.html">→ Multi-region</a></dd>
+
+<dt id="term-data-warehouse"><strong>Data warehouse</strong></dt>
+<dd>A large analytical database optimised for scanning and aggregating historical data (columnar storage, SQL). Instagram's events land there for metrics and ML training. <a href="analytics-ml.html">→ Analytics &amp; ML</a></dd>
+
+<dt id="term-ddos"><strong>DDoS (Distributed Denial of Service)</strong></dt>
+<dd>An attack that floods a service with traffic from many machines to knock it offline. It's mitigated at the edge with Anycast, CDNs, scrubbing and rate limits. <a href="security.html">→ Security</a></dd>
+
+<dt id="term-dlq"><strong>Dead-letter queue (DLQ)</strong></dt>
+<dd>A side queue where messages that repeatedly fail processing are parked for inspection, so one "poison" message can't block the whole stream. A corrupt upload that crashes the transcoder ends up here. <a href="message-queues.html">→ Message queues</a></dd>
+
+<dt id="term-debounce"><strong>Debouncing</strong></dt>
+<dd>Waiting until input pauses (e.g. 100 ms after the last keystroke) before acting. Instagram's search typeahead debounces to avoid sending a request per letter. <a href="search.html">→ Search</a></dd>
+
+<dt id="term-deep-link"><strong>Deep link</strong></dt>
+<dd>A URL that opens a specific screen inside an app, such as <code>instagram://media?id=…</code>. Tapping a notification follows a deep link to the liked post. <a href="notifications.html">→ Notifications</a></dd>
+
+<dt id="term-denormalization"><strong>Denormalization</strong></dt>
+<dd>Deliberately duplicating data so each query can be answered from one place, trading storage and update complexity for read speed. Storing follow edges in both <code>following</code> and <code>followers</code> tables is denormalization. <a href="databases.html">→ Databases</a></dd>
+
+<dt id="term-distributed-tracing"><strong>Distributed tracing</strong></dt>
+<dd>Following one request across many services by propagating a trace ID and recording timed "spans" for each hop. It shows exactly which hop made a feed load slow. <a href="observability.html">→ Observability</a></dd>
+
+<dt id="term-dns"><strong>DNS (Domain Name System)</strong></dt>
+<dd>The internet's phone book. It translates names like <code>i.instagram.com</code> into IP addresses, with caching controlled by TTLs. <a href="dns.html">→ DNS</a></dd>
+
+<dt id="term-durability"><strong>Durability</strong></dt>
+<dd>The guarantee that data, once acknowledged, won't be lost. Object stores advertise "eleven nines" (99.999999999%) annual durability for each object. <a href="object-storage.html">→ Object storage</a></dd>
+</dl>
+
+<!-- ================= E ================= -->
+<h2 id="letter-e">E</h2>
+<dl>
+<dt id="term-edge-ngram"><strong>Edge n-gram</strong></dt>
+<dd>An indexing technique that stores every prefix of a word ("s", "se", "sel"…) as a searchable token, so prefix queries become fast exact lookups. It powers typeahead in Elasticsearch. <a href="search.html">→ Search</a></dd>
+
+<dt id="term-edge-server"><strong>Edge server</strong></dt>
+<dd>A CDN cache server located in a Point of Presence close to users. It terminates connections and serves cached content. <a href="cdn.html">→ CDN</a></dd>
+
+<dt id="term-elasticsearch"><strong>Elasticsearch</strong></dt>
+<dd>A distributed search engine built on Lucene inverted indexes, offering full-text, prefix and aggregation queries with near-real-time updates. It's the Search Index in the Instagram diagram. <a href="search.html">→ Search</a></dd>
+
+<dt id="term-encryption"><strong>Encryption at rest / in transit</strong></dt>
+<dd><em>In transit</em>: data is encrypted while moving over the network (TLS). <em>At rest</em>: data is encrypted on disk, so stolen drives are useless. Instagram traffic uses TLS end to end, and stored media and databases are encrypted. <a href="security.html">→ Security</a></dd>
+
+<dt id="term-erasure-coding"><strong>Erasure coding</strong></dt>
+<dd>Splitting data into k pieces plus m parity pieces, so any k of the k+m pieces can rebuild it. It gives durability similar to 3× replication at ~1.4–1.5× storage cost, which is ideal for petabytes of photos. <a href="object-storage.html">→ Object storage</a></dd>
+
+<dt id="term-etag"><strong>ETag</strong></dt>
+<dd>An HTTP header carrying a version fingerprint of a resource. Caches revalidate with <code>If-None-Match</code> and receive a cheap <code>304 Not Modified</code> if nothing changed. <a href="cdn.html">→ CDN</a></dd>
+
+<dt id="term-event-driven"><strong>Event-driven architecture</strong></dt>
+<dd>A style where services publish events ("post created") and other services react to them, instead of calling each other directly. Instagram's Kafka-centred async layer is event-driven. <a href="message-queues.html">→ Message queues</a></dd>
+
+<dt id="term-eventual-consistency"><strong>Eventual consistency</strong></dt>
+<dd>If no new writes happen, all replicas will <em>eventually</em> return the same value, but reads may briefly be stale. A new post appearing in followers' feeds a few seconds later is eventual consistency. <a href="cap-consistency.html">→ CAP &amp; consistency</a></dd>
+
+<dt id="term-exactly-once"><strong>Exactly-once processing</strong></dt>
+<dd>Each message affects the result exactly once. True exactly-once delivery is very hard, so systems usually achieve the same <em>effect</em> with at-least-once delivery plus idempotent processing (or Kafka transactions). <a href="message-queues.html">→ Message queues</a></dd>
+
+<dt id="term-exponential-backoff"><strong>Exponential backoff</strong></dt>
+<dd>Waiting progressively longer between retries (e.g. 100 ms, 200 ms, 400 ms…), usually with random jitter, so retries don't hammer a struggling service. The app uses it when a like request fails. <a href="resilience-patterns.html">→ Resilience patterns</a></dd>
+</dl>
+
+<!-- ================= F ================= -->
+<h2 id="letter-f">F</h2>
+<dl>
+<dt id="term-failover"><strong>Failover</strong></dt>
+<dd>Automatically switching to a standby component (replica, server or region) when the primary fails. Examples: promoting a PostgreSQL replica, or GeoDNS moving users to another region. <a href="multi-region.html">→ Multi-region</a></dd>
+
+<dt id="term-fan-out-on-read"><strong>Fan-out on read (pull)</strong></dt>
+<dd>Building a user's feed at request time by fetching recent posts from everyone they follow. Writes are cheap and reads are expensive. Instagram uses it for celebrity accounts. <a href="news-feed.html">→ News feed</a></dd>
+
+<dt id="term-fan-out-on-write"><strong>Fan-out on write (push)</strong></dt>
+<dd>When someone posts, the post ID is written into every follower's precomputed timeline. Reads are cheap and writes are amplified. Instagram's Feed Fan-out Workers do this for normal accounts. <a href="news-feed.html">→ News feed</a></dd>
+
+<dt id="term-fcm"><strong>FCM (Firebase Cloud Messaging)</strong></dt>
+<dd>Google's push notification service for Android (and others), the Android counterpart to APNs. <a href="notifications.html">→ Notifications</a></dd>
+
+<dt id="term-feature-store"><strong>Feature store</strong></dt>
+<dd>A system that computes, stores and serves ML features (e.g. "how often Alice likes Bob's posts") consistently for both training and real-time ranking. <a href="analytics-ml.html">→ Analytics &amp; ML</a></dd>
+
+<dt id="term-follower-replica"><strong>Follower (replica)</strong></dt>
+<dd>In leader-follower replication, a copy of the database that applies the leader's changes and can serve reads. Not to be confused with an Instagram follower! <a href="replication.html">→ Replication</a></dd>
+</dl>
+
+<!-- ================= G ================= -->
+<h2 id="letter-g">G</h2>
+<dl>
+<dt id="term-geodns"><strong>GeoDNS</strong></dt>
+<dd>A DNS server that returns different IP addresses depending on where the request comes from, steering users to their nearest healthy region or PoP. <a href="dns.html">→ DNS</a></dd>
+
+<dt id="term-gossip"><strong>Gossip protocol</strong></dt>
+<dd>Nodes periodically exchange state with a few random peers, so information (membership, failures) spreads through the cluster like a rumour. Cassandra uses gossip to know which nodes are alive. <a href="replication.html">→ Replication</a></dd>
+
+<dt id="term-graceful-degradation"><strong>Graceful degradation</strong></dt>
+<dd>Continuing to serve a reduced but useful experience when parts of the system fail. If ranking is down, Instagram can show a chronological feed instead of an error. <a href="resilience-patterns.html">→ Resilience patterns</a></dd>
+
+<dt id="term-graphql"><strong>GraphQL</strong></dt>
+<dd>A query language for APIs where the client specifies exactly which fields it needs in one request. Meta created it to reduce over-fetching on mobile. <a href="api-design.html">→ API design</a></dd>
+
+<dt id="term-grpc"><strong>gRPC</strong></dt>
+<dd>A high-performance RPC framework that uses HTTP/2 and Protocol Buffers (compact binary messages), with deadlines and streaming. It's a common choice for service-to-service calls. <a href="api-design.html">→ API design</a></dd>
+</dl>
+
+<!-- ================= H ================= -->
+<h2 id="letter-h">H</h2>
+<dl>
+<dt id="term-hash-partitioning"><strong>Hash partitioning</strong></dt>
+<dd>Assigning each key to a shard by hashing it, which spreads data evenly but makes range scans across keys expensive. Cassandra hash-partitions by partition key. <a href="sharding.html">→ Sharding</a></dd>
+
+<dt id="term-health-check"><strong>Health check</strong></dt>
+<dd>A periodic probe (e.g. <code>GET /health</code>) that a load balancer uses to decide whether a server should receive traffic. Failing servers are removed from rotation automatically. <a href="load-balancer.html">→ Load balancing</a></dd>
+
+<dt id="term-heartbeat"><strong>Heartbeat</strong></dt>
+<dd>A small periodic "I'm alive" message. DM clients send heartbeats over their WebSocket; if they stop, the presence entry expires and the user is treated as offline. <a href="direct-messaging.html">→ Direct messaging</a></dd>
+
+<dt id="term-hedged-request"><strong>Hedged request</strong></dt>
+<dd>Sending a duplicate request to a second replica if the first hasn't answered within a short delay, then using whichever responds first. It cuts tail (p99) latency at a small cost in extra load. <a href="resilience-patterns.html">→ Resilience patterns</a></dd>
+
+<dt id="term-hls"><strong>HLS / DASH</strong></dt>
+<dd>HTTP-based adaptive streaming formats. Video is split into short segments listed in a manifest (<code>.m3u8</code> for HLS, <code>.mpd</code> for DASH) that the player downloads from the CDN. <a href="media-processing.html">→ Media processing</a></dd>
+
+<dt id="term-horizontal-scaling"><strong>Horizontal scaling (scale out)</strong></dt>
+<dd>Handling more load by adding more machines rather than bigger ones. Stateless services and sharded stores make Instagram scale horizontally. <a href="core-principles.html">→ Core principles</a></dd>
+
+<dt id="term-hot-key"><strong>Hot key</strong></dt>
+<dd>A single cache or database key receiving a disproportionate share of traffic, e.g. a celebrity's new post object or like counter. Mitigated by replicating, splitting and caching locally. <a href="caching.html">→ Caching</a></dd>
+
+<dt id="term-hot-partition"><strong>Hot partition / hotspot</strong></dt>
+<dd>A shard or partition that receives far more load than others because of skewed keys, overloading one machine while others idle. <a href="sharding.html">→ Sharding</a></dd>
+
+<dt id="term-http2-http3"><strong>HTTP/2 and HTTP/3</strong></dt>
+<dd>HTTP/2 multiplexes many requests over one TCP connection with header compression. HTTP/3 runs over QUIC (UDP), avoiding TCP head-of-line blocking and enabling faster connection setup. Both make mobile apps snappier. <a href="networking-basics.html">→ Networking basics</a></dd>
+
+<dt id="term-hydration"><strong>Hydration</strong></dt>
+<dd>Turning a list of IDs into full objects by fetching their details, usually with a batched cache multi-get. The feed service hydrates the top 20 post IDs into post objects. <a href="news-feed.html">→ News feed</a></dd>
+
+<dt id="term-hyperloglog"><strong>HyperLogLog</strong></dt>
+<dd>A probabilistic algorithm that estimates the number of <em>distinct</em> items (e.g. unique viewers of a Reel) using only kilobytes of memory, with ~1% error. <a href="analytics-ml.html">→ Analytics &amp; ML</a></dd>
+</dl>
+
+<!-- ================= I ================= -->
+<h2 id="letter-i">I</h2>
+<dl>
+<dt id="term-idempotency"><strong>Idempotency</strong></dt>
+<dd>An operation is idempotent if doing it twice has the same effect as doing it once. Liking a post (keyed by post + user) is idempotent, so retries are safe. <a href="api-design.html">→ API design</a></dd>
+
+<dt id="term-idempotency-key"><strong>Idempotency key</strong></dt>
+<dd>A unique client-generated ID sent with a non-idempotent request (like "create post"), so the server can recognise retries and return the original result instead of acting twice. <a href="api-design.html">→ API design</a></dd>
+
+<dt id="term-index"><strong>Index (database)</strong></dt>
+<dd>An auxiliary data structure (B-tree, LSM, hash) that lets a database find rows without scanning everything. Every index speeds up reads but slows writes and uses storage. <a href="indexing.html">→ Indexing</a></dd>
+
+<dt id="term-inverted-index"><strong>Inverted index</strong></dt>
+<dd>A map from each word (term) to the list of documents containing it, like the index at the back of a book. It's how searching "#sunset" finds posts instantly. <a href="search.html">→ Search</a></dd>
+
+<dt id="term-isolation-level"><strong>Isolation level</strong></dt>
+<dd>How much concurrent transactions can see of each other: read committed, repeatable read, snapshot or serializable. Stronger levels prevent more anomalies but reduce concurrency. <a href="databases.html">→ Databases</a></dd>
+</dl>
+
+<!-- ================= J ================= -->
+<h2 id="letter-j">J</h2>
+<dl>
+<dt id="term-jitter"><strong>Jitter</strong></dt>
+<dd>Random variation added to retry delays or timers so that many clients don't act in lockstep. After an outage, jitter prevents millions of phones reconnecting at the same instant. <a href="resilience-patterns.html">→ Resilience patterns</a></dd>
+
+<dt id="term-jwt"><strong>JWT (JSON Web Token)</strong></dt>
+<dd>A signed token containing claims (user ID, expiry) that any service can verify with a public key, without calling the auth server. Instagram-style gateways validate short-lived JWTs on every request. <a href="authentication.html">→ Authentication</a></dd>
+</dl>
+
+<!-- ================= K ================= -->
+<h2 id="letter-k">K</h2>
+<dl>
+<dt id="term-kafka"><strong>Kafka</strong></dt>
+<dd>A distributed, durable, partitioned commit log used as an event bus. Producers append events; many independent consumer groups read them at their own pace and can replay history. It's the backbone of Instagram's async layer in this guide. <a href="message-queues.html">→ Message queues</a></dd>
+
+<dt id="term-keep-alive"><strong>Keep-alive (persistent connection)</strong></dt>
+<dd>Reusing one TCP/TLS connection for many requests instead of opening a new one each time, which saves handshake round trips. <a href="networking-basics.html">→ Networking basics</a></dd>
+
+<dt id="term-key-value-store"><strong>Key-value store</strong></dt>
+<dd>The simplest database model: store and fetch a value by its key, with very high speed and easy scaling. Redis and DynamoDB are examples. <a href="databases.html">→ Databases</a></dd>
+</dl>
+
+<!-- ================= L ================= -->
+<h2 id="letter-l">L</h2>
+<dl>
+<dt id="term-l4-l7"><strong>L4 / L7 load balancing</strong></dt>
+<dd>L4 balancers route by IP and port (TCP/UDP), which is fast and protocol-agnostic. L7 balancers understand HTTP, so they can route by path or header, terminate TLS and retry. Instagram-style stacks put L4 in front of L7 proxies and gateways. <a href="load-balancer.html">→ Load balancing</a></dd>
+
+<dt id="term-latency"><strong>Latency</strong></dt>
+<dd>The time one operation takes, e.g. 85 ms for a feed request. Usually reported as percentiles (p50, p99) because averages hide slow outliers. <a href="core-principles.html">→ Core principles</a></dd>
+
+<dt id="term-leader-election"><strong>Leader election</strong></dt>
+<dd>The process by which nodes in a cluster agree on which one acts as leader (e.g. a new database primary after a failure), usually via a consensus system like ZooKeeper, etcd or Raft. <a href="replication.html">→ Replication</a></dd>
+
+<dt id="term-leader-follower"><strong>Leader-follower replication</strong></dt>
+<dd>One node (the leader or primary) accepts writes and streams them to followers (replicas), which serve reads. Instagram's sharded PostgreSQL works this way. <a href="replication.html">→ Replication</a></dd>
+
+<dt id="term-lease"><strong>Lease</strong></dt>
+<dd>A time-limited permission. In caching, a lease lets only one client refill a missing key (preventing stampedes and stale sets), an idea described in Facebook's Memcache paper. <a href="caching.html">→ Caching</a></dd>
+
+<dt id="term-least-connections"><strong>Least connections</strong></dt>
+<dd>A load-balancing algorithm that sends each new request to the server with the fewest active connections, which adapts to uneven request costs. <a href="load-balancer.html">→ Load balancing</a></dd>
+
+<dt id="term-load-balancer"><strong>Load balancer</strong></dt>
+<dd>A component that spreads incoming traffic across many servers and removes unhealthy ones. In the Instagram diagram it sits between DNS and the API Gateway. <a href="load-balancer.html">→ Load balancing</a></dd>
+
+<dt id="term-load-shedding"><strong>Load shedding</strong></dt>
+<dd>Deliberately rejecting some requests (lowest priority first) when overloaded, so the rest still succeed. For example, Instagram might drop prefetch requests before feed requests. <a href="resilience-patterns.html">→ Resilience patterns</a></dd>
+
+<dt id="term-logical-shard"><strong>Logical shard</strong></dt>
+<dd>A virtual partition, many of which live on each physical database server. Moving whole logical shards between machines makes resharding easy. Instagram publicly described thousands of logical shards in PostgreSQL. <a href="sharding.html">→ Sharding</a></dd>
+
+<dt id="term-long-polling"><strong>Long polling</strong></dt>
+<dd>The client makes an HTTP request that the server holds open until there's new data (or a timeout), then the client immediately asks again. It's a fallback for real-time updates when WebSockets aren't available. <a href="direct-messaging.html">→ Direct messaging</a></dd>
+
+<dt id="term-lru"><strong>LRU (Least Recently Used)</strong></dt>
+<dd>A cache eviction policy that removes the entry unused for the longest time when space runs out. It's a good default for feeds and post objects. <a href="caching.html">→ Caching</a></dd>
+
+<dt id="term-lsm-tree"><strong>LSM tree (Log-Structured Merge tree)</strong></dt>
+<dd>A storage engine that buffers writes in memory and flushes them as sorted immutable files, merged later by compaction. Writes are very fast, which is why Cassandra, RocksDB and HBase use it. <a href="indexing.html">→ Indexing</a></dd>
+</dl>
+
+<!-- ================= M ================= -->
+<h2 id="letter-m">M</h2>
+<dl>
+<dt id="term-manifest"><strong>Manifest (video)</strong></dt>
+<dd>A small file listing a video's available bitrates and the URLs of its segments, which a player reads first to start adaptive streaming. <a href="media-processing.html">→ Media processing</a></dd>
+
+<dt id="term-materialized-view"><strong>Materialized view</strong></dt>
+<dd>A precomputed, stored result of a query that's kept up to date as data changes. A user's precomputed home timeline is effectively a materialized view of "recent posts by people I follow". <a href="databases.html">→ Databases</a></dd>
+
+<dt id="term-memcached"><strong>Memcached</strong></dt>
+<dd>A simple, very fast, distributed in-memory key-value cache. Facebook famously runs it at enormous scale, and Instagram has publicly described using it. <a href="caching.html">→ Caching</a></dd>
+
+<dt id="term-message-queue"><strong>Message queue</strong></dt>
+<dd>A buffer where producers put messages and consumers take them off to process, decoupling the two in time and speed. Kafka (a log), RabbitMQ and SQS are examples. <a href="message-queues.html">→ Message queues</a></dd>
+
+<dt id="term-microservice"><strong>Microservice</strong></dt>
+<dd>A small, independently deployable service that owns one business capability and its data, such as the Like &amp; Comment service or the Search Service. <a href="microservices.html">→ Microservices</a></dd>
+
+<dt id="term-moderation"><strong>Content moderation</strong></dt>
+<dd>Detecting and removing content that breaks policy, using ML classifiers, hash matching against known-bad content and human review. It runs in Instagram's media processing pipeline. <a href="media-processing.html">→ Media processing</a></dd>
+
+<dt id="term-monolith"><strong>Monolith</strong></dt>
+<dd>An application built and deployed as one unit. It's simple to start with, but harder to scale teams and components independently. Instagram began as a Django monolith. <a href="microservices.html">→ Microservices</a></dd>
+
+<dt id="term-mtls"><strong>mTLS (mutual TLS)</strong></dt>
+<dd>TLS where <em>both</em> sides present certificates, so services authenticate each other as well as encrypting traffic. It's a standard for zero-trust service-to-service calls. <a href="security.html">→ Security</a></dd>
+
+<dt id="term-multi-leader"><strong>Multi-leader replication</strong></dt>
+<dd>Several nodes, often in different regions, accept writes and replicate to each other. Writes are local and fast, but conflicting concurrent writes must be resolved. <a href="replication.html">→ Replication</a></dd>
+
+<dt id="term-multipart-upload"><strong>Multipart / resumable upload</strong></dt>
+<dd>Uploading a large file in independent chunks that can be retried individually and resumed after a disconnect. It's essential for Reels uploads on mobile networks. <a href="media-upload.html">→ Media upload</a></dd>
+</dl>
+
+<!-- ================= N ================= -->
+<h2 id="letter-n">N</h2>
+<dl>
+<dt id="term-network-partition"><strong>Network partition</strong></dt>
+<dd>A network failure that splits nodes into groups that can't talk to each other, though each group is still running. It's the "P" in CAP. <a href="cap-consistency.html">→ CAP &amp; consistency</a></dd>
+
+<dt id="term-normalization"><strong>Normalization</strong></dt>
+<dd>Structuring relational data so each fact is stored once (no duplication), which avoids update anomalies but needs joins to read. It's the opposite of denormalization. <a href="databases.html">→ Databases</a></dd>
+
+<dt id="term-nosql"><strong>NoSQL</strong></dt>
+<dd>An umbrella term for non-relational databases (key-value, document, wide-column, graph) that typically trade joins and rich transactions for horizontal scale and flexible schemas. <a href="databases.html">→ Databases</a></dd>
+
+<dt id="term-news-feed"><strong>News feed / timeline</strong></dt>
+<dd>The personalised, scrollable list of posts a user sees on the home screen. In Instagram it's built from precomputed timelines in Redis plus pulled celebrity posts, then ranked by ML. <a href="news-feed.html">→ News feed</a></dd>
+</dl>
+
+<!-- ================= O ================= -->
+<h2 id="letter-o">O</h2>
+<dl>
+<dt id="term-oauth"><strong>OAuth 2.0</strong></dt>
+<dd>A standard for delegated authorization: a user lets an app access their data on another service via tokens, without sharing their password. "Log in with Facebook" builds on it. <a href="authentication.html">→ Authentication</a></dd>
+
+<dt id="term-object-storage"><strong>Object storage</strong></dt>
+<dd>Storage for immutable blobs addressed by a key in a flat namespace (e.g. S3). It's massively scalable, very durable and cheap. All Instagram photos and videos live here. <a href="object-storage.html">→ Object storage</a></dd>
+
+<dt id="term-observability"><strong>Observability</strong></dt>
+<dd>How well you can understand a system's internal state from its outputs, mainly metrics, logs and traces. <a href="observability.html">→ Observability</a></dd>
+
+<dt id="term-offset"><strong>Offset (Kafka)</strong></dt>
+<dd>A message's position number within a Kafka partition. Consumers commit offsets to record how far they've processed, so after a crash they resume from there. <a href="message-queues.html">→ Message queues</a></dd>
+
+<dt id="term-optimistic-ui"><strong>Optimistic UI</strong></dt>
+<dd>Updating the interface immediately as if an action succeeded, then reconciling when the server responds. The red heart on a like appears before the server confirms. <a href="clients.html">→ Clients</a></dd>
+
+<dt id="term-origin"><strong>Origin</strong></dt>
+<dd>The authoritative source of content behind a cache or CDN. For Instagram media, the origin is object storage. <a href="cdn.html">→ CDN</a></dd>
+
+<dt id="term-origin-shield"><strong>Origin shield</strong></dt>
+<dd>A middle caching tier between CDN edges and the origin, so many edge misses become a single origin request. It protects object storage when a post goes viral. <a href="cdn.html">→ CDN</a></dd>
+
+<dt id="term-outbox"><strong>Outbox pattern (transactional outbox)</strong></dt>
+<dd>Writing an event to an "outbox" table in the same database transaction as the business change, then having a relay publish it to Kafka. It avoids the dual-write bug where the DB commit succeeds but the event is lost. <a href="message-queues.html">→ Message queues</a></dd>
+</dl>
+
+<!-- ================= P ================= -->
+<h2 id="letter-p">P</h2>
+<dl>
+<dt id="term-p99"><strong>p50 / p95 / p99 (percentile latency)</strong></dt>
+<dd>The latency below which 50%, 95% or 99% of requests complete. p99 captures the "tail" that heavy users hit constantly, so SLOs usually target p99, e.g. a feed p99 under 300 ms. <a href="observability.html">→ Observability</a></dd>
+
+<dt id="term-pacelc"><strong>PACELC</strong></dt>
+<dd>An extension of CAP: if there's a <strong>P</strong>artition, choose <strong>A</strong>vailability or <strong>C</strong>onsistency; <strong>E</strong>lse (normal operation), choose <strong>L</strong>atency or <strong>C</strong>onsistency. Cassandra is PA/EL by default. <a href="cap-consistency.html">→ CAP &amp; consistency</a></dd>
+
+<dt id="term-pagination"><strong>Pagination</strong></dt>
+<dd>Returning large result sets in pages. Offset pagination (<code>page=3</code>) is simple but breaks on changing data; cursor pagination is robust. <a href="api-design.html">→ API design</a></dd>
+
+<dt id="term-partition"><strong>Partition</strong></dt>
+<dd>A subset of a dataset stored together. In databases it's a shard, or a Cassandra partition (all rows sharing a partition key). In Kafka it's an ordered log that's a slice of a topic and the unit of parallelism. <a href="sharding.html">→ Sharding</a></dd>
+
+<dt id="term-partition-key"><strong>Partition key (shard key)</strong></dt>
+<dd>The field whose value decides which partition or shard a row lives on. Choosing it well (e.g. <code>user_id</code> for posts, <code>thread_id</code> for messages) makes common queries hit one partition. <a href="sharding.html">→ Sharding</a></dd>
+
+<dt id="term-pop"><strong>PoP (Point of Presence)</strong></dt>
+<dd>A CDN or network location in a city, containing many edge servers. Large CDNs operate hundreds to thousands of PoPs. <a href="cdn.html">→ CDN</a></dd>
+
+<dt id="term-postgresql"><strong>PostgreSQL</strong></dt>
+<dd>A powerful open-source relational database with strong ACID guarantees and rich indexing. Instagram's engineering blog describes running it sharded, with its ID generation done in PL/pgSQL. <a href="databases.html">→ Databases</a></dd>
+
+<dt id="term-pre-signed-url"><strong>Pre-signed URL</strong></dt>
+<dd>A URL to object storage that embeds a time-limited signature granting one specific operation (e.g. PUT this key). Clients upload media directly to storage without app servers handling the bytes. <a href="media-upload.html">→ Media upload</a></dd>
+
+<dt id="term-presence"><strong>Presence</strong></dt>
+<dd>Tracking which users are online and which connection server holds each one's socket, usually in Redis with heartbeat TTLs. DMs use it to decide between WebSocket delivery and push. <a href="direct-messaging.html">→ Direct messaging</a></dd>
+
+<dt id="term-primary-key"><strong>Primary key</strong></dt>
+<dd>The column(s) that uniquely identify a row. Choosing natural keys like <code>(post_id, user_id)</code> for likes makes writes naturally idempotent. <a href="indexing.html">→ Indexing</a></dd>
+
+<dt id="term-pub-sub"><strong>Pub/Sub (publish-subscribe)</strong></dt>
+<dd>A messaging pattern where publishers send messages to a topic and every subscriber to that topic receives a copy. <a href="message-queues.html">→ Message queues</a></dd>
+
+<dt id="term-push-pull-cdn"><strong>Push CDN vs pull CDN</strong></dt>
+<dd>A push CDN is loaded with content in advance by you. A pull CDN fetches from the origin on the first miss. Instagram's long-tail media suits pull. <a href="cdn.html">→ CDN</a></dd>
+
+<dt id="term-push-notification"><strong>Push notification</strong></dt>
+<dd>A message delivered to a device by the OS push service (APNs or FCM) even when the app is closed, e.g. "alice liked your photo". It's best-effort and not guaranteed. <a href="notifications.html">→ Notifications</a></dd>
+</dl>
+
+<!-- ================= Q ================= -->
+<h2 id="letter-q">Q</h2>
+<dl>
+<dt id="term-qps"><strong>QPS (Queries Per Second)</strong></dt>
+<dd>The number of requests a system handles each second; also RPS or TPS. Assuming 500M DAU each loading the feed 10×/day gives ~58k feed QPS on average. <a href="capacity-estimation.html">→ Capacity estimation</a></dd>
+
+<dt id="term-quic"><strong>QUIC</strong></dt>
+<dd>A transport protocol over UDP with built-in TLS 1.3, faster handshakes, connection migration (Wi-Fi to cellular) and no TCP head-of-line blocking. HTTP/3 runs on it. <a href="networking-basics.html">→ Networking basics</a></dd>
+
+<dt id="term-quorum"><strong>Quorum</strong></dt>
+<dd>The minimum number of replicas that must acknowledge a read or write. With N replicas, choosing R + W &gt; N (e.g. N=3, W=2, R=2) guarantees that reads overlap the latest write. <a href="replication.html">→ Replication</a></dd>
+</dl>
+
+<!-- ================= R ================= -->
+<h2 id="letter-r">R</h2>
+<dl>
+<dt id="term-ranking"><strong>Ranking (feed ranking)</strong></dt>
+<dd>Ordering candidate posts by predicted interest using ML models over features like affinity, recency and engagement. Instagram moved its feed from chronological to ranked in 2016. <a href="analytics-ml.html">→ Analytics &amp; ML</a></dd>
+
+<dt id="term-rate-limiting"><strong>Rate limiting</strong></dt>
+<dd>Capping how many requests a client may make per time window, to stop abuse and protect capacity. Login attempts, follows and searches are all rate-limited at Instagram's API Gateway. <a href="rate-limiting.html">→ Rate limiting</a></dd>
+
+<dt id="term-read-replica"><strong>Read replica</strong></dt>
+<dd>A follower database copy used to serve reads and scale read throughput. It may lag slightly behind the primary. <a href="replication.html">→ Replication</a></dd>
+
+<dt id="term-read-your-writes"><strong>Read-your-writes consistency</strong></dt>
+<dd>A guarantee that a user always sees their own updates, even if others see them later. Your new post must appear on your own profile instantly. <a href="cap-consistency.html">→ CAP &amp; consistency</a></dd>
+
+<dt id="term-redis"><strong>Redis</strong></dt>
+<dd>An in-memory data-structure store (strings, hashes, sorted sets, sets) with optional persistence and clustering. It's the Feed Cache in the Instagram diagram, holding timelines and counters. <a href="caching.html">→ Caching</a></dd>
+
+<dt id="term-refresh-token"><strong>Refresh token</strong></dt>
+<dd>A long-lived credential used only to obtain new short-lived access tokens, and revocable on the server. It keeps users logged in for weeks without long-lived JWTs. <a href="authentication.html">→ Authentication</a></dd>
+
+<dt id="term-region"><strong>Region</strong></dt>
+<dd>A geographic area containing one or more data centers (availability zones). Instagram-scale systems run in several regions for latency and disaster recovery. <a href="multi-region.html">→ Multi-region</a></dd>
+
+<dt id="term-rendition"><strong>Rendition</strong></dt>
+<dd>One processed version of a media file at a specific size, format or bitrate, e.g. the 640 px WebP of a photo. Media workers create several renditions of every upload. <a href="media-processing.html">→ Media processing</a></dd>
+
+<dt id="term-replication"><strong>Replication</strong></dt>
+<dd>Keeping copies of the same data on multiple machines for availability, durability and read scaling. <a href="replication.html">→ Replication</a></dd>
+
+<dt id="term-replication-factor"><strong>Replication factor (RF)</strong></dt>
+<dd>How many copies of each piece of data are stored. RF=3 is the common default for Cassandra and Kafka. <a href="replication.html">→ Replication</a></dd>
+
+<dt id="term-replication-lag"><strong>Replication lag</strong></dt>
+<dd>The delay between a write on the leader and its appearance on a replica. Lag causes stale reads, e.g. a user not seeing a profile edit they just made if the read hits a lagging replica. <a href="replication.html">→ Replication</a></dd>
+
+<dt id="term-resharding"><strong>Resharding</strong></dt>
+<dd>Changing how data is split across shards (adding shards, moving data) as the system grows. Logical shards and consistent hashing make it far less painful. <a href="sharding.html">→ Sharding</a></dd>
+
+<dt id="term-rest"><strong>REST</strong></dt>
+<dd>An API style built on HTTP resources (nouns like <code>/posts/{id}</code>) and standard methods (GET, POST, PUT, DELETE). It's simple, cacheable and universal. <a href="api-design.html">→ API design</a></dd>
+
+<dt id="term-retry"><strong>Retry</strong></dt>
+<dd>Repeating a failed request in the hope that the failure was transient. Retries need backoff, jitter, budgets and idempotent operations, or they make outages worse. <a href="resilience-patterns.html">→ Resilience patterns</a></dd>
+
+<dt id="term-reverse-proxy"><strong>Reverse proxy</strong></dt>
+<dd>A server that sits in front of backend servers and forwards client requests to them, adding TLS termination, caching, compression or routing. NGINX and Envoy are common examples. <a href="api-gateway.html">→ API gateway</a></dd>
+
+<dt id="term-round-robin"><strong>Round robin</strong></dt>
+<dd>The simplest load-balancing algorithm: send each request to the next server in turn. <a href="load-balancer.html">→ Load balancing</a></dd>
+
+<dt id="term-rpo-rto"><strong>RPO / RTO</strong></dt>
+<dd><em>Recovery Point Objective</em>: how much data loss (in time) is acceptable after a disaster. <em>Recovery Time Objective</em>: how quickly service must be restored. Example: RPO 5 s, RTO 5 min for a regional failover. <a href="multi-region.html">→ Multi-region</a></dd>
+</dl>
+
+<!-- ================= S ================= -->
+<h2 id="letter-s">S</h2>
+<dl>
+<dt id="term-saga"><strong>Saga</strong></dt>
+<dd>A way to run a multi-step operation across services without a distributed transaction. Each step is a local transaction with a matching <em>compensating</em> action that undoes it if a later step fails. <a href="microservices.html">→ Microservices</a></dd>
+
+<dt id="term-scalability"><strong>Scalability</strong></dt>
+<dd>The ability to handle growing load by adding resources while keeping performance acceptable. <a href="core-principles.html">→ Core principles</a></dd>
+
+<dt id="term-secondary-index"><strong>Secondary index</strong></dt>
+<dd>An index on a non-primary-key column, e.g. finding users by email. In sharded systems it is often maintained as a separate lookup table, such as <code>usernames → user_id</code>. <a href="indexing.html">→ Indexing</a></dd>
+
+<dt id="term-service-discovery"><strong>Service discovery</strong></dt>
+<dd>How services find the current network addresses of the instances of other services, via a registry (Consul, etcd, ZooKeeper) or DNS. <a href="microservices.html">→ Microservices</a></dd>
+
+<dt id="term-sharding"><strong>Sharding</strong></dt>
+<dd>Splitting a dataset horizontally across many database servers by a shard key, so no single machine holds or serves everything. Instagram shards users and posts by <code>user_id</code>. <a href="sharding.html">→ Sharding</a></dd>
+
+<dt id="term-signed-url"><strong>Signed URL (download)</strong></dt>
+<dd>A media URL carrying an expiry and an HMAC signature that the CDN edge verifies, so links can't be forged and leaked links stop working. Instagram media URLs carry such parameters. <a href="cdn.html">→ CDN</a></dd>
+
+<dt id="term-sla-sli-slo"><strong>SLA / SLI / SLO</strong></dt>
+<dd><em>SLI</em>: a measured indicator (e.g. the fraction of feed requests under 300 ms). <em>SLO</em>: the internal target for it (99.9%). <em>SLA</em>: a contractual promise to customers, with penalties. <a href="observability.html">→ Observability</a></dd>
+
+<dt id="term-sliding-window"><strong>Sliding window (rate limiting)</strong></dt>
+<dd>A rate-limiting algorithm that counts requests over a rolling time window. It's smoother and fairer than fixed windows, which allow bursts at window boundaries. <a href="rate-limiting.html">→ Rate limiting</a></dd>
+
+<dt id="term-snowflake-id"><strong>Snowflake ID</strong></dt>
+<dd>Twitter's 64-bit, time-sortable ID format: timestamp + machine ID + sequence, generated without coordination. Instagram's variant packs 41 bits of time, 13 bits of logical shard and 10 bits of sequence. <a href="id-generation.html">→ ID generation</a></dd>
+
+<dt id="term-social-graph"><strong>Social graph</strong></dt>
+<dd>The network of relationships between users (who follows whom), stored as adjacency lists in both directions. Its size and skew drive feed design. <a href="social-graph.html">→ Social graph</a></dd>
+
+<dt id="term-spof"><strong>SPOF (Single Point of Failure)</strong></dt>
+<dd>Any component whose failure takes the whole system down. It's eliminated with redundancy at every layer: paired LBs, stateless service fleets and replicated stores. <a href="core-principles.html">→ Core principles</a></dd>
+
+<dt id="term-sql"><strong>SQL / relational database</strong></dt>
+<dd>A database that stores data in tables with schemas and relations, queried with SQL, and offering joins and ACID transactions. Examples are PostgreSQL and MySQL. <a href="databases.html">→ Databases</a></dd>
+
+<dt id="term-stateless"><strong>Stateless service</strong></dt>
+<dd>A service that keeps no per-user data in memory between requests (state lives in databases and caches), so any instance can serve any request and instances can be added or killed freely. <a href="microservices.html">→ Microservices</a></dd>
+
+<dt id="term-sticky-session"><strong>Sticky session (session affinity)</strong></dt>
+<dd>A load balancer routing all of a client's requests to the same server. It's needed for stateful connections like DM WebSockets, and avoided for stateless HTTP APIs. <a href="load-balancer.html">→ Load balancing</a></dd>
+
+<dt id="term-storage-tier"><strong>Storage tiering</strong></dt>
+<dd>Moving data between storage classes (hot SSD, warm HDD, cold archive) according to access frequency, to cut cost. Old, rarely viewed photos can live on cheaper tiers. <a href="object-storage.html">→ Object storage</a></dd>
+
+<dt id="term-stream-processing"><strong>Stream processing</strong></dt>
+<dd>Processing events continuously as they arrive (with Flink, Kafka Streams or Spark Streaming), e.g. real-time view counts or abuse detection. It's the counterpart to batch processing. <a href="analytics-ml.html">→ Analytics &amp; ML</a></dd>
+
+<dt id="term-strong-consistency"><strong>Strong consistency (linearizability)</strong></dt>
+<dd>Every read returns the most recent completed write, as if there were a single copy of the data. It's needed for username uniqueness and block lists. <a href="cap-consistency.html">→ CAP &amp; consistency</a></dd>
+</dl>
+
+<!-- ================= T ================= -->
+<h2 id="letter-t">T</h2>
+<dl>
+<dt id="term-tao"><strong>TAO</strong></dt>
+<dd>Facebook's geographically distributed graph data store and cache (described in a public paper) that serves objects and associations, such as users, likes and friendships, at massive read rates. <a href="social-graph.html">→ Social graph</a></dd>
+
+<dt id="term-tcp"><strong>TCP</strong></dt>
+<dd>The reliable, ordered, connection-based transport protocol under HTTP/1.1 and HTTP/2. It needs a handshake before data flows. <a href="networking-basics.html">→ Networking basics</a></dd>
+
+<dt id="term-thundering-herd"><strong>Thundering herd</strong></dt>
+<dd>A large number of clients or processes waking up and hitting the same resource at once, e.g. after a cache expiry, a restart or a viral post. Mitigated with jitter, request coalescing and origin shields. <a href="caching.html">→ Caching</a></dd>
+
+<dt id="term-throughput"><strong>Throughput</strong></dt>
+<dd>How much work a system completes per unit of time (requests/s, MB/s). It's distinct from latency: a system can have high throughput and still be slow per request. <a href="core-principles.html">→ Core principles</a></dd>
+
+<dt id="term-timeout"><strong>Timeout / deadline</strong></dt>
+<dd>The maximum time a caller waits for a response before giving up. Every network call needs one, and deadlines should shrink as they propagate down the call chain. <a href="resilience-patterns.html">→ Resilience patterns</a></dd>
+
+<dt id="term-tls"><strong>TLS (Transport Layer Security)</strong></dt>
+<dd>The protocol that encrypts and authenticates connections (the "S" in HTTPS). TLS 1.3 needs only one round trip to set up. <a href="networking-basics.html">→ Networking basics</a></dd>
+
+<dt id="term-token-bucket"><strong>Token bucket</strong></dt>
+<dd>A rate-limiting algorithm. A bucket refills with tokens at a fixed rate up to a maximum; each request spends a token, and requests are rejected when it's empty. It allows short bursts while enforcing an average rate. <a href="rate-limiting.html">→ Rate limiting</a></dd>
+
+<dt id="term-tombstone"><strong>Tombstone</strong></dt>
+<dd>A marker written to record a deletion in LSM-based stores like Cassandra. The data is physically removed later during compaction. Many expiring Stories rows create many tombstones. <a href="stories.html">→ Stories</a></dd>
+
+<dt id="term-transcoding"><strong>Transcoding</strong></dt>
+<dd>Converting video or audio from one encoding, resolution or bitrate to another, e.g. turning an uploaded Reel into several HLS renditions. It's CPU- or GPU-heavy, so it runs asynchronously. <a href="media-processing.html">→ Media processing</a></dd>
+
+<dt id="term-trie"><strong>Trie (prefix tree)</strong></dt>
+<dd>A tree where each path from the root spells a prefix, making "all words starting with sel" fast to find. It's a classic structure for typeahead. <a href="search.html">→ Search</a></dd>
+
+<dt id="term-ttl"><strong>TTL (Time To Live)</strong></dt>
+<dd>How long a piece of data stays valid before it expires: a DNS record, a cache entry, a CDN object, or a 24-hour Story row in Cassandra. <a href="stories.html">→ Stories</a></dd>
+
+<dt id="term-two-phase-commit"><strong>Two-phase commit (2PC)</strong></dt>
+<dd>A protocol for atomic commits across multiple databases. A coordinator asks every participant to <em>prepare</em>, then tells all of them to <em>commit</em>. It's correct but slow, and it blocks if the coordinator fails, so large web systems usually prefer sagas and idempotent retries. <a href="microservices.html">→ Microservices</a></dd>
+
+<dt id="term-typeahead"><strong>Typeahead (autocomplete)</strong></dt>
+<dd>Suggesting results while the user types each character. It needs very low latency, prefix indexes and caching of popular prefixes. <a href="search.html">→ Search</a></dd>
+</dl>
+
+<!-- ================= U ================= -->
+<h2 id="letter-u">U</h2>
+<dl>
+<dt id="term-udp"><strong>UDP</strong></dt>
+<dd>A lightweight, connectionless transport with no delivery or ordering guarantees. It's used for DNS, real-time media and as the base for QUIC. <a href="networking-basics.html">→ Networking basics</a></dd>
+
+<dt id="term-upsert"><strong>Upsert</strong></dt>
+<dd>A write that inserts a row if it doesn't exist or updates it if it does. In Cassandra every write is effectively an upsert, which makes retries idempotent. <a href="databases.html">→ Databases</a></dd>
+
+<dt id="term-uuid"><strong>UUID</strong></dt>
+<dd>A 128-bit identifier that can be generated anywhere without coordination. Random UUIDv4 isn't time-sortable and indexes poorly; UUIDv7 and ULID add time ordering. <a href="id-generation.html">→ ID generation</a></dd>
+</dl>
+
+<!-- ================= V ================= -->
+<h2 id="letter-v">V</h2>
+<dl>
+<dt id="term-vector-clock"><strong>Vector clock</strong></dt>
+<dd>A list of per-node counters attached to a value that lets a system tell whether two versions are causally ordered or truly concurrent (a conflict). It's used in Dynamo-style databases. <a href="replication.html">→ Replication</a></dd>
+
+<dt id="term-vector-search"><strong>Vector search (embeddings)</strong></dt>
+<dd>Finding items whose ML embedding vectors are closest to a query vector, i.e. semantically or visually similar. It powers recommendation candidate retrieval for Explore-style surfaces. <a href="analytics-ml.html">→ Analytics &amp; ML</a></dd>
+
+<dt id="term-vertical-scaling"><strong>Vertical scaling (scale up)</strong></dt>
+<dd>Handling more load by using a bigger machine (more CPU, RAM, disk). It's simple, but has a hard ceiling and remains a single point of failure. <a href="core-principles.html">→ Core principles</a></dd>
+
+<dt id="term-vip"><strong>VIP (Virtual IP)</strong></dt>
+<dd>An IP address not tied to one physical machine, which can move between load balancers on failure, so clients always have a working address. <a href="load-balancer.html">→ Load balancing</a></dd>
+
+<dt id="term-virtual-nodes"><strong>Virtual nodes (vnodes)</strong></dt>
+<dd>Placing each physical server at many points on a consistent-hash ring. Load spreads more evenly, and when a node joins or leaves, its data moves to or from many peers instead of just one neighbour. <a href="consistent-hashing.html">→ Consistent hashing</a></dd>
+</dl>
+
+<!-- ================= W ================= -->
+<h2 id="letter-w">W</h2>
+<dl>
+<dt id="term-waf"><strong>WAF (Web Application Firewall)</strong></dt>
+<dd>A filter at the edge that blocks malicious HTTP traffic (injection attacks, bad bots, known exploits) before it reaches your servers. <a href="security.html">→ Security</a></dd>
+
+<dt id="term-wal"><strong>WAL (Write-Ahead Log)</strong></dt>
+<dd>An append-only log where a database records every change <em>before</em> applying it, enabling crash recovery and streaming replication. PostgreSQL replicas follow the primary's WAL. <a href="replication.html">→ Replication</a></dd>
+
+<dt id="term-websocket"><strong>WebSocket</strong></dt>
+<dd>A protocol that upgrades an HTTP connection into a persistent, two-way channel, so the server can push messages instantly. Instagram-style DMs use it. <a href="direct-messaging.html">→ Direct messaging</a></dd>
+
+<dt id="term-wide-column"><strong>Wide-column store</strong></dt>
+<dd>A NoSQL model where rows are grouped into partitions and each partition holds many sorted columns or rows, e.g. Cassandra, HBase, Bigtable. It's great for time-ordered, per-entity data like a user's posts or a conversation's messages. <a href="databases.html">→ Databases</a></dd>
+
+<dt id="term-write-amplification"><strong>Write amplification</strong></dt>
+<dd>One logical write causing many physical writes, e.g. one post fanned out to 10,000 timelines, or one row rewritten repeatedly during LSM compaction. <a href="news-feed.html">→ News feed</a></dd>
+
+<dt id="term-write-around"><strong>Write-around</strong></dt>
+<dd>Writes go straight to the database and skip the cache, which is filled only on later reads. This avoids polluting the cache with data that's never read. <a href="caching.html">→ Caching</a></dd>
+
+<dt id="term-write-back"><strong>Write-back (write-behind)</strong></dt>
+<dd>Writes go to the cache first and are flushed to the database asynchronously later. It's fast, but data can be lost if the cache dies. Like counters batched in Redis use this pattern. <a href="caching.html">→ Caching</a></dd>
+
+<dt id="term-write-through"><strong>Write-through</strong></dt>
+<dd>Every write updates the cache and the database together, so the cache is always fresh, at the cost of slower writes. Fan-out workers writing timelines into Redis behave like write-through for the feed. <a href="caching.html">→ Caching</a></dd>
+</dl>
+
+<!-- ================= X ================= -->
+<h2 id="letter-x">X</h2>
+<dl>
+<dt id="term-xss"><strong>XSS (Cross-Site Scripting)</strong></dt>
+<dd>An attack that injects malicious script into pages viewed by other users, e.g. via an unescaped comment or bio. It's prevented by output encoding and Content Security Policy. <a href="security.html">→ Security</a></dd>
+</dl>
+
+<!-- ================= Z ================= -->
+<h2 id="letter-z">Z</h2>
+<dl>
+<dt id="term-zero-downtime-deploy"><strong>Zero-downtime deployment</strong></dt>
+<dd>Releasing new code without interrupting users, using rolling, blue-green or canary deployments behind load balancers, plus backward-compatible schema and API changes. <a href="microservices.html">→ Microservices</a></dd>
+
+<dt id="term-zookeeper"><strong>ZooKeeper</strong></dt>
+<dd>A coordination service offering consistent configuration storage, distributed locks, service registration and leader election. It's historically used by Kafka, HBase and many others; newer systems use etcd or built-in Raft. <a href="replication.html">→ Replication</a></dd>
+</dl>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Most system design vocabulary falls into a few families: <strong>scaling</strong> (sharding, replication, caching), <strong>consistency</strong> (CAP, quorum, eventual), <strong>async</strong> (Kafka, fan-out, outbox), <strong>reliability</strong> (timeouts, retries, circuit breakers) and <strong>edge</strong> (DNS, CDN, load balancing).</li>
+    <li>For any term, practise saying <em>what</em> it is, <em>why</em> it exists, and <em>where</em> it appears in Instagram's architecture.</li>
+    <li>When a term is fuzzy, follow its → lesson link. Each lesson explains the idea from scratch with diagrams and worked examples.</li>
+  </ul>
+</div>
+
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="how-to-approach.html">How to approach a system design problem</a>: where to start if you're new</li>
+  <li><a href="request-flows.html">End-to-end request flows</a>: see most of these terms working together</li>
+  <li><a href="interview-guide.html">Full interview walkthrough</a>: use the vocabulary under time pressure</li>
+  <li><a href="core-principles.html">Core principles</a> and <a href="cap-consistency.html">CAP &amp; consistency</a>: the foundational terms in depth</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

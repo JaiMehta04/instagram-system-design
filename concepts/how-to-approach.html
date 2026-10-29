@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How to Approach a System Design Problem — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="how-to-approach">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>A system design interview is an open-ended, <strong>45-minute collaborative design session</strong>. There is no single right answer; you are judged on <em>how you think</em>, not on reproducing a famous architecture.</li>
+    <li>Use a repeatable <strong>6-step framework</strong>: ① clarify requirements → ② estimate scale → ③ define the API → ④ data model + high-level design → ⑤ deep dives → ⑥ bottlenecks, trade-offs &amp; wrap-up.</li>
+    <li>Spend time where the signal is: roughly <strong>10 minutes on scoping (steps 1–3), 10–12 on the high-level design, 15 on deep dives, 5 on wrap-up</strong>.</li>
+    <li>Interviewers score <strong>problem navigation, solution design, technical depth, trade-off reasoning and communication</strong>. Thinking aloud, stating assumptions and driving the conversation matter as much as the boxes you draw.</li>
+    <li>Every box in this guide's Instagram diagram can be "derived" by walking through the framework — this lesson shows which step produces which box and which lesson teaches it.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why do you need a framework?</h2>
+<p>Imagine the interviewer says just one sentence: <em>"Design Instagram."</em> That is it. No spec, no numbers, no list of features. Instagram is a product with photo and video posts, Reels, Stories, a ranked feed, Explore, search, direct messages, notifications, shopping, live video and ads — built by thousands of engineers over more than a decade. You have 45 minutes.</p>
+<p>Candidates without a method tend to fail in a few predictable ways:</p>
+<ul>
+  <li><strong>They start drawing immediately.</strong> Ten minutes later they have a detailed design for a feature the interviewer did not care about, and no time left for the part that mattered (usually the feed).</li>
+  <li><strong>They freeze.</strong> The problem is so big that they do not know where to begin, and silence fills the room.</li>
+  <li><strong>They recite buzzwords.</strong> "We'll use Kafka, Cassandra, Redis and Kubernetes" — without explaining <em>why</em> each is needed or what it costs.</li>
+  <li><strong>They never go deep.</strong> They draw twenty boxes and can't explain how any one of them actually works under load.</li>
+</ul>
+<p>A framework fixes all four. It gives you an <strong>opening move</strong> (ask questions), a <strong>sequence</strong> that builds each decision on the previous one (requirements drive numbers, numbers drive architecture), and <strong>checkpoints</strong> where you can glance at the clock and adjust. It also signals seniority: experienced engineers <em>do</em> work this way in real design reviews.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  An architect asked to "design a house" does not start by choosing tiles. First they ask: <em>How many people will live here? What's the budget? Which city — earthquakes, snow?</em> (requirements). Then they size it: <em>4 bedrooms, ~200 m², a 10 kW electrical supply</em> (estimation). Then they agree the interfaces with the client: <em>where are the doors, which rooms connect</em> (API). Then a floor plan (high-level design), then detailed drawings of the tricky parts — the staircase, the cantilevered balcony (deep dives) — and finally a review of risks and costs: <em>"if the budget is cut, we drop the basement"</em> (trade-offs). The system design framework is exactly the same discipline applied to software.
+</div>
+
+<h2>2. The 6-step framework at a glance</h2>
+<p>Here is the whole method on one page. Each step produces an <strong>artifact</strong> that you leave visible on the whiteboard so that you and the interviewer can refer back to it.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 210" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-hta-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g text-anchor="middle">
+    <rect x="10" y="20" width="120" height="76" rx="8" fill="#e1f5fe" stroke="#0277bd"/>
+    <text x="70" y="42" font-weight="700">Step 1</text><text x="70" y="62">Clarify</text><text x="70" y="80">requirements</text>
+    <rect x="145" y="20" width="120" height="76" rx="8" fill="#fff3e0" stroke="#ef6c00"/>
+    <text x="205" y="42" font-weight="700">Step 2</text><text x="205" y="62">Estimate</text><text x="205" y="80">scale</text>
+    <rect x="280" y="20" width="120" height="76" rx="8" fill="#e8f5e9" stroke="#2e7d32"/>
+    <text x="340" y="42" font-weight="700">Step 3</text><text x="340" y="62">Define</text><text x="340" y="80">the API</text>
+    <rect x="415" y="20" width="120" height="76" rx="8" fill="#fff8e1" stroke="#f9a825"/>
+    <text x="475" y="42" font-weight="700">Step 4</text><text x="475" y="62">Data model +</text><text x="475" y="80">high-level</text>
+    <rect x="550" y="20" width="120" height="76" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/>
+    <text x="610" y="42" font-weight="700">Step 5</text><text x="610" y="62">Deep</text><text x="610" y="80">dives</text>
+    <rect x="685" y="20" width="120" height="76" rx="8" fill="#eceff1" stroke="#455a64"/>
+    <text x="745" y="42" font-weight="700">Step 6</text><text x="745" y="62">Bottlenecks</text><text x="745" y="80">&amp; wrap-up</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" marker-end="url(#ar-hta-1)" fill="none">
+    <path d="M130,58 L143,58"/><path d="M265,58 L278,58"/><path d="M400,58 L413,58"/><path d="M535,58 L548,58"/><path d="M670,58 L683,58"/>
+  </g>
+  <text x="10" y="128" font-size="12" fill="#555">45-minute timeline (minutes)</text>
+  <g font-size="12" text-anchor="middle">
+    <rect x="10" y="136" width="88" height="26" fill="#e1f5fe" stroke="#0277bd"/><text x="54" y="153">~5</text>
+    <rect x="98" y="136" width="70" height="26" fill="#fff3e0" stroke="#ef6c00"/><text x="133" y="153">~4</text>
+    <rect x="168" y="136" width="71" height="26" fill="#e8f5e9" stroke="#2e7d32"/><text x="203" y="153">~4</text>
+    <rect x="239" y="136" width="211" height="26" fill="#fff8e1" stroke="#f9a825"/><text x="344" y="153">~12</text>
+    <rect x="450" y="136" width="264" height="26" fill="#f3e5f5" stroke="#6a1b9a"/><text x="582" y="153">~15</text>
+    <rect x="714" y="136" width="88" height="26" fill="#eceff1" stroke="#455a64"/><text x="758" y="153">~5</text>
+  </g>
+  <g font-size="11" fill="#555" text-anchor="middle">
+    <text x="10" y="178">0</text><text x="98" y="178">5</text><text x="168" y="178">9</text><text x="239" y="178">13</text><text x="450" y="178">25</text><text x="714" y="178">40</text><text x="796" y="178">45</text>
+  </g>
+  <text x="410" y="200" font-size="12" fill="#555" text-anchor="middle">Scoping (steps 1–3) ≈ 13 min · Breadth (step 4) ≈ 12 min · Depth + wrap-up ≈ 20 min</text>
+</svg>
+<div class="caption">The six steps and a typical 45-minute budget. The bar widths are proportional to time: most of the interview is design and deep dives, not scoping.</div>
+</div>
+
+<div class="table-wrap"><table>
+  <tr><th>Step</th><th>Question it answers</th><th>Artifact you leave on the board</th><th>Lesson(s) in this guide</th></tr>
+  <tr><td><b>1. Clarify requirements</b></td><td>What exactly are we building, for whom, and how good must it be?</td><td>A short list of in-scope features + non-functional targets</td><td><a href="requirements.html">Requirements</a></td></tr>
+  <tr><td><b>2. Estimate scale</b></td><td>How big is it? Reads vs writes? Bytes per day?</td><td>QPS, storage, bandwidth, cache size — 5–8 numbers</td><td><a href="capacity-estimation.html">Back-of-the-Envelope Estimation</a></td></tr>
+  <tr><td><b>3. Define the API</b></td><td>How do clients talk to the system?</td><td>5–8 endpoint signatures</td><td><a href="api-design.html">API Design</a></td></tr>
+  <tr><td><b>4. Data model + high-level design</b></td><td>What are the entities, where are they stored, which components exist?</td><td>Tables/keys + a box-and-arrow diagram</td><td><a href="databases.html">Databases</a>, <a href="microservices.html">Microservices</a></td></tr>
+  <tr><td><b>5. Deep dives</b></td><td>How do the hardest parts actually work at scale?</td><td>Zoomed-in diagrams, algorithms, sequence flows</td><td><a href="news-feed.html">News Feed</a>, <a href="media-upload.html">Media Upload</a>, …</td></tr>
+  <tr><td><b>6. Bottlenecks &amp; wrap-up</b></td><td>What breaks first? What did we trade away? What next?</td><td>A list of risks, mitigations and future work</td><td><a href="core-principles.html">Core Principles</a>, <a href="cap-consistency.html">CAP</a></td></tr>
+</table></div>
+
+<p>The order matters because <strong>each step feeds the next</strong>. Requirements tell you what to estimate ("do we need to store video?"). Estimates tell you which architecture is necessary ("100K reads/s means we need caching and replicas; 1 PB/day of media means object storage plus a CDN"). The API tells you which services and data you need. The high-level design tells you where the risky parts are — and those become your deep dives.</p>
+
+<h2>3. Step 1 — Clarify requirements (≈ 5 minutes)</h2>
+<p>The prompt is deliberately vague. The interviewer wants to see whether you can turn ambiguity into a crisp problem statement — exactly what a senior engineer does when a product manager says "we want Stories". You need two lists:</p>
+<ul>
+  <li><strong>Functional requirements</strong> — what the system <em>does</em> (users can upload a photo; users see a feed of people they follow).</li>
+  <li><strong>Non-functional requirements</strong> — how <em>well</em> it does it: scale, latency, availability, consistency, durability, security, cost.</li>
+</ul>
+
+<h3>3.1 Narrow the scope out loud</h3>
+<p>You cannot design all of Instagram in 45 minutes, so propose a scope and let the interviewer correct you. A good opening sounds like this:</p>
+<pre class="ascii">
+You:  "Instagram is huge, so let me propose a scope and you tell me if you'd
+       like to change it. Core: users upload photos and videos with a caption;
+       users follow other users; users see a home feed of posts from people they
+       follow; users can like and comment. I'll treat Stories, DMs, search and
+       Explore as extended features — I'll show where they plug in but won't
+       design them in depth unless you want me to. Ads, shopping and live video
+       are out of scope. Does that sound right?"
+Interviewer: "Sounds good. Focus on the feed and uploads."
+You:  "Great. A few questions about scale and quality..."
+</pre>
+<p>Notice what happened: you <strong>proposed</strong> instead of asking an open question ("what features do you want?"), which shows product sense and keeps control of the clock. The interviewer then told you where the signal is: <em>feed and uploads</em>. That one sentence decides your deep dives.</p>
+
+<h3>3.2 The questions worth asking</h3>
+<div class="table-wrap"><table>
+  <tr><th>Category</th><th>Question</th><th>Why it changes the design</th></tr>
+  <tr><td>Users &amp; scale</td><td>How many daily active users? Global or one country?</td><td>1M DAU fits on a single database; 500M DAU needs <a href="sharding.html">sharding</a>, <a href="caching.html">caching</a> and <a href="multi-region.html">multiple regions</a>.</td></tr>
+  <tr><td>Content</td><td>Photos only, or video too? Max file size?</td><td>Video adds transcoding, adaptive streaming and ~10× more storage and bandwidth.</td></tr>
+  <tr><td>Feed</td><td>Chronological or ranked? How fresh must it be?</td><td>Ranking needs an ML pipeline; freshness decides push vs pull fan-out.</td></tr>
+  <tr><td>Graph</td><td>Is following one-way? Are there celebrities with 100M+ followers?</td><td>Celebrities break naive fan-out-on-write (the "hot key" problem).</td></tr>
+  <tr><td>Latency</td><td>What feed load time is acceptable?</td><td>A p99 of 200 ms forces pre-computed timelines in memory.</td></tr>
+  <tr><td>Consistency</td><td>Is it OK if a like count is briefly stale?</td><td>"Yes" lets you use eventually consistent counters — see <a href="cap-consistency.html">CAP &amp; consistency</a>.</td></tr>
+  <tr><td>Privacy</td><td>Private accounts? Blocking? Data deletion laws?</td><td>Every read path needs an authorization check; deletion must propagate to caches, CDN and backups.</td></tr>
+</table></div>
+<p>The detailed list of clarifying questions — with example answers — lives in the <a href="requirements.html">Requirements</a> lesson.</p>
+
+<h3>3.3 Write the requirements down</h3>
+<p>Keep a corner of the board for this and never erase it. It becomes your contract: in step 6 you will walk back through it and show that every requirement is satisfied.</p>
+<pre><code>FUNCTIONAL (core)              NON-FUNCTIONAL
+- upload photo/video + caption - 500M DAU, global
+- follow / unfollow            - feed p99 &lt; 300 ms (server), media via CDN
+- home feed (ranked)           - 99.99% availability for feed &amp; upload
+- like / comment               - never lose an acknowledged upload
+EXTENDED: stories, DMs, search - feed/likes: eventual consistency OK
+OUT: ads, shopping, live       - read-heavy (~100:1 views : uploads)</code></pre>
+
+<h2>4. Step 2 — Estimate the scale (≈ 3–5 minutes)</h2>
+<p>Back-of-the-envelope estimation converts the requirements into a handful of numbers that <strong>justify architectural decisions</strong>. The goal is the right <em>order of magnitude</em>, not precision. Round aggressively: 1 day ≈ 86,400 s ≈ 10<sup>5</sup> s.</p>
+<pre><code>Assume 500M DAU.
+Uploads:  100M posts/day  → 100M / 10^5 s ≈ 1,000 writes/s (peak ~3,000/s)
+Feed:     each user loads ~20 feed pages/day → 10B/day → ~100K reads/s (peak ~300K/s)
+Storage:  100M posts × ~1.5 MB (photo + renditions) ≈ 150 TB/day photos alone
+          video makes it several hundred TB/day → object storage, not a database
+Egress:   500M users × ~100 images × 200 KB ≈ 10 PB/day of images → CDN is mandatory</code></pre>
+<p>What each number tells you:</p>
+<ul>
+  <li><strong>~100K–300K feed reads/s vs ~1K uploads/s</strong> → the system is read-heavy; optimise reads: pre-computed timelines, caches, read replicas.</li>
+  <li><strong>Hundreds of TB/day of media</strong> → blobs go to <a href="object-storage.html">object storage</a>, only metadata goes to databases.</li>
+  <li><strong>PB/day egress</strong> → a <a href="cdn.html">CDN</a> must serve media; the origin could never handle it.</li>
+</ul>
+<div class="callout tip"><span class="callout-title">💡 Keep it short</span>
+Some interviewers skip estimation entirely ("assume it's big"). Offer it — "shall I do some quick math on scale?" — and keep it under five minutes. Only compute numbers you will <em>use</em> later. The full technique, and a complete worked Instagram example, is in <a href="capacity-estimation.html">Back-of-the-Envelope Estimation</a>.</div>
+
+<h2>5. Step 3 — Define the API (≈ 3–5 minutes)</h2>
+<p>The API is the contract between clients and your system. Writing it down forces you to be concrete about what data flows where, and it reveals the services you will need. Keep it to the core use cases; you do not need every field.</p>
+<pre><code># Upload: two-phase, so media bytes never pass through our app servers
+POST /v1/media/upload-url        → { media_id, upload_url (pre-signed, expires in 15 min) }
+PUT  {upload_url}                  (client uploads bytes directly to object storage)
+POST /v1/posts  { media_ids[], caption, location? }   → { post_id, status: "processing" }
+
+# Feed: cursor-based pagination
+GET  /v1/feed?cursor=&lt;opaque&gt;&amp;limit=20  → { posts: [ {post_id, author, media_urls[], caption,
+                                                       like_count, liked_by_me, ...} ], next_cursor }
+
+# Social graph
+POST   /v1/users/{user_id}/follow
+DELETE /v1/users/{user_id}/follow
+
+# Engagement
+POST   /v1/posts/{post_id}/likes          (idempotent: liking twice = one like)
+POST   /v1/posts/{post_id}/comments  { text }
+GET    /v1/posts/{post_id}/comments?cursor=
+
+# Profile
+GET  /v1/users/{user_id}/posts?cursor=</code></pre>
+<p>Points worth saying out loud while you write:</p>
+<ul>
+  <li><strong>Authentication</strong> comes from a token in the header, validated at the <a href="api-gateway.html">API Gateway</a> — the user id is never trusted from the request body. See <a href="authentication.html">Authentication</a>.</li>
+  <li><strong>Cursor pagination</strong>, not <code>offset</code>: new posts arrive constantly, so offsets would skip or duplicate items, and deep offsets are slow.</li>
+  <li><strong>Idempotency</strong>: mobile networks retry. A like or a post creation must be safe to repeat (idempotency keys, or "like" as a set-membership operation).</li>
+  <li><strong>Pre-signed upload URLs</strong> keep gigabytes of video off the app servers — detailed in <a href="media-upload.html">Media Upload</a>.</li>
+  <li><strong>Protocol choice</strong>: REST/JSON for public endpoints, gRPC between internal services, WebSockets for DMs — see <a href="api-design.html">API Design</a>.</li>
+</ul>
+
+<h2>6. Step 4 — Data model + high-level design (≈ 10–12 minutes)</h2>
+<h3>6.1 Data model first</h3>
+<p>List the core entities, their key fields and — most importantly — the <strong>access patterns</strong> (how they are read). The access pattern decides the database and the partition key, not the other way round.</p>
+<div class="table-wrap"><table>
+  <tr><th>Entity</th><th>Key fields</th><th>Main access pattern</th><th>Store (why)</th></tr>
+  <tr><td>User</td><td>user_id, username (unique), name, bio, is_private</td><td>Lookup by id / by username; uniqueness on signup</td><td>PostgreSQL, sharded + replicas (strong uniqueness, relational)</td></tr>
+  <tr><td>Post</td><td>post_id, user_id, caption, media keys, created_at</td><td>"Latest posts of user X", "post by id"</td><td>Cassandra partitioned by user_id, clustered by post_id desc</td></tr>
+  <tr><td>Media</td><td>bytes of each rendition</td><td>Fetch by URL</td><td>Object storage (S3) + CDN</td></tr>
+  <tr><td>Follow</td><td>follower_id, followee_id, created_at</td><td>"Who does X follow?", "Who follows X?"</td><td>Graph store; edges stored in both directions</td></tr>
+  <tr><td>Like / Comment</td><td>post_id, user_id, (text), created_at</td><td>Count per post; "did I like it?"; latest comments</td><td>Cassandra + counters in Redis</td></tr>
+  <tr><td>Timeline</td><td>user_id → list of post_ids</td><td>Read the top N quickly</td><td>Redis (pre-computed feed cache)</td></tr>
+</table></div>
+<p>Mention <strong>ID generation</strong> here: post ids should be globally unique and roughly time-sortable so "latest first" is a simple sort — Instagram's publicly described 64-bit ids (timestamp + shard id + sequence) are the classic example; see <a href="id-generation.html">Unique ID Generation</a>.</p>
+
+<h3>6.2 Draw the high-level design</h3>
+<p>Now draw boxes and arrows that satisfy every functional requirement <strong>end-to-end</strong>, at a single level of detail. Start simple and grow it, narrating as you go:</p>
+<ol class="steps">
+  <li><strong>Client → load balancer → API gateway → services.</strong> One sentence each: the <a href="load-balancer.html">load balancer</a> spreads traffic; the gateway does TLS, auth and rate limiting.</li>
+  <li><strong>Split services by responsibility</strong>: Upload, Feed, Follow/Graph, Like &amp; Comment, User. Make them <a href="microservices.html">stateless</a> so they scale horizontally.</li>
+  <li><strong>Attach a data store to each</strong>, using the table above.</li>
+  <li><strong>Walk through the write path</strong>: upload bytes to object storage → create post → publish "post created" event to <a href="message-queues.html">Kafka</a> → workers resize/transcode, fan the post out to followers' timelines, index for search, send notifications.</li>
+  <li><strong>Walk through the read path</strong>: feed service reads the timeline from Redis → hydrates post metadata (cache, then Cassandra) → returns JSON with CDN URLs → client fetches media from the <a href="cdn.html">CDN</a>.</li>
+</ol>
+<div class="flow">
+  <div class="fnode client">📱 App<small>upload</small></div><div class="farrow">→<small>pre-signed PUT</small></div>
+  <div class="fnode store">S3<small>original</small></div><div class="farrow">→<small>create post</small></div>
+  <div class="fnode svc">Upload svc<small>metadata</small></div><div class="farrow">→<small>event</small></div>
+  <div class="fnode async">Kafka<small>post.created</small></div><div class="farrow">→<small>consume</small></div>
+  <div class="fnode async">Fan-out / media workers</div><div class="farrow">→<small>write</small></div>
+  <div class="fnode store">Redis timelines<small>+ renditions in S3</small></div>
+</div>
+<div class="callout warn"><span class="callout-title">⚠️ Breadth before depth</span>
+Do not go deep on any single box in this step. A complete but shallow design at minute 25 is far better than a perfect upload pipeline and no feed. If the interviewer pulls you into detail early, answer briefly and say "let me finish the end-to-end picture first and come back to this in the deep dive."</div>
+
+<h2>7. Step 5 — Deep dives (≈ 15 minutes)</h2>
+<p>This is where most of the <strong>technical-depth signal</strong> comes from. Pick 2–3 components that are (a) hardest, (b) most specific to this problem, and (c) of interest to the interviewer. For Instagram the usual candidates are:</p>
+<div class="cards">
+  <div class="card"><h4>📰 Feed generation</h4><p>Fan-out on write vs read, the celebrity problem, hybrid push/pull, ranking, cache sizing. → <a href="news-feed.html">News Feed</a></p></div>
+  <div class="card"><h4>📤 Media upload &amp; processing</h4><p>Pre-signed URLs, resumable uploads, transcoding pipeline, renditions, moderation. → <a href="media-upload.html">Upload</a>, <a href="media-processing.html">Processing</a></p></div>
+  <div class="card"><h4>🗄️ Sharding the data</h4><p>Partition keys, hot shards, resharding, cross-shard queries. → <a href="sharding.html">Sharding</a></p></div>
+  <div class="card"><h4>❤️ Likes &amp; counters</h4><p>Hot posts with millions of likes per hour, sharded counters, approximate counts. → <a href="likes-comments.html">Likes &amp; Comments</a></p></div>
+  <div class="card"><h4>💬 Real-time DMs</h4><p>WebSockets, presence, ordering, delivery receipts. → <a href="direct-messaging.html">Direct Messaging</a></p></div>
+  <div class="card"><h4>⚡ Caching</h4><p>What to cache, eviction, invalidation, thundering herd. → <a href="caching.html">Caching</a></p></div>
+</div>
+
+<div class="diagram">
+<svg viewBox="0 0 820 250" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <rect x="20" y="20" width="780" height="46" rx="8" fill="#e8f5e9" stroke="#2e7d32"/>
+  <text x="410" y="40" text-anchor="middle" font-weight="700">BREADTH — step 4: end-to-end design that covers every core requirement</text>
+  <text x="410" y="58" text-anchor="middle" font-size="12">clients · edge · gateway · services · data stores · async pipeline · CDN</text>
+  <rect x="90" y="66" width="150" height="160" fill="#f3e5f5" stroke="#6a1b9a"/>
+  <text x="165" y="96" text-anchor="middle" font-weight="700">DEPTH 1</text>
+  <text x="165" y="118" text-anchor="middle">Feed fan-out</text>
+  <text x="165" y="140" text-anchor="middle" font-size="12">push vs pull</text>
+  <text x="165" y="158" text-anchor="middle" font-size="12">celebrities</text>
+  <text x="165" y="176" text-anchor="middle" font-size="12">Redis sizing</text>
+  <text x="165" y="194" text-anchor="middle" font-size="12">ranking</text>
+  <rect x="335" y="66" width="150" height="130" fill="#f3e5f5" stroke="#6a1b9a"/>
+  <text x="410" y="96" text-anchor="middle" font-weight="700">DEPTH 2</text>
+  <text x="410" y="118" text-anchor="middle">Media pipeline</text>
+  <text x="410" y="140" text-anchor="middle" font-size="12">pre-signed URLs</text>
+  <text x="410" y="158" text-anchor="middle" font-size="12">transcoding</text>
+  <text x="410" y="176" text-anchor="middle" font-size="12">CDN delivery</text>
+  <rect x="580" y="66" width="150" height="100" fill="#f3e5f5" stroke="#6a1b9a" stroke-dasharray="5 3"/>
+  <text x="655" y="96" text-anchor="middle" font-weight="700">DEPTH 3</text>
+  <text x="655" y="118" text-anchor="middle">Sharding</text>
+  <text x="655" y="140" text-anchor="middle" font-size="12">if time allows</text>
+  <text x="410" y="245" text-anchor="middle" font-size="12" fill="#555">A "T-shaped" interview: one wide, shallow pass, then 2–3 deep vertical drills chosen with the interviewer.</text>
+</svg>
+<div class="caption">Breadth first (the horizontal bar), then depth on the parts that matter most (the vertical bars).</div>
+</div>
+
+<h3>7.1 How to run a deep dive</h3>
+<ol class="steps">
+  <li><strong>Ask or propose:</strong> "I think the feed is the most interesting part — shall I go deep there, or would you prefer the upload pipeline?"</li>
+  <li><strong>State the sub-problem precisely:</strong> "We need each user's feed in &lt;300 ms p99, at ~300K feed reads/s, where some authors have 500M followers."</li>
+  <li><strong>Present 2+ options</strong> with a comparison (fan-out on write vs on read).</li>
+  <li><strong>Choose one, with numbers</strong> ("push for 99.9% of authors; pull for the ~0.1% with more than ~1M followers — otherwise one celebrity post triggers hundreds of millions of writes").</li>
+  <li><strong>Walk through failure cases:</strong> what if a fan-out worker crashes mid-way? (Kafka offsets → retry; idempotent writes to timelines.)</li>
+  <li><strong>Close the loop</strong> by updating the main diagram.</li>
+</ol>
+
+<h2>8. Step 6 — Bottlenecks, trade-offs &amp; wrap-up (≈ 5 minutes)</h2>
+<p>Finish strong. Walk the diagram looking for things that will break, then summarise.</p>
+<ul>
+  <li><strong>Single points of failure:</strong> is anything not replicated? Load balancers in pairs, databases with replicas and automated failover, services across availability zones. See <a href="core-principles.html">Core Principles</a>.</li>
+  <li><strong>Hot spots:</strong> a viral post's like counter, a celebrity's shard, a popular hashtag in search. Mitigate with sharded counters, caching and request coalescing.</li>
+  <li><strong>Failure handling:</strong> timeouts, retries with backoff, circuit breakers, graceful degradation ("if ranking is down, serve a chronological feed") — see <a href="resilience-patterns.html">Resilience Patterns</a>.</li>
+  <li><strong>Consistency trade-offs you made:</strong> "feeds and like counts are eventually consistent; usernames are strongly consistent" — see <a href="cap-consistency.html">CAP &amp; Consistency</a>.</li>
+  <li><strong>Operations:</strong> metrics, logs, traces, alerts on SLOs — <a href="observability.html">Observability</a>; disaster recovery and regions — <a href="multi-region.html">Multi-Region</a>.</li>
+  <li><strong>Future work:</strong> "With more time I'd design Explore ranking and multi-region active-active writes."</li>
+</ul>
+<p>A crisp 60-second summary sounds like: <em>"To recap: uploads go directly to S3 via pre-signed URLs; metadata in Cassandra sharded by user; an event on Kafka triggers media processing and a hybrid fan-out into Redis timelines; reads hit Redis and the CDN, so the read path never touches the primary databases in the common case. The main risks are celebrity fan-out and hot counters, which we handle with pull-on-read and sharded counters. We chose eventual consistency for feeds and counts to get 99.99% availability and low latency."</em></p>
+
+<h2>9. The 45-minute time budget</h2>
+<p>Most loops give you 45 minutes of design time (sometimes 60 with introductions). A typical plan, and what to do when you fall behind:</p>
+<div class="table-wrap"><table>
+  <tr><th>Minutes</th><th>Phase</th><th>Goal</th><th>If you are running late…</th></tr>
+  <tr><td>0–2</td><td>Introductions / restate the problem</td><td>Confirm what is being asked</td><td>Skip small talk; restate in one sentence</td></tr>
+  <tr><td>2–7</td><td>1. Requirements</td><td>Scope + 5–6 non-functional targets</td><td>Propose a scope and ask "OK?" rather than asking open questions</td></tr>
+  <tr><td>7–11</td><td>2. Estimation</td><td>QPS, storage, bandwidth, read:write ratio</td><td>Give 3 numbers verbally; skip the rest</td></tr>
+  <tr><td>11–15</td><td>3. API</td><td>Core endpoints</td><td>Write only the feed + upload endpoints</td></tr>
+  <tr><td>15–27</td><td>4. Data model + high-level design</td><td>Complete end-to-end diagram</td><td>Draw it, describe read and write paths in two sentences each</td></tr>
+  <tr><td>27–40</td><td>5. Deep dives</td><td>2–3 components in depth</td><td>Do one deep dive well instead of three badly</td></tr>
+  <tr><td>40–45</td><td>6. Bottlenecks &amp; wrap-up</td><td>Risks, trade-offs, summary; questions</td><td>Never skip the 60-second summary</td></tr>
+</table></div>
+<div class="callout tip"><span class="callout-title">💡 Use checkpoints</span>
+Glance at the clock at the end of each step. A good habit is saying "we're about 15 minutes in, so let me move to the high-level design." It shows the interviewer you are managing the session — a senior-level behaviour in itself. If the interviewer explicitly steers you ("skip the estimates, let's talk about the feed"), <strong>follow them immediately</strong>; the budget is a default, not a rule.</div>
+
+<h2>10. What interviewers evaluate</h2>
+<p>Companies use slightly different words, but nearly all rubrics boil down to five or six dimensions. Knowing them tells you what to make <em>visible</em>.</p>
+<div class="table-wrap"><table>
+  <tr><th>Dimension</th><th>What a strong signal looks like</th><th>What a weak signal looks like</th></tr>
+  <tr><td><b>Problem navigation / scoping</b></td><td>Asks targeted questions, proposes a scope, prioritises core features, identifies the hard parts early</td><td>Starts drawing immediately; tries to design everything; never confirms assumptions</td></tr>
+  <tr><td><b>Solution design (breadth)</b></td><td>A complete, coherent, working end-to-end design; components have clear responsibilities</td><td>Disconnected boxes; requirements left unaddressed; data flow unclear</td></tr>
+  <tr><td><b>Technical depth</b></td><td>Explains <em>how</em> components work (partition keys, cache eviction, fan-out mechanics), with numbers</td><td>Buzzwords ("use Kafka") without mechanics; hand-waving at the first follow-up</td></tr>
+  <tr><td><b>Trade-off reasoning</b></td><td>Compares alternatives, picks one with justification, names what was sacrificed</td><td>Presents one option as obviously correct; cannot say what it costs</td></tr>
+  <tr><td><b>Scalability &amp; operations</b></td><td>Finds bottlenecks and SPOFs; thinks about failures, monitoring, deployment</td><td>Assumes nothing fails; no awareness of hot spots</td></tr>
+  <tr><td><b>Communication &amp; collaboration</b></td><td>Thinks aloud, structured, checks in, adapts to hints, handles pushback calmly</td><td>Long silences; monologue; ignores hints; defensive</td></tr>
+</table></div>
+<h3>10.1 How expectations change by level</h3>
+<div class="table-wrap"><table>
+  <tr><th>Level</th><th>Typical expectation</th></tr>
+  <tr><td>Junior / new grad</td><td>Often no system design round, or a simpler one. Reasonable high-level design with some guidance.</td></tr>
+  <tr><td>Mid-level</td><td>Complete high-level design on their own; one solid deep dive; knows standard building blocks.</td></tr>
+  <tr><td>Senior</td><td>Drives the whole session; multiple deep dives; proactively raises trade-offs, failure modes and operational concerns.</td></tr>
+  <tr><td>Staff+</td><td>All of the above, plus questioning the requirements themselves, cost and organisational implications, evolution over years, and nuanced alternatives.</td></tr>
+</table></div>
+
+<h2>11. Communication tips</h2>
+<p>A design interview is a <strong>conversation with a colleague</strong>, not an exam you sit silently. The interviewer can only grade what they can hear and see.</p>
+<h3>11.1 Think aloud</h3>
+<p>Narrate your reasoning, including the options you reject: <em>"I could store the feed in the database and query it on read, but at 300K reads/s with a join across hundreds of followees that would be far too slow, so I'll pre-compute timelines."</em> The rejected option and the reason are often worth more than the choice itself.</p>
+<h3>11.2 Drive the conversation</h3>
+<ul>
+  <li><strong>Announce the plan</strong> at the start: "I'll clarify requirements, do quick estimates, sketch the API, then the high-level design, and then go deep on the feed."</li>
+  <li><strong>Signpost transitions</strong>: "That covers the write path; now the read path."</li>
+  <li><strong>Offer choices</strong> instead of waiting: "I can go deep on fan-out or on media processing — which is more interesting to you?"</li>
+</ul>
+<h3>11.3 State assumptions explicitly</h3>
+<p>When you lack information, <strong>assume, say so, and move on</strong>: <em>"I'll assume a ranked feed with eventual consistency; if it must be strictly chronological the design changes in this way…"</em>. Unstated assumptions look like gaps; stated ones look like judgement.</p>
+<h3>11.4 Check in, but don't ask permission for everything</h3>
+<p>Every few minutes: "Does this make sense so far? Anything you'd like me to focus on?" — but do not ask "should I use a cache?". Decide, justify, and let them push back.</p>
+<h3>11.5 Treat hints and pushback as gifts</h3>
+<p>If the interviewer asks "what happens when Cristiano Ronaldo posts?", that is a hint that your fan-out design has a hole. Do not defend the old design — say "good point, that breaks push fan-out; let me fix it" and adapt. Changing your mind in response to new information is a <em>positive</em> signal.</p>
+<h3>11.6 Keep the board organised</h3>
+<p>Requirements and numbers in one corner, API in another, the main diagram in the centre. Label arrows (sync vs async, what data flows). A tidy board makes your thinking easy to follow — and easy to grade.</p>
+
+<h2>12. How to discuss trade-offs</h2>
+<p>"Everything is a trade-off" is a cliché; the skill is <strong>making the trade-off specific</strong>. Use this template:</p>
+<div class="flow">
+  <div class="fnode svc">Options<small>name 2–3</small></div><div class="farrow">→</div>
+  <div class="fnode svc">Criteria<small>from requirements</small></div><div class="farrow">→</div>
+  <div class="fnode svc">Decision<small>+ numbers</small></div><div class="farrow">→</div>
+  <div class="fnode edge">Cost<small>what we give up</small></div><div class="farrow">→</div>
+  <div class="fnode store">Mitigation / revisit<small>when it changes</small></div>
+</div>
+<p>Applied to Instagram's feed:</p>
+<blockquote><em>"<b>Options:</b> fan-out on write (push), fan-out on read (pull), or hybrid. <b>Criteria:</b> our requirement is p99 &lt; 300 ms at ~300K reads/s, and reads outnumber posts ~100:1. <b>Decision:</b> push, because each post is written once to ~200 average followers' timelines and then read many times cheaply. <b>Cost:</b> write amplification — ~100M posts/day × ~200 followers = ~20B timeline inserts/day — and wasted work for inactive followers; and celebrities with 100M+ followers would cause massive bursts. <b>Mitigation:</b> pull for accounts above a follower threshold and merge at read time; skip fan-out to users inactive for 30+ days. <b>Revisit</b> if the read:write ratio drops (e.g. a write-heavy product)."</em></blockquote>
+<p>The most common trade-off axes in system design:</p>
+<div class="table-wrap"><table>
+  <tr><th>Axis</th><th>Instagram example</th><th>Lesson</th></tr>
+  <tr><td>Consistency vs availability / latency</td><td>Eventually consistent like counts vs strongly consistent usernames</td><td><a href="cap-consistency.html">CAP &amp; Consistency</a></td></tr>
+  <tr><td>Read cost vs write cost</td><td>Push fan-out (cheap reads, costly writes) vs pull</td><td><a href="news-feed.html">News Feed</a></td></tr>
+  <tr><td>Latency vs cost</td><td>Keeping timelines in RAM vs on disk</td><td><a href="caching.html">Caching</a></td></tr>
+  <tr><td>Simplicity vs scalability</td><td>One PostgreSQL vs sharded clusters</td><td><a href="sharding.html">Sharding</a></td></tr>
+  <tr><td>Sync vs async</td><td>Transcode during upload request vs via a queue</td><td><a href="message-queues.html">Message Queues</a></td></tr>
+  <tr><td>Freshness vs efficiency</td><td>Short vs long cache TTLs; CDN invalidation</td><td><a href="cdn.html">CDN</a></td></tr>
+  <tr><td>Build vs buy</td><td>Own CDN vs commercial CDN</td><td><a href="cdn.html">CDN</a></td></tr>
+</table></div>
+
+<h2>13. A printable checklist / template</h2>
+<p>Print this (or memorise it) and run through it in every practice session until it becomes automatic.</p>
+<pre><code>SYSTEM DESIGN CHECKLIST                                         [ time ]
+──────────────────────────────────────────────────────────────────────────
+□ 0. Restate the problem in one sentence. Announce the plan.       0–2 min
+□ 1. REQUIREMENTS                                                  ~5 min
+     □ Users / actors?  Core use cases (3–5)?  What's out of scope?
+     □ Scale: DAU, geography, growth.  Read:write ratio.
+     □ Latency targets (p99) per key operation.
+     □ Availability target.  Durability needs.
+     □ Consistency per feature (strong where? eventual where?).
+     □ Security / privacy / compliance.  Cost constraints?
+     □ Write the list on the board. Confirm with interviewer.
+□ 2. ESTIMATES (only what you'll use)                              ~4 min
+     □ Read QPS and write QPS (avg and peak = 2–3× avg)
+     □ Storage per day / per year (media vs metadata)
+     □ Bandwidth in / out.  Cache size (hot set).
+     □ Say what each number implies for the design.
+□ 3. API                                                           ~4 min
+     □ Core endpoints, inputs, outputs.  Auth.  Pagination (cursor).
+     □ Idempotency for writes.  Sync vs async (202 Accepted).
+□ 4. DATA MODEL + HIGH-LEVEL DESIGN                               ~12 min
+     □ Entities, keys, access patterns → choice of store, partition key.
+     □ Clients → DNS/CDN → LB → gateway → stateless services → stores.
+     □ Async path: events → queue → workers.
+     □ Walk the WRITE path and the READ path end-to-end.
+     □ Every functional requirement covered?
+□ 5. DEEP DIVES (2–3, agreed with interviewer)                     ~15 min
+     □ State sub-problem + numbers.  ≥2 options compared.
+     □ Decide + justify.  Failure cases.  Update the diagram.
+□ 6. WRAP-UP                                                       ~5 min
+     □ SPOFs, hot spots, bottlenecks → mitigations.
+     □ Failure handling: timeouts, retries, degradation, DR.
+     □ Monitoring / SLOs.  Security.  Cost.
+     □ Trade-offs made.  Future work.  60-second summary.</code></pre>
+
+<h2>14. How to practise</h2>
+<ol class="steps">
+  <li><strong>Learn the building blocks first.</strong> You cannot reason about trade-offs between components you don't understand. Work through Parts 1–5 of this guide (load balancers, caches, databases, sharding, queues, CDNs…).</li>
+  <li><strong>Study one system deeply.</strong> This guide uses Instagram because it exercises almost every building block: media storage, feeds, graphs, counters, search, real-time messaging, notifications and ML. Once you can design Instagram end-to-end, systems like Twitter/X, TikTok, Facebook or Pinterest are variations.</li>
+  <li><strong>Practise out loud, on a timer.</strong> Set a 45-minute timer and talk to an empty room, a rubber duck or a recording app. Reading designs silently trains recognition; speaking trains production — and the interview tests production.</li>
+  <li><strong>Do mock interviews with a partner.</strong> Swap roles; being the interviewer teaches you what good answers look like. Ask for feedback against the rubric in section 10.</li>
+  <li><strong>Review and redo.</strong> After each session, write down the two weakest moments (a question you couldn't answer, a step that ran over) and study exactly those. Redo the same problem a week later.</li>
+  <li><strong>Vary the problem.</strong> Practise related prompts that reuse the same blocks: design Twitter's timeline, a chat app, a URL shortener, a notification system, YouTube, a rate limiter, a web crawler, a ride-sharing dispatcher.</li>
+  <li><strong>Drill estimation separately.</strong> Five-minute daily drills ("how much storage do 1B tweets need?") build fluency with powers of ten — see <a href="capacity-estimation.html">Estimation</a>.</li>
+  <li><strong>Read real engineering write-ups</strong> (company engineering blogs, famous papers like Dynamo, Bigtable, TAO, Memcache at Facebook, The Tail at Scale) once you have the basics — they give you true, specific examples to cite.</li>
+</ol>
+
+<h2>15. How to use this guide: a learning path</h2>
+<p>The guide is organised as one architecture — Instagram — explained box by box. You can click any box on the <a href="../index.html">interactive diagram</a> to jump to its lesson, but if you are starting from zero, follow this order:</p>
+<div class="table-wrap"><table>
+  <tr><th>Stage</th><th>Lessons (in order)</th><th>You will be able to…</th></tr>
+  <tr><td><b>1. Foundations</b></td><td><a href="how-to-approach.html">How to Approach</a> → <a href="requirements.html">Requirements</a> → <a href="capacity-estimation.html">Estimation</a> → <a href="core-principles.html">Core Principles</a> → <a href="cap-consistency.html">CAP &amp; Consistency</a></td><td>Scope a problem, size it, and speak the vocabulary of trade-offs</td></tr>
+  <tr><td><b>2. Edge &amp; networking</b></td><td><a href="networking-basics.html">Networking</a> → <a href="clients.html">Clients</a> → <a href="dns.html">DNS</a> → <a href="cdn.html">CDN</a> → <a href="load-balancer.html">Load Balancing</a> → <a href="api-gateway.html">API Gateway</a> → <a href="rate-limiting.html">Rate Limiting</a> → <a href="authentication.html">Auth</a></td><td>Explain how a request gets from a phone to a server, safely and fast</td></tr>
+  <tr><td><b>3. Data layer</b></td><td><a href="databases.html">Databases</a> → <a href="indexing.html">Indexing</a> → <a href="replication.html">Replication</a> → <a href="sharding.html">Sharding</a> → <a href="consistent-hashing.html">Consistent Hashing</a> → <a href="caching.html">Caching</a> → <a href="object-storage.html">Object Storage</a> → <a href="id-generation.html">ID Generation</a></td><td>Choose and scale storage for any access pattern</td></tr>
+  <tr><td><b>4. Async processing</b></td><td><a href="message-queues.html">Message Queues &amp; Kafka</a> → <a href="media-processing.html">Media Processing</a> → <a href="notifications.html">Notifications</a> → <a href="analytics-ml.html">Analytics &amp; ML</a></td><td>Decouple work with events and background workers</td></tr>
+  <tr><td><b>5. Services</b></td><td><a href="api-design.html">API Design</a> → <a href="microservices.html">Microservices</a> → <a href="media-upload.html">Upload</a> → <a href="social-graph.html">Social Graph</a> → <a href="news-feed.html">News Feed</a> → <a href="likes-comments.html">Likes</a> → <a href="stories.html">Stories</a> → <a href="search.html">Search</a> → <a href="direct-messaging.html">DMs</a></td><td>Design each Instagram feature in depth</td></tr>
+  <tr><td><b>6. Operations</b></td><td><a href="resilience-patterns.html">Resilience</a> → <a href="observability.html">Observability</a> → <a href="multi-region.html">Multi-Region</a> → <a href="security.html">Security</a></td><td>Keep it running, measurable and safe</td></tr>
+  <tr><td><b>7. Put it together</b></td><td><a href="request-flows.html">Request Flows</a> → <a href="interview-guide.html">Full Interview Walkthrough</a>; keep the <a href="glossary.html">Glossary</a> handy</td><td>Deliver the whole design in 45 minutes</td></tr>
+</table></div>
+<div class="callout tip"><span class="callout-title">💡 Study tips for each lesson</span>
+Read the TL;DR first, then the body. Try to answer every "Check your understanding" question <em>before</em> expanding it. Mark the lesson as learned only when you can explain its diagram to someone else from memory. If you have limited time (e.g. an interview next week), do Stage 1, then <a href="news-feed.html">News Feed</a>, <a href="caching.html">Caching</a>, <a href="sharding.html">Sharding</a>, <a href="message-queues.html">Message Queues</a>, <a href="cdn.html">CDN</a>, and finish with the <a href="interview-guide.html">Interview Walkthrough</a>.</div>
+
+<h2>16. How Instagram uses the framework: mapping the steps onto the diagram</h2>
+<p>The architecture on this guide's home page is not a random collection of popular technologies — every box is the <strong>output of one of the six steps</strong>. The numbered badges below show which step "creates" each part of the design.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 830 480" width="830" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-hta-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <path d="M90,40 C90,6 730,6 730,40" fill="none" stroke="#555" stroke-dasharray="5 3" marker-end="url(#ar-hta-2)"/>
+  <text x="410" y="30" text-anchor="middle" font-size="11" fill="#555">media bytes via CDN</text>
+  <g font-weight="600" text-anchor="middle">
+    <rect x="20" y="40" width="140" height="40" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="90" y="65">📱 Mobile / Web</text>
+    <rect x="190" y="40" width="80" height="40" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="230" y="65">DNS</text>
+    <rect x="300" y="40" width="130" height="40" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="365" y="65">Load Balancer</text>
+    <rect x="460" y="40" width="150" height="40" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="535" y="65">API Gateway</text>
+    <rect x="660" y="40" width="140" height="40" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="730" y="65">CDN (edge)</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" fill="none">
+    <path d="M160,60 L188,60" marker-end="url(#ar-hta-2)"/><path d="M270,60 L298,60" marker-end="url(#ar-hta-2)"/><path d="M430,60 L458,60" marker-end="url(#ar-hta-2)"/>
+    <path d="M535,80 L535,110"/><path d="M60,110 L760,110"/>
+    <path d="M60,110 L60,128" marker-end="url(#ar-hta-2)"/><path d="M160,110 L160,128" marker-end="url(#ar-hta-2)"/><path d="M260,110 L260,128" marker-end="url(#ar-hta-2)"/><path d="M360,110 L360,128" marker-end="url(#ar-hta-2)"/>
+    <path d="M460,110 L460,128" marker-end="url(#ar-hta-2)"/><path d="M560,110 L560,128" marker-end="url(#ar-hta-2)"/><path d="M660,110 L660,128" marker-end="url(#ar-hta-2)"/><path d="M760,110 L760,128" marker-end="url(#ar-hta-2)"/>
+  </g>
+  <g text-anchor="middle" font-size="12.5">
+    <rect x="14" y="130" width="92" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="60" y="155">Upload</text>
+    <rect x="114" y="130" width="92" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="160" y="155">Stories</text>
+    <rect x="214" y="130" width="92" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="260" y="155">Like/Cmt</text>
+    <rect x="314" y="130" width="92" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="360" y="155">Follow</text>
+    <rect x="414" y="130" width="92" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="460" y="155">Feed</text>
+    <rect x="514" y="130" width="92" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="560" y="155">Search</text>
+    <rect x="614" y="130" width="92" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="660" y="155">DM</text>
+    <rect x="714" y="130" width="92" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="760" y="155">User/Auth</text>
+  </g>
+  <g stroke="#6a1b9a" stroke-width="1.5" fill="none" stroke-dasharray="4 3">
+    <path d="M60,170 L60,198" marker-end="url(#ar-hta-2)"/><path d="M160,170 L160,198" marker-end="url(#ar-hta-2)"/><path d="M260,170 L260,198" marker-end="url(#ar-hta-2)"/><path d="M360,170 L360,198" marker-end="url(#ar-hta-2)"/>
+  </g>
+  <rect x="14" y="200" width="792" height="34" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/>
+  <text x="410" y="222" text-anchor="middle" font-weight="600">Kafka event bus (post.created · like · comment · follow · story.created)</text>
+  <g stroke="#6a1b9a" stroke-width="1.5" fill="none">
+    <path d="M90,234 L90,268" marker-end="url(#ar-hta-2)"/><path d="M250,234 L250,268" marker-end="url(#ar-hta-2)"/><path d="M410,234 L410,268" marker-end="url(#ar-hta-2)"/><path d="M570,234 L570,268" marker-end="url(#ar-hta-2)"/><path d="M730,234 L730,268" marker-end="url(#ar-hta-2)"/>
+  </g>
+  <g text-anchor="middle" font-size="12.5">
+    <rect x="15" y="270" width="150" height="40" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="90" y="295">Fan-out workers</text>
+    <rect x="175" y="270" width="150" height="40" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="250" y="295">Media workers</text>
+    <rect x="335" y="270" width="150" height="40" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="410" y="295">Search indexer</text>
+    <rect x="495" y="270" width="150" height="40" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="570" y="295">Notifications</text>
+    <rect x="655" y="270" width="150" height="40" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="730" y="295">Analytics &amp; ML</text>
+  </g>
+  <text x="410" y="342" text-anchor="middle" font-size="11" fill="#555">services and workers read/write the data stores below</text>
+  <g text-anchor="middle">
+    <rect x="15" y="360" width="106" height="46" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="68" y="380" font-size="12.5">Cassandra</text><text x="68" y="397" font-size="11">posts/comments</text>
+    <rect x="129" y="360" width="106" height="46" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="182" y="380" font-size="12.5">Graph store</text><text x="182" y="397" font-size="11">follows</text>
+    <rect x="243" y="360" width="106" height="46" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="296" y="380" font-size="12.5">Redis</text><text x="296" y="397" font-size="11">feeds/counters</text>
+    <rect x="357" y="360" width="106" height="46" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="410" y="380" font-size="12.5">Elasticsearch</text><text x="410" y="397" font-size="11">search index</text>
+    <rect x="471" y="360" width="106" height="46" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="524" y="380" font-size="12.5">PostgreSQL</text><text x="524" y="397" font-size="11">users</text>
+    <rect x="585" y="360" width="106" height="46" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="638" y="380" font-size="12.5">Messages</text><text x="638" y="397" font-size="11">DMs</text>
+    <rect x="699" y="360" width="106" height="46" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="752" y="380" font-size="12.5">S3 objects</text><text x="752" y="397" font-size="11">photos/video</text>
+  </g>
+  <path d="M805,383 L818,383 L818,60 L802,60" fill="none" stroke="#555" stroke-dasharray="5 3" marker-end="url(#ar-hta-2)"/>
+  <text x="814" y="230" font-size="11" fill="#555" text-anchor="end" transform="rotate(-90 814 230)">origin pull</text>
+  <g font-size="12" font-weight="700" fill="#fff" text-anchor="middle">
+    <circle cx="22" cy="40" r="11" fill="#ad1457"/><text x="22" y="44">1</text>
+    <circle cx="800" cy="40" r="11" fill="#ad1457"/><text x="800" y="44">2</text>
+    <circle cx="806" cy="200" r="11" fill="#ad1457"/><text x="806" y="204">2</text>
+    <circle cx="610" cy="40" r="11" fill="#ad1457"/><text x="610" y="44">3</text>
+    <circle cx="14" cy="130" r="11" fill="#ad1457"/><text x="14" y="134">4</text>
+    <circle cx="15" cy="360" r="11" fill="#ad1457"/><text x="15" y="364">4</text>
+    <circle cx="506" cy="130" r="11" fill="#ad1457"/><text x="506" y="134">5</text>
+    <circle cx="165" cy="270" r="11" fill="#ad1457"/><text x="165" y="274">5</text>
+    <circle cx="325" cy="270" r="11" fill="#ad1457"/><text x="325" y="274">5</text>
+    <circle cx="430" cy="40" r="11" fill="#ad1457"/><text x="430" y="44">6</text>
+    <circle cx="349" cy="360" r="11" fill="#ad1457"/><text x="349" y="364">6</text>
+  </g>
+  <text x="20" y="440" font-size="12">① scope decides which boxes exist  ② numbers justify CDN, Kafka, shard counts  ③ API defines gateway routes</text>
+  <text x="20" y="460" font-size="12">④ entities → services + stores  ⑤ deep dives: feed, fan-out, media  ⑥ bottlenecks: redundant LB, cache replicas</text>
+</svg>
+<div class="caption">The Instagram architecture annotated with the framework step that produces each part.</div>
+</div>
+
+<div class="table-wrap"><table>
+  <tr><th>Step</th><th>What it produces in the Instagram diagram</th><th>Lessons that teach it</th></tr>
+  <tr><td>① Requirements</td><td>Which service boxes exist at all. "Stories in scope" adds the Stories Service + TTL storage; "DMs in scope" adds the WebSocket messaging service and Messages Store; "search" adds Elasticsearch and the Search Indexer.</td><td><a href="requirements.html">Requirements</a></td></tr>
+  <tr><td>② Estimation</td><td>Why there is a CDN (PB/day egress), why object storage (hundreds of TB/day), how many Redis nodes, Kafka partitions, DB shards and app servers.</td><td><a href="capacity-estimation.html">Estimation</a></td></tr>
+  <tr><td>③ API</td><td>The routes on the API Gateway; REST vs WebSocket; pre-signed upload URLs.</td><td><a href="api-design.html">API Design</a>, <a href="api-gateway.html">API Gateway</a>, <a href="authentication.html">Auth</a>, <a href="rate-limiting.html">Rate Limiting</a></td></tr>
+  <tr><td>④ Data model + HLD</td><td>The services row, the data-store row and the choice of store per entity; the Kafka event bus.</td><td><a href="microservices.html">Microservices</a>, <a href="databases.html">Databases</a>, <a href="object-storage.html">Object Storage</a>, <a href="message-queues.html">Message Queues</a>, <a href="id-generation.html">IDs</a></td></tr>
+  <tr><td>⑤ Deep dives</td><td>Fan-out workers + Redis timelines, media workers + renditions, sharded counters, WebSocket gateways.</td><td><a href="news-feed.html">News Feed</a>, <a href="media-upload.html">Upload</a>, <a href="media-processing.html">Processing</a>, <a href="likes-comments.html">Likes</a>, <a href="social-graph.html">Graph</a>, <a href="direct-messaging.html">DMs</a>, <a href="search.html">Search</a>, <a href="stories.html">Stories</a></td></tr>
+  <tr><td>⑥ Bottlenecks &amp; trade-offs</td><td>Replicas behind every store, redundant load balancers, caches in front of databases, multi-region copies, monitoring.</td><td><a href="core-principles.html">Core Principles</a>, <a href="cap-consistency.html">CAP</a>, <a href="replication.html">Replication</a>, <a href="sharding.html">Sharding</a>, <a href="caching.html">Caching</a>, <a href="resilience-patterns.html">Resilience</a>, <a href="multi-region.html">Multi-Region</a>, <a href="observability.html">Observability</a></td></tr>
+</table></div>
+
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+Instagram's real history is a lesson in the framework applied over time. Public engineering talks describe a tiny team launching in 2010 on a simple stack (Django + PostgreSQL + Redis/Memcached on cloud servers) — the right design for <em>those</em> requirements. As requirements changed (tens of millions of users within two years, video, Stories, DMs), the numbers changed, and the design evolved: PostgreSQL was sharded into thousands of logical shards with 64-bit time-ordered IDs, Cassandra was adopted for high-write workloads, and the system moved into Facebook's data centres. The lesson: <strong>the design follows from requirements and numbers</strong>. In an interview, you are showing that you could make each of those decisions for the right reason at the right time.</div>
+
+<p>When you get "Design Instagram" in an interview, a strong performance in this guide's terms is:</p>
+<ol>
+  <li>Scope to upload + follow + feed + like/comment, flag Stories/DMs/search as extended (<a href="requirements.html">Requirements</a>).</li>
+  <li>Size it: ~1K uploads/s, ~100–300K feed reads/s, hundreds of TB/day media, PB/day egress (<a href="capacity-estimation.html">Estimation</a>).</li>
+  <li>Write 6–8 endpoints with cursor pagination and pre-signed uploads (<a href="api-design.html">API Design</a>).</li>
+  <li>Draw the diagram top to bottom: clients, edge, services, Kafka, workers, stores, CDN (<a href="request-flows.html">Request Flows</a>).</li>
+  <li>Go deep on the feed (hybrid fan-out, Redis sizing, ranking) and media pipeline (<a href="news-feed.html">News Feed</a>, <a href="media-processing.html">Media Processing</a>).</li>
+  <li>Close with SPOFs, hot keys, consistency choices and a recap (<a href="core-principles.html">Core Principles</a>, <a href="cap-consistency.html">CAP</a>).</li>
+</ol>
+<p>The complete minute-by-minute script is in the <a href="interview-guide.html">Full Interview Walkthrough</a>.</p>
+
+<h2>17. Trade-offs &amp; common pitfalls</h2>
+<p>Even the framework itself is a trade-off: structure versus flexibility.</p>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Following a framework</h4><ul>
+    <li>Never stuck for the next move; no blank-page panic</li>
+    <li>Guarantees coverage of requirements, scale and failure handling</li>
+    <li>Easy for the interviewer to follow and grade</li>
+    <li>Built-in checkpoints for time management</li>
+    <li>Mirrors how real design reviews work</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Risks if applied rigidly</h4><ul>
+    <li>Robotic delivery — "step 3 now" without connecting to the problem</li>
+    <li>Over-spending time on estimation or API details the interviewer doesn't need</li>
+    <li>Ignoring the interviewer's steering because "the template says so"</li>
+    <li>Generic designs that never engage with what makes <em>this</em> problem hard</li>
+  </ul></div>
+</div>
+<h4>The most common mistakes (and the fix)</h4>
+<ul>
+  <li><strong>Jumping into the solution.</strong> Fix: always spend the first 5 minutes on requirements, even if you "know" the problem.</li>
+  <li><strong>Asking questions without proposing answers.</strong> "What scale?" → better: "I'll assume ~500M DAU globally — sound right?"</li>
+  <li><strong>Estimating numbers you never use.</strong> Every number must justify a decision (CDN, sharding, cache size), or skip it.</li>
+  <li><strong>Going deep too early.</strong> Designing the transcoding ladder at minute 12 means no feed at minute 40. Breadth first.</li>
+  <li><strong>Buzzword architecture.</strong> Naming technologies without explaining mechanics or need. Say <em>what problem</em> each box solves.</li>
+  <li><strong>One option only.</strong> Always mention at least one alternative and why you rejected it.</li>
+  <li><strong>Ignoring the hot path.</strong> For Instagram, the feed read path at ~300K req/s is where performance matters; spending equal time on the "change password" flow wastes signal.</li>
+  <li><strong>Forgetting failures.</strong> No discussion of what happens when a node, a zone or a dependency dies.</li>
+  <li><strong>Silent thinking.</strong> Long pauses with no narration — the interviewer can't grade thoughts they can't hear.</li>
+  <li><strong>Over-engineering.</strong> Multi-region active-active with consensus everywhere for a design that only needs a single region. Match complexity to requirements.</li>
+  <li><strong>Being defensive.</strong> Treat pushback as collaboration; adapt.</li>
+  <li><strong>No summary.</strong> Running out of time without a recap leaves the interviewer to assemble your design themselves.</li>
+</ul>
+
+<h2>18. Real-world technologies</h2>
+<p>In the interview you'll name concrete technologies. Use this "default toolbox" — and always say <em>why</em>:</p>
+<div class="table-wrap"><table>
+  <tr><th>Need</th><th>Typical choices</th><th>Reach for it when…</th></tr>
+  <tr><td>Traffic distribution</td><td>DNS (Route 53), L4/L7 load balancers (NGINX, HAProxy, Envoy, cloud LBs)</td><td>Always — more than one server</td></tr>
+  <tr><td>Edge for static media</td><td>CDN (CloudFront, Akamai, Cloudflare, Fastly)</td><td>Large, cacheable, globally-read content</td></tr>
+  <tr><td>Relational / strongly consistent data</td><td>PostgreSQL, MySQL (+ Vitess/Citus for sharding), Spanner/CockroachDB</td><td>Uniqueness, transactions, relations (users, accounts)</td></tr>
+  <tr><td>High-write, wide-column data</td><td>Cassandra, ScyllaDB, HBase, DynamoDB</td><td>Huge write volume, simple key-based access (posts, likes, messages)</td></tr>
+  <tr><td>Cache / in-memory structures</td><td>Redis, Memcached</td><td>Hot reads, timelines, counters, sessions</td></tr>
+  <tr><td>Blob storage</td><td>Amazon S3, GCS, Azure Blob, Ceph</td><td>Photos, videos, backups — anything large and immutable</td></tr>
+  <tr><td>Event streaming / queues</td><td>Kafka, Pulsar, Kinesis, RabbitMQ, SQS</td><td>Async work, fan-out, decoupling producers and consumers</td></tr>
+  <tr><td>Search</td><td>Elasticsearch, OpenSearch, Solr</td><td>Full-text and typeahead search</td></tr>
+  <tr><td>Coordination</td><td>ZooKeeper, etcd</td><td>Leader election, config, service discovery</td></tr>
+  <tr><td>Batch / ML</td><td>Spark, Flink, data warehouses, feature stores</td><td>Analytics, ranking model training</td></tr>
+  <tr><td>Whiteboarding (practice)</td><td>Physical whiteboard, Excalidraw, draw.io, any shared doc</td><td>Mock interviews — practise in the medium you'll be interviewed in</td></tr>
+</table></div>
+
+<h2>19. Interview corner</h2>
+<details class="qa"><summary>The interviewer says "Design Instagram." What are your first two minutes?</summary>
+<p>Restate the problem and announce a plan: "I'll start with requirements, do a quick estimate, define the core API, sketch a high-level design, then go deep on the feed and upload pipeline, and finish with bottlenecks." Then propose a scope: core = upload photo/video, follow, home feed, like/comment; extended = Stories, DMs, search, Explore; out = ads, shopping, live. Ask them to confirm, then ask the 3–4 non-functional questions that change the design most: scale (DAU, global?), ranked vs chronological feed, latency target, and whether eventual consistency is acceptable for feeds and counts.</p></details>
+<details class="qa"><summary>How do you decide what to deep-dive on?</summary>
+<p>Three filters: (1) what's <em>hardest</em> at this scale — for Instagram, feed generation for 500M DAU with celebrity accounts, and the media pipeline at hundreds of TB/day; (2) what's <em>specific</em> to this problem rather than generic plumbing (a load balancer is rarely the best deep dive); (3) what the interviewer <em>signals</em> interest in. I propose the two I think matter most and let the interviewer choose — that both shows judgement and makes sure I spend time where they're grading.</p></details>
+<details class="qa"><summary>You realise halfway through that your design has a flaw. What do you do?</summary>
+<p>Say so explicitly and fix it: "Actually, push fan-out breaks for an account with 300M followers — one post would mean 300M Redis writes. Let me change this to a hybrid: push for normal accounts, pull at read time for accounts above ~1M followers." Self-correction is a strong senior signal; hiding the flaw is a weak one, because the interviewer almost certainly noticed already.</p></details>
+<details class="qa"><summary>How much time should estimation take, and what if the interviewer wants to skip it?</summary>
+<p>Three to five minutes, only for numbers that drive decisions: peak read/write QPS, storage per day/year, egress bandwidth and maybe cache size. If the interviewer wants to skip it, skip it — but still mention the conclusions verbally when they matter ("this is read-heavy by about 100:1, so I'll optimise the read path"). Numbers are a tool for justifying design, not a ritual.</p></details>
+<details class="qa"><summary>What separates a senior answer from a mid-level answer for the same design?</summary>
+<p>A mid-level candidate produces a correct design when prompted. A senior candidate <em>drives</em>: sets the agenda, makes and justifies decisions with numbers, raises failure modes before being asked (hot shards, celebrity posts, cache stampedes, region outages), discusses consistency per feature, mentions observability and operability, and summarises trade-offs. Staff-level adds questioning requirements, cost, evolution over time and organisational impact (which team owns which service).</p></details>
+<details class="qa"><summary>How do you handle an interviewer who keeps interrupting with detailed questions while you're still doing the high-level design?</summary>
+<p>Answer briefly (one or two sentences) so they get the signal they want, then park the detail: "I'll come back to this in the deep dive — let me first finish the end-to-end flow so we have something complete." Write a note on the board ("TODO: counter hot-spot") so they see you won't forget. If they insist, follow them — they may want to assess depth on that topic specifically.</p></details>
+<details class="qa"><summary>How do you talk about trade-offs without sounding vague?</summary>
+<p>Use the pattern: options → criteria (from the requirements) → decision with numbers → cost → mitigation/when to revisit. E.g. "Cassandra vs PostgreSQL for likes: we need ~60K writes/s average, simple key access and no cross-row transactions, so Cassandra; we give up strong consistency and ad-hoc queries, which is fine because like counts may be slightly stale; analytics queries go to the warehouse instead."</p></details>
+<details class="qa"><summary>What should your final summary contain?</summary>
+<p>In about a minute: the core read and write paths in one sentence each; the two or three key decisions and why (pre-signed uploads to S3 + CDN; hybrid fan-out into Redis; Cassandra sharded by user_id); the main risks and their mitigations; the consistency/availability choices; and what you'd do next with more time. It should map back to the requirements you wrote at the start.</p></details>
+
+<h2>20. Check your understanding</h2>
+<details class="quiz"><summary>Put these in the right order: deep dives, API, estimation, wrap-up, requirements, high-level design.</summary>
+<p>Requirements → estimation → API → (data model +) high-level design → deep dives → wrap-up. Each step depends on the previous one: requirements decide what to estimate; estimates justify architecture; the API reveals the services and data; the high-level design reveals where the hard parts are.</p></details>
+<details class="quiz"><summary>You are at minute 30 and haven't started any deep dive yet. What do you do?</summary>
+<p>Say it out loud and re-plan: "We're at 30 minutes, so I'll do one deep dive — the feed — and keep 5 minutes for bottlenecks and a summary." One good deep dive beats two rushed ones, and the wrap-up must not be dropped.</p></details>
+<details class="quiz"><summary>Numeric: 100M posts per day. Roughly what is the average and peak write QPS for post creation?</summary>
+<p>100M / ~10<sup>5</sup> s ≈ <strong>1,000 posts/s</strong> average (precisely ≈ 1,157/s). Peak is typically 2–3× average → <strong>~2,000–3,500/s</strong>. That's modest — the conclusion is that post creation is not the bottleneck; fan-out (each post × hundreds of followers) and feed reads are.</p></details>
+<details class="quiz"><summary>Which is the better clarifying question: "What features should I build?" or "I'll focus on upload, follow, feed and likes, and treat Stories and DMs as extensions — OK?" Why?</summary>
+<p>The second. It shows product judgement, keeps you in control of the clock, and gives the interviewer something concrete to correct. Open questions push the work back onto the interviewer and often lead to a vague or sprawling scope.</p></details>
+<details class="quiz"><summary>Scenario: the interviewer asks, "What happens when someone with 400M followers posts?" What is this question really testing, and which step of the framework are you in?</summary>
+<p>It's a hint that naive fan-out-on-write fails for celebrities (400M timeline writes for one post). It's testing technical depth and adaptability — you're in step 5 (deep dive on the feed) or step 6 (bottlenecks). A good answer: switch to hybrid fan-out — pull celebrity posts at read time and merge with the pushed timeline.</p></details>
+<details class="quiz"><summary>Why should you design the API before the high-level architecture?</summary>
+<p>The API makes the use cases concrete: each endpoint implies a service that handles it and data it must read or write. Writing <code>GET /feed?cursor</code> immediately raises "where does the feed come from, and how is it paginated?", which shapes the feed service, the timeline cache and the data model.</p></details>
+<details class="quiz"><summary>Name four rubric dimensions interviewers commonly use, and one behaviour that scores well on each.</summary>
+<p>Problem navigation — proposing a scope and confirming it. Solution design — a complete end-to-end design covering every core requirement. Technical depth — explaining the mechanics of fan-out or sharding with numbers. Trade-offs — comparing push vs pull and naming the cost of the choice. (Also: communication — thinking aloud and checking in; operational awareness — discussing failures and monitoring.)</p></details>
+<details class="quiz"><summary>Which lessons of this guide would you study to prepare for step 6 (bottlenecks &amp; trade-offs)?</summary>
+<p><a href="core-principles.html">Core Principles</a> (SPOFs, availability math, tail latency), <a href="cap-consistency.html">CAP &amp; Consistency</a>, <a href="resilience-patterns.html">Resilience Patterns</a>, <a href="multi-region.html">Multi-Region</a> and <a href="observability.html">Observability</a> — plus <a href="caching.html">Caching</a> and <a href="sharding.html">Sharding</a> for hot-spot mitigations.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Use the <strong>6 steps</strong>: requirements → estimation → API → data model + high-level design → deep dives → bottlenecks &amp; wrap-up. Each step feeds the next.</li>
+    <li>Budget time: <strong>~13 min scoping, ~12 min breadth, ~15 min depth, ~5 min wrap-up</strong> — and say your checkpoints out loud.</li>
+    <li><strong>Breadth before depth</strong>: a complete simple design first, then 2–3 deep dives chosen with the interviewer.</li>
+    <li>Make your thinking visible: <strong>think aloud, propose rather than ask, state assumptions, check in</strong>.</li>
+    <li>Discuss trade-offs as <strong>options → criteria → decision with numbers → cost → mitigation</strong>.</li>
+    <li>Every box in the Instagram diagram traces back to a requirement, a number or a bottleneck — be able to say which.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="requirements.html">Requirements</a> — step 1 in depth, including the full list of clarifying questions</li>
+  <li><a href="capacity-estimation.html">Back-of-the-Envelope Estimation</a> — step 2, with a complete worked Instagram example</li>
+  <li><a href="api-design.html">API Design</a> — step 3: REST, gRPC, GraphQL, WebSockets, pagination, idempotency</li>
+  <li><a href="core-principles.html">Core Principles</a> — the vocabulary for step 6: scalability, availability, latency</li>
+  <li><a href="cap-consistency.html">CAP &amp; Consistency</a> — how to discuss consistency trade-offs per feature</li>
+  <li><a href="news-feed.html">News Feed</a> — the most common Instagram deep dive</li>
+  <li><a href="interview-guide.html">Full Interview Walkthrough</a> — the framework applied to Instagram, minute by minute</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

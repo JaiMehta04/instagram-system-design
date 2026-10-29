@@ -1,0 +1,436 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1760" height="1050" viewBox="0 0 1760 1050" font-family="Segoe UI, Helvetica, Arial, sans-serif" role="img" aria-label="Instagram high-level system design diagram">
+<defs><filter id="sh" x="-5%" y="-5%" width="110%" height="120%"><feDropShadow dx="0" dy="1" stdDeviation="1.2" flood-opacity="0.18"/></filter>
+<marker id="a-sync" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#424242"/></marker>
+<marker id="a-evt" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7B1FA2"/></marker>
+<marker id="a-dash" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#78909C"/></marker>
+</defs>
+<rect width="1760" height="1050" fill="#FFFFFF"/>
+<text x="880.0" y="36" font-size="22" font-weight="bold" fill="#212121" text-anchor="middle" >Instagram — High-Level System Design</text>
+<text x="880.0" y="54" font-size="12" font-weight="normal" fill="#78909C" text-anchor="middle" >Click any box, label or ◆ chip to open its lesson</text>
+<g class="grp"><rect x="360" y="62" width="440" height="92" rx="12" fill="#E1F5FE" fill-opacity="0.35" stroke="#0277BD" stroke-width="1.4"/>
+<a class="grp-link" data-concept="clients" data-label="Clients" href="../concepts/clients.html" xlink:href="../concepts/clients.html"><title>Clients — click to learn</title>
+<text x="372" y="80" font-size="12.5" font-weight="bold" fill="#0277BD" text-anchor="start" >Clients  ↗</text>
+</a></g>
+<g class="grp"><rect x="35" y="385" width="1235" height="125" rx="12" fill="#E8F5E9" fill-opacity="0.35" stroke="#2E7D32" stroke-width="1.4"/>
+<a class="grp-link" data-concept="microservices" data-label="Application Services  (stateless · horizontally scaled)" href="../concepts/microservices.html" xlink:href="../concepts/microservices.html"><title>Application Services  (stateless · horizontally scaled) — click to learn</title>
+<text x="47" y="403" font-size="12.5" font-weight="bold" fill="#2E7D32" text-anchor="start" >Application Services  (stateless · horizontally scaled)  ↗</text>
+</a></g>
+<g class="grp"><rect x="35" y="545" width="1235" height="160" rx="12" fill="#FFF8E1" fill-opacity="0.35" stroke="#F9A825" stroke-width="1.4"/>
+<a class="grp-link" data-concept="databases" data-label="Data Layer" href="../concepts/databases.html" xlink:href="../concepts/databases.html"><title>Data Layer — click to learn</title>
+<text x="47" y="563" font-size="12.5" font-weight="bold" fill="#F9A825" text-anchor="start" >Data Layer  ↗</text>
+</a></g>
+<g class="grp"><rect x="1340" y="385" width="375" height="520" rx="12" fill="#F3E5F5" fill-opacity="0.35" stroke="#6A1B9A" stroke-width="1.4"/>
+<a class="grp-link" data-concept="message-queues" data-label="Async Processing" href="../concepts/message-queues.html" xlink:href="../concepts/message-queues.html"><title>Async Processing — click to learn</title>
+<text x="1352" y="403" font-size="12.5" font-weight="bold" fill="#6A1B9A" text-anchor="start" >Async Processing  ↗</text>
+</a></g>
+<g class="grp"><rect x="1355" y="485" width="345" height="410" rx="12" fill="#F3E5F5" fill-opacity="0.35" stroke="#6A1B9A" stroke-width="1.4" stroke-dasharray="6 4"/>
+<a class="grp-link" data-concept="message-queues" data-label="Consumers" href="../concepts/message-queues.html" xlink:href="../concepts/message-queues.html"><title>Consumers — click to learn</title>
+<text x="1367" y="503" font-size="12.5" font-weight="bold" fill="#6A1B9A" text-anchor="start" >Consumers  ↗</text>
+</a></g>
+<g class="edge" id="e-client-cdn">
+<path d="M360,112 L240,112" fill="none" stroke="#78909C" stroke-width="1.6" stroke-dasharray="6 4" marker-end="url(#a-dash)"/>
+<a class="tag-link" data-concept="cdn" data-label="GET media" href="../concepts/cdn.html" xlink:href="../concepts/cdn.html"><title>GET media — click to learn</title>
+<g><rect x="268.1" y="93" width="63.800000000000004" height="15" rx="3" fill="#FFFFFF" fill-opacity="0.95"/>
+<text x="300" y="104" font-size="10.5" font-weight="normal" fill="#37474F" text-anchor="middle" >GET media</text>
+</g>
+</a>
+</g>
+<g class="edge" id="e-client-dns">
+<path d="M420,154 L420,207 L270,207" fill="none" stroke="#78909C" stroke-width="1.6" stroke-dasharray="6 4" marker-end="url(#a-dash)"/>
+<a class="tag-link" data-concept="dns" data-label="resolve" href="../concepts/dns.html" xlink:href="../concepts/dns.html"><title>resolve — click to learn</title>
+<g><rect x="319.3" y="188" width="51.4" height="15" rx="3" fill="#FFFFFF" fill-opacity="0.95"/>
+<text x="345" y="199" font-size="10.5" font-weight="normal" fill="#37474F" text-anchor="middle" >resolve</text>
+</g>
+</a>
+</g>
+<g class="edge" id="e-client-lb">
+<path d="M580,154 L580,180" fill="none" stroke="#424242" stroke-width="1.6" marker-end="url(#a-sync)"/>
+</g>
+<g class="edge" id="e-lb-gw">
+<path d="M580,234 L580,262" fill="none" stroke="#424242" stroke-width="1.6" marker-end="url(#a-sync)"/>
+</g>
+<g class="edge" id="e-push-client">
+<path d="M1480,110 L800,110" fill="none" stroke="#78909C" stroke-width="1.6" stroke-dasharray="6 4" marker-end="url(#a-dash)"/>
+<a class="tag-link" data-concept="notifications" data-label="push notifications" href="../concepts/notifications.html" xlink:href="../concepts/notifications.html"><title>push notifications — click to learn</title>
+<g><rect x="1080.2" y="91" width="119.60000000000001" height="15" rx="3" fill="#FFFFFF" fill-opacity="0.95"/>
+<text x="1140" y="102" font-size="10.5" font-weight="normal" fill="#37474F" text-anchor="middle" >push notifications</text>
+</g>
+</a>
+</g>
+<g class="edge" id="e-ev-upload">
+<path d="M120,420 L120,357" fill="none" stroke="#7B1FA2" stroke-width="1.6" marker-end="url(#a-evt)"/>
+</g>
+<g class="edge" id="e-ev-stories">
+<path d="M272,420 L272,357" fill="none" stroke="#7B1FA2" stroke-width="1.6" marker-end="url(#a-evt)"/>
+</g>
+<g class="edge" id="e-ev-likes">
+<path d="M424,420 L424,357" fill="none" stroke="#7B1FA2" stroke-width="1.6" marker-end="url(#a-evt)"/>
+</g>
+<g class="edge" id="e-ev-graph">
+<path d="M576,420 L576,357" fill="none" stroke="#7B1FA2" stroke-width="1.6" marker-end="url(#a-evt)"/>
+</g>
+<g class="edge" id="e-bus">
+<path d="M120,355 L1527,355 L1527,405" fill="none" stroke="#7B1FA2" stroke-width="2" marker-end="url(#a-evt)"/>
+<a class="tag-link" data-concept="message-queues" data-label="domain events: post created · story created · like / comment · follow" href="../concepts/message-queues.html" xlink:href="../concepts/message-queues.html"><title>domain events: post created · story created · like / comment · follow — click to learn</title>
+<g><rect x="832.1" y="336" width="435.8" height="15" rx="3" fill="#FFFFFF" fill-opacity="0.95"/>
+<text x="1050" y="347" font-size="10.5" font-weight="normal" fill="#7B1FA2" text-anchor="middle" >domain events: post created · story created · like / comment · follow</text>
+</g>
+</a>
+</g>
+<path d="M700,324 L700,385" stroke="#FFFFFF" stroke-width="7"/>
+<g class="edge" id="e-gw-svc">
+<path d="M700,324 L700,385" fill="none" stroke="#424242" stroke-width="1.6" marker-end="url(#a-sync)"/>
+<a class="tag-link" data-concept="api-design" data-label="REST / gRPC · WebSocket" href="../concepts/api-design.html" xlink:href="../concepts/api-design.html"><title>REST / gRPC · WebSocket — click to learn</title>
+<g><rect x="706" y="364" width="150.6" height="15" rx="3" fill="#FFFFFF" fill-opacity="0.95"/>
+<text x="710" y="375" font-size="10.5" font-weight="normal" fill="#37474F" text-anchor="start" >REST / gRPC · WebSocket</text>
+</g>
+</a>
+</g>
+<g class="edge" id="e-upload-s3">
+<path d="M120,495 L120,577" fill="none" stroke="#424242" stroke-width="1.6" marker-end="url(#a-sync)"/>
+<a class="tag-link" data-concept="object-storage" data-label="media" href="../concepts/object-storage.html" xlink:href="../concepts/object-storage.html"><title>media — click to learn</title>
+<g><rect x="100.5" y="529" width="39.0" height="15" rx="3" fill="#FFFFFF" fill-opacity="0.95"/>
+<text x="120" y="540" font-size="10.5" font-weight="normal" fill="#37474F" text-anchor="middle" >media</text>
+</g>
+</a>
+</g>
+<g class="edge" id="e-stories-postdb">
+<path d="M272,495 L272,577" fill="none" stroke="#424242" stroke-width="1.6" marker-end="url(#a-sync)"/>
+</g>
+<g class="edge" id="e-likes-postdb">
+<path d="M424,495 L424,577" fill="none" stroke="#424242" stroke-width="1.6" marker-end="url(#a-sync)"/>
+</g>
+<g class="edge" id="e-graph-graphdb">
+<path d="M576,495 L576,577" fill="none" stroke="#424242" stroke-width="1.6" marker-end="url(#a-sync)"/>
+</g>
+<g class="edge" id="e-feed-feedcache">
+<path d="M728,495 L728,577" fill="none" stroke="#424242" stroke-width="1.6" marker-end="url(#a-sync)"/>
+</g>
+<g class="edge" id="e-search-es">
+<path d="M880,495 L880,577" fill="none" stroke="#424242" stroke-width="1.6" marker-end="url(#a-sync)"/>
+</g>
+<g class="edge" id="e-dm-msgdb">
+<path d="M1032,495 L1032,577" fill="none" stroke="#424242" stroke-width="1.6" marker-end="url(#a-sync)"/>
+</g>
+<g class="edge" id="e-user-userdb">
+<path d="M1184,495 L1184,577" fill="none" stroke="#424242" stroke-width="1.6" marker-end="url(#a-sync)"/>
+</g>
+<g class="edge" id="e-upload-postdb">
+<path d="M150,495 L240,577" fill="none" stroke="#424242" stroke-width="1.6" marker-end="url(#a-sync)"/>
+<a class="tag-link" data-concept="databases" data-label="metadata" href="../concepts/databases.html" xlink:href="../concepts/databases.html"><title>metadata — click to learn</title>
+<g><rect x="171.2" y="517" width="57.6" height="15" rx="3" fill="#FFFFFF" fill-opacity="0.95"/>
+<text x="200" y="528" font-size="10.5" font-weight="normal" fill="#37474F" text-anchor="middle" >metadata</text>
+</g>
+</a>
+</g>
+<g class="edge" id="e-s3-cdn">
+<path d="M50,640 L18,640 L18,125 L40,125" fill="none" stroke="#78909C" stroke-width="1.6" stroke-dasharray="6 4" marker-end="url(#a-dash)"/>
+<a class="tag-link" data-concept="cdn" data-label="origin pull" href="../concepts/cdn.html" xlink:href="../concepts/cdn.html"><title>origin pull — click to learn</title>
+<g transform="rotate(-90 18 380)"><rect x="-20.1" y="369" width="76.2" height="15" rx="3" fill="#FFFFFF" fill-opacity="0.95"/>
+<text x="18" y="380" font-size="10.5" font-weight="normal" fill="#37474F" text-anchor="middle" >origin pull</text>
+</g>
+</a>
+</g>
+<g class="edge" id="e-kafka-consumers">
+<path d="M1527,460 L1527,485" fill="none" stroke="#7B1FA2" stroke-width="2" marker-end="url(#a-evt)"/>
+</g>
+<g class="edge" id="e-idx-es">
+<path d="M1375,542 L1290,542 L1290,735 L880,735 L880,692" fill="none" stroke="#7B1FA2" stroke-width="1.6" marker-end="url(#a-evt)"/>
+<a class="tag-link" data-concept="search" data-label="index" href="../concepts/search.html" xlink:href="../concepts/search.html"><title>index — click to learn</title>
+<g><rect x="1060.5" y="719" width="39.0" height="15" rx="3" fill="#FFFFFF" fill-opacity="0.95"/>
+<text x="1080" y="730" font-size="10.5" font-weight="normal" fill="#7B1FA2" text-anchor="middle" >index</text>
+</g>
+</a>
+</g>
+<g class="edge" id="e-fanout-feedcache">
+<path d="M1375,620 L1305,620 L1305,760 L728,760 L728,692" fill="none" stroke="#7B1FA2" stroke-width="1.6" marker-end="url(#a-evt)"/>
+<a class="tag-link" data-concept="news-feed" data-label="write post IDs to followers&#x27; timelines" href="../concepts/news-feed.html" xlink:href="../concepts/news-feed.html"><title>write post IDs to followers&#x27; timelines — click to learn</title>
+<g><rect x="878.2" y="744" width="243.6" height="15" rx="3" fill="#FFFFFF" fill-opacity="0.95"/>
+<text x="1000" y="755" font-size="10.5" font-weight="normal" fill="#7B1FA2" text-anchor="middle" >write post IDs to followers&#x27; timelines</text>
+</g>
+</a>
+</g>
+<g class="edge" id="e-media-s3">
+<path d="M1375,700 L1320,700 L1320,785 L120,785 L120,692" fill="none" stroke="#7B1FA2" stroke-width="1.6" marker-end="url(#a-evt)"/>
+<a class="tag-link" data-concept="media-processing" data-label="store processed renditions" href="../concepts/media-processing.html" xlink:href="../concepts/media-processing.html"><title>store processed renditions — click to learn</title>
+<g><rect x="475.4" y="769" width="169.20000000000002" height="15" rx="3" fill="#FFFFFF" fill-opacity="0.95"/>
+<text x="560" y="780" font-size="10.5" font-weight="normal" fill="#7B1FA2" text-anchor="middle" >store processed renditions</text>
+</g>
+</a>
+</g>
+<g class="edge" id="e-notif-push">
+<path d="M1680,775 L1738,775 L1738,125 L1700,125" fill="none" stroke="#7B1FA2" stroke-width="1.6" marker-end="url(#a-evt)"/>
+</g>
+<a class="node" id="n-cdn" data-concept="cdn" data-label="CDN" href="../concepts/cdn.html" xlink:href="../concepts/cdn.html"><title>CDN — click to learn</title>
+<rect class="shape" x="40" y="80" width="200" height="60" rx="8" fill="#FFF3E0" stroke="#EF6C00" stroke-width="1.6" filter="url(#sh)"/>
+<text x="140.0" y="107.0" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >CDN</text>
+<text x="140.0" y="121.0" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >photos · videos · thumbnails</text>
+</a>
+<a class="node" id="n-mobile" data-concept="clients" data-label="Mobile App" href="../concepts/clients.html" xlink:href="../concepts/clients.html"><title>Mobile App — click to learn</title>
+<rect class="shape" x="375" y="86" width="200" height="56" rx="8" fill="#E1F5FE" stroke="#0277BD" stroke-width="1.6" filter="url(#sh)"/>
+<text x="475.0" y="111.0" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Mobile App</text>
+<text x="475.0" y="125.0" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >iOS / Android</text>
+</a>
+<a class="node" id="n-web" data-concept="clients" data-label="Web Client" href="../concepts/clients.html" xlink:href="../concepts/clients.html"><title>Web Client — click to learn</title>
+<rect class="shape" x="590" y="86" width="195" height="56" rx="8" fill="#E1F5FE" stroke="#0277BD" stroke-width="1.6" filter="url(#sh)"/>
+<text x="687.5" y="111.0" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Web Client</text>
+<text x="687.5" y="125.0" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >Browser</text>
+</a>
+<a class="node" id="n-push" data-concept="notifications" data-label="Push Providers" href="../concepts/notifications.html" xlink:href="../concepts/notifications.html"><title>Push Providers — click to learn</title>
+<rect class="shape" x="1480" y="80" width="220" height="60" rx="8" fill="#ECEFF1" stroke="#455A64" stroke-width="1.6" filter="url(#sh)"/>
+<text x="1590.0" y="107.0" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Push Providers</text>
+<text x="1590.0" y="121.0" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >APNs / FCM</text>
+</a>
+<a class="node" id="n-dns" data-concept="dns" data-label="DNS" href="../concepts/dns.html" xlink:href="../concepts/dns.html"><title>DNS — click to learn</title>
+<rect class="shape" x="150" y="185" width="120" height="46" rx="8" fill="#FFF3E0" stroke="#EF6C00" stroke-width="1.6" filter="url(#sh)"/>
+<text x="210.0" y="212.0" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >DNS</text>
+</a>
+<a class="node" id="n-lb" data-concept="load-balancer" data-label="Load Balancer" href="../concepts/load-balancer.html" xlink:href="../concepts/load-balancer.html"><title>Load Balancer — click to learn</title>
+<rect class="shape" x="470" y="180" width="220" height="54" rx="8" fill="#FFF3E0" stroke="#EF6C00" stroke-width="1.6" filter="url(#sh)"/>
+<text x="580.0" y="204.0" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Load Balancer</text>
+<text x="580.0" y="218.0" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >L4 / L7, multi-region</text>
+</a>
+<a class="node" id="n-gw" data-concept="api-gateway" data-label="API Gateway" href="../concepts/api-gateway.html" xlink:href="../concepts/api-gateway.html"><title>API Gateway — click to learn</title>
+<rect class="shape" x="380" y="262" width="400" height="62" rx="8" fill="#FFF3E0" stroke="#EF6C00" stroke-width="1.6" filter="url(#sh)"/>
+<text x="580.0" y="290.0" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >API Gateway</text>
+<text x="580.0" y="304.0" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >AuthN/Z · rate limiting · routing · TLS</text>
+</a>
+<a class="node" id="n-upload" data-concept="media-upload" data-label="Upload Service" href="../concepts/media-upload.html" xlink:href="../concepts/media-upload.html"><title>Upload Service — click to learn</title>
+<rect class="shape" x="50" y="420" width="140" height="75" rx="8" fill="#E8F5E9" stroke="#2E7D32" stroke-width="1.6" filter="url(#sh)"/>
+<text x="120.0" y="447.5" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Upload Service</text>
+<text x="120.0" y="461.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >posts / reels</text>
+<text x="120.0" y="475.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >pre-signed URLs</text>
+</a>
+<a class="node" id="n-stories" data-concept="stories" data-label="Stories Service" href="../concepts/stories.html" xlink:href="../concepts/stories.html"><title>Stories Service — click to learn</title>
+<rect class="shape" x="202" y="420" width="140" height="75" rx="8" fill="#E8F5E9" stroke="#2E7D32" stroke-width="1.6" filter="url(#sh)"/>
+<text x="272.0" y="454.5" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Stories Service</text>
+<text x="272.0" y="468.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >24h TTL</text>
+</a>
+<a class="node" id="n-likes" data-concept="likes-comments" data-label="Like &amp; Comment" href="../concepts/likes-comments.html" xlink:href="../concepts/likes-comments.html"><title>Like &amp; Comment — click to learn</title>
+<rect class="shape" x="354" y="420" width="140" height="75" rx="8" fill="#E8F5E9" stroke="#2E7D32" stroke-width="1.6" filter="url(#sh)"/>
+<text x="424.0" y="454.5" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Like &amp; Comment</text>
+<text x="424.0" y="468.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >Service</text>
+</a>
+<a class="node" id="n-graph" data-concept="social-graph" data-label="Follow / Graph" href="../concepts/social-graph.html" xlink:href="../concepts/social-graph.html"><title>Follow / Graph — click to learn</title>
+<rect class="shape" x="506" y="420" width="140" height="75" rx="8" fill="#E8F5E9" stroke="#2E7D32" stroke-width="1.6" filter="url(#sh)"/>
+<text x="576.0" y="454.5" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Follow / Graph</text>
+<text x="576.0" y="468.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >Service</text>
+</a>
+<a class="node" id="n-feed" data-concept="news-feed" data-label="News Feed Service" href="../concepts/news-feed.html" xlink:href="../concepts/news-feed.html"><title>News Feed Service — click to learn</title>
+<rect class="shape" x="658" y="420" width="140" height="75" rx="8" fill="#E8F5E9" stroke="#2E7D32" stroke-width="1.6" filter="url(#sh)"/>
+<text x="728.0" y="447.5" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >News Feed Service</text>
+<text x="728.0" y="461.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >timeline read</text>
+<text x="728.0" y="475.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >ML-ranked</text>
+</a>
+<a class="node" id="n-search" data-concept="search" data-label="Search Service" href="../concepts/search.html" xlink:href="../concepts/search.html"><title>Search Service — click to learn</title>
+<rect class="shape" x="810" y="420" width="140" height="75" rx="8" fill="#E8F5E9" stroke="#2E7D32" stroke-width="1.6" filter="url(#sh)"/>
+<text x="880.0" y="454.5" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Search Service</text>
+<text x="880.0" y="468.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >users · tags · places</text>
+</a>
+<a class="node" id="n-dm" data-concept="direct-messaging" data-label="Direct Messaging" href="../concepts/direct-messaging.html" xlink:href="../concepts/direct-messaging.html"><title>Direct Messaging — click to learn</title>
+<rect class="shape" x="962" y="420" width="140" height="75" rx="8" fill="#E8F5E9" stroke="#2E7D32" stroke-width="1.6" filter="url(#sh)"/>
+<text x="1032.0" y="454.5" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Direct Messaging</text>
+<text x="1032.0" y="468.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >WebSocket</text>
+</a>
+<a class="node" id="n-user" data-concept="authentication" data-label="User / Auth Service" href="../concepts/authentication.html" xlink:href="../concepts/authentication.html"><title>User / Auth Service — click to learn</title>
+<rect class="shape" x="1114" y="420" width="140" height="75" rx="8" fill="#E8F5E9" stroke="#2E7D32" stroke-width="1.6" filter="url(#sh)"/>
+<text x="1184.0" y="454.5" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >User / Auth Service</text>
+<text x="1184.0" y="468.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >profiles · sessions</text>
+</a>
+<a class="node" id="n-s3" data-concept="object-storage" data-label="Object Storage" href="../concepts/object-storage.html" xlink:href="../concepts/object-storage.html"><title>Object Storage — click to learn</title>
+<path class="shape" d="M50,583 a70.0,8 0 0,0 140,0 a70.0,8 0 0,0 -140,0 v99 a70.0,8 0 0,0 140,0 v-99" fill="#FFF8E1" stroke="#F9A825" stroke-width="1.6" filter="url(#sh)"/>
+<path d="M50,583 a70.0,8 0 0,0 140,0" fill="none" stroke="#F9A825" stroke-width="1.2"/>
+<text x="120.0" y="627.5" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Object Storage</text>
+<text x="120.0" y="641.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >Amazon S3</text>
+<text x="120.0" y="655.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >photos &amp; videos</text>
+</a>
+<a class="node" id="n-postdb" data-concept="databases" data-label="Post / Comment / Story Metadata" href="../concepts/databases.html" xlink:href="../concepts/databases.html"><title>Post / Comment / Story Metadata — click to learn</title>
+<path class="shape" d="M205,583 a143.0,8 0 0,0 286,0 a143.0,8 0 0,0 -286,0 v99 a143.0,8 0 0,0 286,0 v-99" fill="#FFF8E1" stroke="#F9A825" stroke-width="1.6" filter="url(#sh)"/>
+<path d="M205,583 a143.0,8 0 0,0 286,0" fill="none" stroke="#F9A825" stroke-width="1.2"/>
+<text x="348.0" y="627.5" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Post / Comment / Story Metadata</text>
+<text x="348.0" y="641.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >Cassandra</text>
+<text x="348.0" y="655.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >sharded by user_id</text>
+</a>
+<a class="node" id="n-graphdb" data-concept="social-graph" data-label="Social Graph" href="../concepts/social-graph.html" xlink:href="../concepts/social-graph.html"><title>Social Graph — click to learn</title>
+<path class="shape" d="M506,583 a70.0,8 0 0,0 140,0 a70.0,8 0 0,0 -140,0 v99 a70.0,8 0 0,0 140,0 v-99" fill="#FFF8E1" stroke="#F9A825" stroke-width="1.6" filter="url(#sh)"/>
+<path d="M506,583 a70.0,8 0 0,0 140,0" fill="none" stroke="#F9A825" stroke-width="1.2"/>
+<text x="576.0" y="627.5" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Social Graph</text>
+<text x="576.0" y="641.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >follower / following</text>
+<text x="576.0" y="655.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >sharded store</text>
+</a>
+<a class="node" id="n-feedcache" data-concept="caching" data-label="Feed Cache" href="../concepts/caching.html" xlink:href="../concepts/caching.html"><title>Feed Cache — click to learn</title>
+<path class="shape" d="M658,583 a70.0,8 0 0,0 140,0 a70.0,8 0 0,0 -140,0 v99 a70.0,8 0 0,0 140,0 v-99" fill="#FFF8E1" stroke="#F9A825" stroke-width="1.6" filter="url(#sh)"/>
+<path d="M658,583 a70.0,8 0 0,0 140,0" fill="none" stroke="#F9A825" stroke-width="1.2"/>
+<text x="728.0" y="627.5" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Feed Cache</text>
+<text x="728.0" y="641.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >Redis</text>
+<text x="728.0" y="655.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >timelines · counters</text>
+</a>
+<a class="node" id="n-es" data-concept="search" data-label="Search Index" href="../concepts/search.html" xlink:href="../concepts/search.html"><title>Search Index — click to learn</title>
+<path class="shape" d="M810,583 a70.0,8 0 0,0 140,0 a70.0,8 0 0,0 -140,0 v99 a70.0,8 0 0,0 140,0 v-99" fill="#FFF8E1" stroke="#F9A825" stroke-width="1.6" filter="url(#sh)"/>
+<path d="M810,583 a70.0,8 0 0,0 140,0" fill="none" stroke="#F9A825" stroke-width="1.2"/>
+<text x="880.0" y="634.5" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Search Index</text>
+<text x="880.0" y="648.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >Elasticsearch</text>
+</a>
+<a class="node" id="n-msgdb" data-concept="direct-messaging" data-label="Messages Store" href="../concepts/direct-messaging.html" xlink:href="../concepts/direct-messaging.html"><title>Messages Store — click to learn</title>
+<path class="shape" d="M962,583 a70.0,8 0 0,0 140,0 a70.0,8 0 0,0 -140,0 v99 a70.0,8 0 0,0 140,0 v-99" fill="#FFF8E1" stroke="#F9A825" stroke-width="1.6" filter="url(#sh)"/>
+<path d="M962,583 a70.0,8 0 0,0 140,0" fill="none" stroke="#F9A825" stroke-width="1.2"/>
+<text x="1032.0" y="634.5" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Messages Store</text>
+<text x="1032.0" y="648.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >Cassandra / HBase</text>
+</a>
+<a class="node" id="n-userdb" data-concept="databases" data-label="User DB" href="../concepts/databases.html" xlink:href="../concepts/databases.html"><title>User DB — click to learn</title>
+<path class="shape" d="M1114,583 a70.0,8 0 0,0 140,0 a70.0,8 0 0,0 -140,0 v99 a70.0,8 0 0,0 140,0 v-99" fill="#FFF8E1" stroke="#F9A825" stroke-width="1.6" filter="url(#sh)"/>
+<path d="M1114,583 a70.0,8 0 0,0 140,0" fill="none" stroke="#F9A825" stroke-width="1.2"/>
+<text x="1184.0" y="627.5" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >User DB</text>
+<text x="1184.0" y="641.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >PostgreSQL</text>
+<text x="1184.0" y="655.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >sharded + replicas</text>
+</a>
+<a class="node" id="n-kafka" data-concept="message-queues" data-label="Kafka — Event Bus" href="../concepts/message-queues.html" xlink:href="../concepts/message-queues.html"><title>Kafka — Event Bus — click to learn</title>
+<rect class="shape" x="1360" y="405" width="335" height="55" rx="8" fill="#F3E5F5" stroke="#6A1B9A" stroke-width="1.6" filter="url(#sh)"/>
+<text x="1527.5" y="429.5" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Kafka — Event Bus</text>
+<text x="1527.5" y="443.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >topics: posts · likes · comments · follows · stories</text>
+</a>
+<a class="node" id="n-indexer" data-concept="search" data-label="Search Indexer" href="../concepts/search.html" xlink:href="../concepts/search.html"><title>Search Indexer — click to learn</title>
+<rect class="shape" x="1375" y="515" width="305" height="55" rx="8" fill="#F3E5F5" stroke="#6A1B9A" stroke-width="1.6" filter="url(#sh)"/>
+<text x="1527.5" y="539.5" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Search Indexer</text>
+<text x="1527.5" y="553.5" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >updates Elasticsearch</text>
+</a>
+<a class="node" id="n-fanout" data-concept="news-feed" data-label="Feed Fan-out Workers" href="../concepts/news-feed.html" xlink:href="../concepts/news-feed.html"><title>Feed Fan-out Workers — click to learn</title>
+<rect class="shape" x="1375" y="590" width="305" height="60" rx="8" fill="#F3E5F5" stroke="#6A1B9A" stroke-width="1.6" filter="url(#sh)"/>
+<text x="1527.5" y="610.0" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Feed Fan-out Workers</text>
+<text x="1527.5" y="624.0" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >push post IDs to followers&#x27; timelines</text>
+<text x="1527.5" y="638.0" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >(pull model for celebrities)</text>
+</a>
+<a class="node" id="n-media" data-concept="media-processing" data-label="Media Processing Workers" href="../concepts/media-processing.html" xlink:href="../concepts/media-processing.html"><title>Media Processing Workers — click to learn</title>
+<rect class="shape" x="1375" y="670" width="305" height="60" rx="8" fill="#F3E5F5" stroke="#6A1B9A" stroke-width="1.6" filter="url(#sh)"/>
+<text x="1527.5" y="690.0" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Media Processing Workers</text>
+<text x="1527.5" y="704.0" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >resize · transcode · thumbnails</text>
+<text x="1527.5" y="718.0" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >content moderation</text>
+</a>
+<a class="node" id="n-notif" data-concept="notifications" data-label="Notification Service" href="../concepts/notifications.html" xlink:href="../concepts/notifications.html"><title>Notification Service — click to learn</title>
+<rect class="shape" x="1375" y="750" width="305" height="50" rx="8" fill="#F3E5F5" stroke="#6A1B9A" stroke-width="1.6" filter="url(#sh)"/>
+<text x="1527.5" y="772.0" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Notification Service</text>
+<text x="1527.5" y="786.0" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >likes · comments · follows · DMs</text>
+</a>
+<a class="node" id="n-analytics" data-concept="analytics-ml" data-label="Analytics &amp; ML Training" href="../concepts/analytics-ml.html" xlink:href="../concepts/analytics-ml.html"><title>Analytics &amp; ML Training — click to learn</title>
+<rect class="shape" x="1375" y="820" width="305" height="60" rx="8" fill="#F3E5F5" stroke="#6A1B9A" stroke-width="1.6" filter="url(#sh)"/>
+<text x="1527.5" y="840.0" font-size="13" font-weight="bold" fill="#212121" text-anchor="middle" >Analytics &amp; ML Training</text>
+<text x="1527.5" y="854.0" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >Spark / data warehouse</text>
+<text x="1527.5" y="868.0" font-size="11" font-weight="normal" fill="#455A64" text-anchor="middle" >feed &amp; Explore ranking models</text>
+</a>
+<a class="chip-link" data-concept="networking-basics" data-label="HTTPS · TLS · HTTP/2" href="../concepts/networking-basics.html" xlink:href="../concepts/networking-basics.html"><title>HTTPS · TLS · HTTP/2 — click to learn</title>
+<rect x="700" y="198" width="148" height="18" rx="9" fill="#FFFFFF" stroke="#546E7A" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="774.0" y="211" font-size="10.5" font-weight="600" fill="#546E7A" text-anchor="middle" >◆ HTTPS · TLS · HTTP/2</text>
+</a>
+<a class="chip-link" data-concept="rate-limiting" data-label="Rate limiting" href="../concepts/rate-limiting.html" xlink:href="../concepts/rate-limiting.html"><title>Rate limiting — click to learn</title>
+<rect x="795" y="262" width="104" height="18" rx="9" fill="#FFFFFF" stroke="#546E7A" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="847.0" y="275" font-size="10.5" font-weight="600" fill="#546E7A" text-anchor="middle" >◆ Rate limiting</text>
+</a>
+<a class="chip-link" data-concept="authentication" data-label="AuthN / AuthZ" href="../concepts/authentication.html" xlink:href="../concepts/authentication.html"><title>AuthN / AuthZ — click to learn</title>
+<rect x="795" y="284" width="104" height="18" rx="9" fill="#FFFFFF" stroke="#546E7A" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="847.0" y="297" font-size="10.5" font-weight="600" fill="#546E7A" text-anchor="middle" >◆ AuthN / AuthZ</text>
+</a>
+<a class="chip-link" data-concept="api-design" data-label="API design" href="../concepts/api-design.html" xlink:href="../concepts/api-design.html"><title>API design — click to learn</title>
+<rect x="795" y="306" width="85" height="18" rx="9" fill="#FFFFFF" stroke="#546E7A" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="837.5" y="319" font-size="10.5" font-weight="600" fill="#546E7A" text-anchor="middle" >◆ API design</text>
+</a>
+<a class="chip-link" data-concept="resilience-patterns" data-label="Resilience: timeouts · retries · circuit breakers" href="../concepts/resilience-patterns.html" xlink:href="../concepts/resilience-patterns.html"><title>Resilience: timeouts · retries · circuit breakers — click to learn</title>
+<rect x="760" y="391" width="331" height="18" rx="9" fill="#FFFFFF" stroke="#546E7A" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="925.5" y="404" font-size="10.5" font-weight="600" fill="#546E7A" text-anchor="middle" >◆ Resilience: timeouts · retries · circuit breakers</text>
+</a>
+<a class="chip-link" data-concept="microservices" data-label="Service discovery" href="../concepts/microservices.html" xlink:href="../concepts/microservices.html"><title>Service discovery — click to learn</title>
+<rect x="1110" y="391" width="129" height="18" rx="9" fill="#FFFFFF" stroke="#546E7A" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="1174.5" y="404" font-size="10.5" font-weight="600" fill="#546E7A" text-anchor="middle" >◆ Service discovery</text>
+</a>
+<a class="chip-link" data-concept="indexing" data-label="Indexing" href="../concepts/indexing.html" xlink:href="../concepts/indexing.html"><title>Indexing — click to learn</title>
+<rect x="312.0" y="551" width="72" height="18" rx="9" fill="#FFFFFF" stroke="#546E7A" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="348.0" y="564" font-size="10.5" font-weight="600" fill="#546E7A" text-anchor="middle" >◆ Indexing</text>
+</a>
+<a class="chip-link" data-concept="replication" data-label="Replication" href="../concepts/replication.html" xlink:href="../concepts/replication.html"><title>Replication — click to learn</title>
+<rect x="454.5" y="551" width="91" height="18" rx="9" fill="#FFFFFF" stroke="#546E7A" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="500.0" y="564" font-size="10.5" font-weight="600" fill="#546E7A" text-anchor="middle" >◆ Replication</text>
+</a>
+<a class="chip-link" data-concept="sharding" data-label="Sharding" href="../concepts/sharding.html" xlink:href="../concepts/sharding.html"><title>Sharding — click to learn</title>
+<rect x="616.0" y="551" width="72" height="18" rx="9" fill="#FFFFFF" stroke="#546E7A" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="652.0" y="564" font-size="10.5" font-weight="600" fill="#546E7A" text-anchor="middle" >◆ Sharding</text>
+</a>
+<a class="chip-link" data-concept="consistent-hashing" data-label="Consistent hashing" href="../concepts/consistent-hashing.html" xlink:href="../concepts/consistent-hashing.html"><title>Consistent hashing — click to learn</title>
+<rect x="736.5" y="551" width="135" height="18" rx="9" fill="#FFFFFF" stroke="#546E7A" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="804.0" y="564" font-size="10.5" font-weight="600" fill="#546E7A" text-anchor="middle" >◆ Consistent hashing</text>
+</a>
+<a class="chip-link" data-concept="id-generation" data-label="Snowflake IDs" href="../concepts/id-generation.html" xlink:href="../concepts/id-generation.html"><title>Snowflake IDs — click to learn</title>
+<rect x="904.0" y="551" width="104" height="18" rx="9" fill="#FFFFFF" stroke="#546E7A" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="956.0" y="564" font-size="10.5" font-weight="600" fill="#546E7A" text-anchor="middle" >◆ Snowflake IDs</text>
+</a>
+<a class="chip-link" data-concept="databases" data-label="SQL vs NoSQL" href="../concepts/databases.html" xlink:href="../concepts/databases.html"><title>SQL vs NoSQL — click to learn</title>
+<rect x="1059.0" y="551" width="98" height="18" rx="9" fill="#FFFFFF" stroke="#546E7A" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="1108.0" y="564" font-size="10.5" font-weight="600" fill="#546E7A" text-anchor="middle" >◆ SQL vs NoSQL</text>
+</a>
+<g class="xcut">
+<rect x="35" y="922" width="1680" height="62" rx="12" fill="#FAFAFA" stroke="#B0BEC5" stroke-dasharray="6 4"/>
+<text x="50" y="941" font-size="12.5" font-weight="bold" fill="#455A64" text-anchor="start" >Cross-cutting concepts — apply to every box above</text>
+<a class="chip-link" data-concept="how-to-approach" data-label="How to approach" href="../concepts/how-to-approach.html" xlink:href="../concepts/how-to-approach.html"><title>How to approach — click to learn</title>
+<rect x="50" y="954" width="116" height="18" rx="9" fill="#FFFFFF" stroke="#455A64" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="108.0" y="967" font-size="10.5" font-weight="600" fill="#455A64" text-anchor="middle" >◆ How to approach</text>
+</a>
+<a class="chip-link" data-concept="requirements" data-label="Requirements" href="../concepts/requirements.html" xlink:href="../concepts/requirements.html"><title>Requirements — click to learn</title>
+<rect x="174" y="954" width="98" height="18" rx="9" fill="#FFFFFF" stroke="#455A64" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="223.0" y="967" font-size="10.5" font-weight="600" fill="#455A64" text-anchor="middle" >◆ Requirements</text>
+</a>
+<a class="chip-link" data-concept="capacity-estimation" data-label="Capacity estimation" href="../concepts/capacity-estimation.html" xlink:href="../concepts/capacity-estimation.html"><title>Capacity estimation — click to learn</title>
+<rect x="280" y="954" width="142" height="18" rx="9" fill="#FFFFFF" stroke="#455A64" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="351.0" y="967" font-size="10.5" font-weight="600" fill="#455A64" text-anchor="middle" >◆ Capacity estimation</text>
+</a>
+<a class="chip-link" data-concept="core-principles" data-label="Scalability &amp; availability" href="../concepts/core-principles.html" xlink:href="../concepts/core-principles.html"><title>Scalability &amp; availability — click to learn</title>
+<rect x="430" y="954" width="186" height="18" rx="9" fill="#FFFFFF" stroke="#455A64" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="523.0" y="967" font-size="10.5" font-weight="600" fill="#455A64" text-anchor="middle" >◆ Scalability &amp; availability</text>
+</a>
+<a class="chip-link" data-concept="cap-consistency" data-label="CAP &amp; consistency" href="../concepts/cap-consistency.html" xlink:href="../concepts/cap-consistency.html"><title>CAP &amp; consistency — click to learn</title>
+<rect x="624" y="954" width="129" height="18" rx="9" fill="#FFFFFF" stroke="#455A64" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="688.5" y="967" font-size="10.5" font-weight="600" fill="#455A64" text-anchor="middle" >◆ CAP &amp; consistency</text>
+</a>
+<a class="chip-link" data-concept="resilience-patterns" data-label="Resilience" href="../concepts/resilience-patterns.html" xlink:href="../concepts/resilience-patterns.html"><title>Resilience — click to learn</title>
+<rect x="761" y="954" width="85" height="18" rx="9" fill="#FFFFFF" stroke="#455A64" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="803.5" y="967" font-size="10.5" font-weight="600" fill="#455A64" text-anchor="middle" >◆ Resilience</text>
+</a>
+<a class="chip-link" data-concept="multi-region" data-label="Multi-region &amp; DR" href="../concepts/multi-region.html" xlink:href="../concepts/multi-region.html"><title>Multi-region &amp; DR — click to learn</title>
+<rect x="854" y="954" width="129" height="18" rx="9" fill="#FFFFFF" stroke="#455A64" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="918.5" y="967" font-size="10.5" font-weight="600" fill="#455A64" text-anchor="middle" >◆ Multi-region &amp; DR</text>
+</a>
+<a class="chip-link" data-concept="observability" data-label="Observability" href="../concepts/observability.html" xlink:href="../concepts/observability.html"><title>Observability — click to learn</title>
+<rect x="991" y="954" width="104" height="18" rx="9" fill="#FFFFFF" stroke="#455A64" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="1043.0" y="967" font-size="10.5" font-weight="600" fill="#455A64" text-anchor="middle" >◆ Observability</text>
+</a>
+<a class="chip-link" data-concept="security" data-label="Security &amp; privacy" href="../concepts/security.html" xlink:href="../concepts/security.html"><title>Security &amp; privacy — click to learn</title>
+<rect x="1103" y="954" width="135" height="18" rx="9" fill="#FFFFFF" stroke="#455A64" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="1170.5" y="967" font-size="10.5" font-weight="600" fill="#455A64" text-anchor="middle" >◆ Security &amp; privacy</text>
+</a>
+<a class="chip-link" data-concept="request-flows" data-label="End-to-end flows" href="../concepts/request-flows.html" xlink:href="../concepts/request-flows.html"><title>End-to-end flows — click to learn</title>
+<rect x="1246" y="954" width="123" height="18" rx="9" fill="#FFFFFF" stroke="#455A64" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="1307.5" y="967" font-size="10.5" font-weight="600" fill="#455A64" text-anchor="middle" >◆ End-to-end flows</text>
+</a>
+<a class="chip-link" data-concept="interview-guide" data-label="Interview walkthrough" href="../concepts/interview-guide.html" xlink:href="../concepts/interview-guide.html"><title>Interview walkthrough — click to learn</title>
+<rect x="1377" y="954" width="154" height="18" rx="9" fill="#FFFFFF" stroke="#455A64" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="1454.0" y="967" font-size="10.5" font-weight="600" fill="#455A64" text-anchor="middle" >◆ Interview walkthrough</text>
+</a>
+</g>
+<text x="40" y="1026" font-size="12" font-weight="bold" fill="#212121" text-anchor="start" >Legend:</text>
+<rect x="96" y="1015" width="18" height="14" rx="3" fill="#E1F5FE" stroke="#0277BD"/>
+<text x="120" y="1026" font-size="11.5" font-weight="normal" fill="#212121" text-anchor="start" >Client</text>
+<rect x="180" y="1015" width="18" height="14" rx="3" fill="#FFF3E0" stroke="#EF6C00"/>
+<text x="204" y="1026" font-size="11.5" font-weight="normal" fill="#212121" text-anchor="start" >Edge / Networking</text>
+<rect x="341" y="1015" width="18" height="14" rx="3" fill="#E8F5E9" stroke="#2E7D32"/>
+<text x="365" y="1026" font-size="11.5" font-weight="normal" fill="#212121" text-anchor="start" >Service</text>
+<rect x="432" y="1015" width="18" height="14" rx="3" fill="#F3E5F5" stroke="#6A1B9A"/>
+<text x="456" y="1026" font-size="11.5" font-weight="normal" fill="#212121" text-anchor="start" >Async / Streaming</text>
+<rect x="593" y="1015" width="18" height="14" rx="3" fill="#FFF8E1" stroke="#F9A825"/>
+<text x="617" y="1026" font-size="11.5" font-weight="normal" fill="#212121" text-anchor="start" >Storage</text>
+<rect x="684" y="1015" width="18" height="14" rx="3" fill="#ECEFF1" stroke="#455A64"/>
+<text x="708" y="1026" font-size="11.5" font-weight="normal" fill="#212121" text-anchor="start" >External</text>
+<path d="M782,1022 L822,1022" fill="none" stroke="#424242" stroke-width="1.6" marker-end="url(#a-sync)"/>
+<text x="830" y="1026" font-size="11.5" font-weight="normal" fill="#212121" text-anchor="start" >Synchronous request</text>
+<path d="M975.5,1022 L1015.5,1022" fill="none" stroke="#7B1FA2" stroke-width="1.6" marker-end="url(#a-evt)"/>
+<text x="1023.5" y="1026" font-size="11.5" font-weight="normal" fill="#212121" text-anchor="start" >Event / async flow</text>
+<path d="M1162.5,1022 L1202.5,1022" fill="none" stroke="#78909C" stroke-width="1.6" stroke-dasharray="6 4" marker-end="url(#a-dash)"/>
+<text x="1210.5" y="1026" font-size="11.5" font-weight="normal" fill="#212121" text-anchor="start" >Media delivery / push / DNS</text>
+</svg>

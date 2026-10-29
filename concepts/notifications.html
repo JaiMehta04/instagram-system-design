@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notification System — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="notifications">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>Notifications come in four channels: <strong>push</strong> (APNs for iOS, FCM for Android), the <strong>in-app activity feed</strong> (the ♥ tab), <strong>email</strong> and <strong>SMS</strong>. Each has different cost, latency, reliability and annoyance profiles.</li>
+    <li>The pipeline is asynchronous: domain events from <strong>Kafka</strong> → Notification Service → <strong>preferences &amp; mute checks</strong> → <strong>aggregation</strong> ("maya and 20 others liked your post") → <strong>template rendering &amp; localization</strong> → <strong>rate limits &amp; quiet hours</strong> → <strong>priority queues</strong> → <strong>delivery workers</strong> → APNs/FCM.</li>
+    <li>A <strong>device token registry</strong> maps users to their devices; tokens are refreshed on app start and <strong>pruned</strong> when providers report them invalid.</li>
+    <li>Delivery is <strong>at-least-once with retries and exponential backoff</strong>; <strong>idempotency keys</strong> and provider <strong>collapse IDs</strong> stop users from seeing duplicates.</li>
+    <li>Celebrity events can create <strong>millions of notifications at once</strong>: throttle, stagger and prioritise, both to respect provider limits and to avoid a thundering herd of app opens.</li>
+    <li>Everything is measured (sent → delivered → opened → disabled) and <strong>experimented on</strong>, because a notification system's real enemy is user fatigue, not throughput.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why are notifications hard?</h2>
+<p>"Maya liked your photo." It seems trivial: when a like happens, send a push. But consider what Instagram has to get right:</p>
+<ul>
+  <li><strong>Volume</strong>: billions of likes, comments, follows and mentions per day. Turning every event into a push would mean hundreds of thousands of pushes per second — and furious users.</li>
+  <li><strong>Relevance and restraint</strong>: a post going viral gets 50,000 likes in an hour. Nobody wants 50,000 pushes. They want <em>one</em>: "maya and 49,999 others liked your post" — and maybe not at 3 a.m.</li>
+  <li><strong>Many channels, many rules</strong>: push vs in-app vs email vs SMS; per-category user settings; muted accounts; blocked users; OS-level permission; language and time zone.</li>
+  <li><strong>External dependencies</strong>: the last hop goes through Apple and Google, which have their own APIs, rate limits, error codes and failure modes — and they don't tell you whether the user actually saw anything.</li>
+  <li><strong>Correctness under retries</strong>: duplicates are very visible ("why did I get this twice?"), but so are losses for important notifications like login codes and DMs.</li>
+  <li><strong>Spikes</strong>: a celebrity going live can mean "notify 10 million followers <em>now</em>" — and then 10 million people open the app at the same moment.</li>
+</ul>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  Think of a great <strong>personal assistant</strong> handling your mail. They don't run into your meeting every time a letter arrives. They know which senders you've asked to ignore (preferences, mutes), they <strong>bundle</strong> twenty fan letters into one note ("you got 20 fan letters, including one from Maya"), they write it in <strong>your language</strong>, they don't call you at 3 a.m. unless the house is on fire (quiet hours, priority), they use the right channel (a text for urgent things, a summary email for the weekly digest), they keep an up-to-date list of your <strong>phone numbers</strong> (device tokens), and they notice which messages you actually read so they can do better next week (tracking and experiments).
+</div>
+
+<h2>2. Types of notifications and requirements</h2>
+
+<h3>2.1 The four channels</h3>
+<div class="table-wrap"><table>
+  <tr><th>Channel</th><th>How it reaches the user</th><th>Latency</th><th>Cost</th><th>Typical Instagram use</th></tr>
+  <tr><td><b>Push</b></td><td>Via Apple Push Notification service (APNs) or Firebase Cloud Messaging (FCM) to the OS, which shows a banner even when the app is closed</td><td>Seconds (best-effort)</td><td>Free per message, but costly in user attention — users can disable it with one tap</td><td>Likes, comments, mentions, follows, DMs, live videos, posts from accounts with post notifications on</td></tr>
+  <tr><td><b>In-app activity feed</b></td><td>Stored server-side; shown in the Activity (♥) tab with an unread badge</td><td>Visible next time the user looks</td><td>Storage only</td><td>Everything, including low-priority items that never get a push</td></tr>
+  <tr><td><b>Email</b></td><td>Via an email delivery service (SMTP/API)</td><td>Seconds to minutes</td><td>Fractions of a cent each</td><td>Security alerts, password resets, digests of missed activity, re-engagement</td></tr>
+  <tr><td><b>SMS</b></td><td>Via SMS gateways / carriers</td><td>Seconds</td><td>Real money per message (varies by country), fraud risk</td><td>Login verification codes, account recovery — rarely anything else</td></tr>
+</table></div>
+<p>A single event may produce output on several channels: a new comment creates an in-app activity item <em>and</em> (if allowed) a push. A login from a new device produces an in-app security alert, a push <em>and</em> an email.</p>
+
+<h3>2.2 Functional requirements</h3>
+<ul>
+  <li>Generate notifications from domain events: like, comment, reply, mention, tag, follow / follow request, DM, live, story mention, new post from a "post notifications on" account, security events.</li>
+  <li>Respect <strong>per-user preferences</strong> per category and channel, muted accounts/threads, blocks, and OS permission.</li>
+  <li><strong>Aggregate</strong> similar events ("X and 20 others…").</li>
+  <li>Render in the recipient's <strong>language</strong> with correct plurals, names and deep links.</li>
+  <li>Enforce <strong>rate limits</strong> and <strong>quiet hours</strong>; prioritise urgent notifications.</li>
+  <li>Maintain an <strong>in-app activity feed</strong> with unread counts.</li>
+  <li><strong>Track</strong> delivery and opens; support A/B experiments.</li>
+</ul>
+
+<h3>2.3 Non-functional requirements</h3>
+<ul>
+  <li><strong>Latency</strong>: high-priority (DMs, login codes) within a couple of seconds; social notifications within seconds to minutes (aggregation deliberately delays some).</li>
+  <li><strong>Reliability</strong>: no loss of critical notifications; occasional loss of a low-priority "like" push is acceptable (it's still in the activity feed).</li>
+  <li><strong>No duplicates</strong> visible to users.</li>
+  <li><strong>Scalability</strong> to billions of events per day and multi-million spikes.</li>
+  <li><strong>Isolation</strong>: notification problems must never slow down posting, liking or the feed — the whole system is downstream of Kafka.</li>
+</ul>
+
+<h3>2.4 Back-of-the-envelope (assumptions)</h3>
+<pre><code>Input events/day (assumptions): likes 4B, comments 500M, follows 300M,
+  mentions/tags 200M, DMs 12B (handled mostly in-chat), lives/new-post subscriptions ~1B fan-out
+Notification-worthy social events ≈ 5-6B/day → ~65,000/s average, ~200,000/s peak
+
+After preferences, mutes, aggregation, caps:
+  In-app activity writes ≈ 3B/day  (~35k/s; aggregated items are UPSERTS, not new rows)
+  Push sends          ≈ 2-3B/day (~30k/s average, ~100k/s+ at peak and during spikes)
+  Email               ≈ 100M/day; SMS ≈ 10-20M/day (mostly verification codes)
+
+Push payload ≈ 1-2 KB → 3B × 1.5 KB ≈ 4.5 TB/day of outbound API traffic to APNs/FCM
+Tracking events (created, sent, opened, dismissed…) ≈ 5× pushes ≈ 15B/day → data warehouse</code></pre>
+<p>The headline: <strong>aggregation and filtering cut the event stream roughly in half or more</strong> before anything is sent, and tracking data is several times larger than the notifications themselves.</p>
+
+<h2>3. Architecture overview</h2>
+
+<div class="diagram">
+<svg viewBox="0 0 880 400" width="880" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-nt-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <!-- row 0: stores -->
+  <rect x="370" y="15" width="150" height="46" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="445" y="35" text-anchor="middle" font-weight="600">User prefs</text><text x="445" y="52" text-anchor="middle" font-size="11">KV store + cache</text>
+  <rect x="560" y="15" width="150" height="46" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="635" y="35" text-anchor="middle" font-weight="600">Activity feed</text><text x="635" y="52" text-anchor="middle" font-size="11">Cassandra (in-app)</text>
+  <!-- row 1 -->
+  <rect x="20" y="110" width="140" height="50" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="90" y="131" text-anchor="middle" font-weight="600">Kafka</text><text x="90" y="148" text-anchor="middle" font-size="11">like, comment, follow…</text>
+  <rect x="190" y="110" width="150" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="265" y="131" text-anchor="middle" font-weight="600">Notification Svc</text><text x="265" y="148" text-anchor="middle" font-size="11">resolve recipients</text>
+  <rect x="370" y="110" width="150" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="445" y="131" text-anchor="middle" font-weight="600">Prefs &amp; mutes</text><text x="445" y="148" text-anchor="middle" font-size="11">drop if disabled</text>
+  <rect x="560" y="110" width="150" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="635" y="131" text-anchor="middle" font-weight="600">Aggregator</text><text x="635" y="148" text-anchor="middle" font-size="11">"X and 20 others"</text>
+  <rect x="740" y="110" width="130" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="805" y="131" text-anchor="middle" font-weight="600">Renderer</text><text x="805" y="148" text-anchor="middle" font-size="11">template + i18n</text>
+  <!-- row 2 (right to left) -->
+  <rect x="730" y="225" width="140" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="800" y="246" text-anchor="middle" font-weight="600">Rate limits</text><text x="800" y="263" text-anchor="middle" font-size="11">quiet hours, caps</text>
+  <rect x="540" y="225" width="150" height="50" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="615" y="246" text-anchor="middle" font-weight="600">Priority queues</text><text x="615" y="263" text-anchor="middle" font-size="11">high / normal / low</text>
+  <rect x="350" y="225" width="150" height="50" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="425" y="246" text-anchor="middle" font-weight="600">Delivery workers</text><text x="425" y="263" text-anchor="middle" font-size="11">push · email · SMS</text>
+  <rect x="180" y="225" width="140" height="50" rx="8" fill="#eceff1" stroke="#455a64"/><text x="250" y="246" text-anchor="middle" font-weight="600">APNs / FCM</text><text x="250" y="263" text-anchor="middle" font-size="11">email &amp; SMS gateways</text>
+  <rect x="20" y="225" width="130" height="50" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="85" y="255" text-anchor="middle" font-weight="600">📱 Devices</text>
+  <!-- row 3 -->
+  <rect x="350" y="330" width="150" height="46" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="425" y="350" text-anchor="middle" font-weight="600">Device tokens</text><text x="425" y="367" text-anchor="middle" font-size="11">registry</text>
+  <rect x="20" y="330" width="280" height="46" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="160" y="350" text-anchor="middle" font-weight="600">Tracking events → Kafka</text><text x="160" y="367" text-anchor="middle" font-size="11">sent, invalid token, opened → warehouse</text>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-nt-1)">
+    <path d="M160,135 L188,135"/><path d="M340,135 L368,135"/><path d="M520,135 L558,135"/><path d="M710,135 L738,135"/>
+    <path d="M445,110 L445,63"/><path d="M635,110 L635,63"/>
+    <path d="M805,160 L801,223"/>
+    <path d="M730,250 L692,250"/><path d="M540,250 L502,250"/><path d="M350,250 L322,250"/><path d="M180,250 L152,250"/>
+    <path d="M425,275 L425,328"/>
+    <path d="M250,275 L200,328"/>
+  </g>
+  <text x="440" y="305" font-size="11" fill="#555">lookup tokens</text>
+  <text x="560" y="88" font-size="11" fill="#555">in-app item</text>
+</svg>
+<div class="caption">The notification pipeline: filter early, aggregate, render late, rate-limit, queue by priority, deliver through providers, and feed results back.</div>
+</div>
+
+<p>Each box is a stage that can be scaled independently, and every stage boundary is a queue or topic (see <a href="message-queues.html">Message queues &amp; Kafka</a>), so a slow provider never backs up into the services that produce events. Let's walk through the stages.</p>
+
+<h2>4. The pipeline, stage by stage</h2>
+
+<h3>4.1 Ingest: events and recipient resolution</h3>
+<p>Producer services don't call the Notification Service directly; they publish domain events they would publish anyway — the <a href="likes-comments.html">Like &amp; Comment Service</a> emits <code>like.created</code>, the <a href="social-graph.html">Follow Service</a> emits <code>follow.created</code>, and so on. The Notification Service is just another consumer group on those Kafka topics.</p>
+<pre><code>{ "event_id": "evt_01HF3K9...",          // unique, used for idempotency
+  "type": "like.created",
+  "actor_id": 4821,                       // maya
+  "object": { "type": "post", "id": 3170538912345678, "owner_id": 17 },
+  "ts": 1730000000123 }</code></pre>
+<p>The first job is <strong>recipient resolution</strong> — who should hear about this event?</p>
+<div class="table-wrap"><table>
+  <tr><th>Event</th><th>Recipients</th></tr>
+  <tr><td>Like on a post</td><td>The post owner (not the liker; never notify yourself)</td></tr>
+  <tr><td>Comment</td><td>Post owner + users @mentioned in the comment + (for replies) the parent comment's author</td></tr>
+  <tr><td>Follow / follow request</td><td>The followed account</td></tr>
+  <tr><td>Mention / tag in a post or story</td><td>Each mentioned/tagged user</td></tr>
+  <tr><td>New post / live video</td><td>Followers who turned on post/live notifications for that account — a <strong>fan-out</strong> (section 7)</td></tr>
+  <tr><td>DM</td><td>Conversation members who are offline (see <a href="direct-messaging.html">Direct messaging</a>)</td></tr>
+  <tr><td>Security (new login, password change)</td><td>The account owner, on all channels</td></tr>
+</table></div>
+<p>The output is a stream of <strong>(recipient, notification candidate)</strong> pairs, partitioned by <code>recipient_id</code> so that all of one user's notifications are processed by the same worker — which makes per-user aggregation, rate limiting and ordering simple and lock-free.</p>
+
+<h3>4.2 Preferences and mute checks: filter early</h3>
+<p>The cheapest notification is the one you drop first. Before any expensive work, check:</p>
+<ul>
+  <li><strong>Category/channel settings</strong>: e.g. likes → push "From people I follow", comments → "From everyone", email digests off. Stored as a small document per user (user_id → settings), read through a cache — this lookup happens for every candidate, so it must be a sub-millisecond cache hit.</li>
+  <li><strong>Relationship filters</strong>: has the recipient muted or blocked the actor? Is the actor restricted? Is the actor's account flagged as spam? (Spammy accounts generate a lot of notifications; suppressing them protects users.)</li>
+  <li><strong>Object state</strong>: has the comment already been deleted? Has the like been undone? (Re-checked again at send time for delayed notifications.)</li>
+  <li><strong>"Pause all"</strong> and per-thread mutes.</li>
+  <li><strong>Channel availability</strong>: does the user have any registered device tokens with push permission? If not, only the in-app item is created.</li>
+</ul>
+<p>Filtering happens per channel: a like might be suppressed for push but still recorded in the activity feed.</p>
+
+<h3>4.3 Aggregation and batching</h3>
+<p>Aggregation turns many similar events into one notification. The <strong>aggregation key</strong> identifies "the same kind of thing about the same object for the same person":</p>
+<pre><code>agg_key = (recipient_id, type, object_id)      e.g. (17, "like", post 3170538912345678)</code></pre>
+<p>A common strategy is <strong>"first one fast, then batch"</strong>:</p>
+<ol class="steps">
+  <li>The first like on a post in a window → create the activity item and send a push quickly (users like immediate feedback on the first reaction).</li>
+  <li>Further likes within the window (say 15–60 minutes) → update the aggregate (count, latest actors) and the in-app item, but <strong>don't push</strong> yet.</li>
+  <li>When the window closes — or when the count crosses a milestone (10, 50, 100, 1,000…) — send <strong>one</strong> aggregated push: "maya, arjun and 48 others liked your post".</li>
+  <li>The aggregated push uses the same <strong>collapse ID</strong> as the earlier one, so on the device it <em>replaces</em> the previous banner instead of stacking a new one.</li>
+</ol>
+<pre><code># Aggregation state in Redis (one hash per agg_key), processed by the recipient's worker
+HINCRBY agg:17:like:3170538912345678  count 1
+LPUSH   agg:17:like:3170538912345678:actors 4821
+LTRIM   agg:17:like:3170538912345678:actors 0 2        # keep the 3 most recent actors for display
+EXPIRE  agg:17:like:3170538912345678  3600
+
+def on_like(recipient, post, actor):
+    key = f"agg:{recipient}:like:{post}"
+    count = redis.hincrby(key, "count", 1)
+    activity_store.upsert(recipient, key, actor, count)          # in-app item, always fresh
+    if count == 1:
+        enqueue_push(recipient, key, priority="normal")          # first like: send soon
+        schedule_flush(key, delay_s=window_for(recipient))       # delay queue / timer
+    elif count in MILESTONES:                                    # 10, 50, 100, 1000 ...
+        enqueue_push(recipient, key, priority="low")
+
+def on_flush(key):                                               # window closed
+    if redis.hget(key, "count") &gt; redis.hget(key, "count_at_last_push"):
+        enqueue_push(recipient_of(key), key, priority="low")     # one summary push</code></pre>
+<ul>
+  <li><strong>Windows adapt</strong>: a user who gets 3 likes a day can get every like quickly; a creator getting 10,000 likes an hour gets milestone summaries. The window can be chosen per user (and tuned by experiments, section 10).</li>
+  <li><strong>Different types aggregate differently</strong>: likes and follows aggregate heavily; comments aggregate per post but show the comment text of the latest one; DMs and security alerts are <em>never</em> aggregated away.</li>
+  <li><strong>Retractions</strong>: if a like is undone before the push is sent, decrement the aggregate; if the count drops to zero, cancel the pending push and remove the activity item.</li>
+</ul>
+
+<h3>4.4 Template rendering and localization</h3>
+<p>Notifications are never stored as final text. Each is a <strong>structured record</strong> (type, actors, count, object, deep link) plus a <strong>template ID</strong>, rendered as late as possible — at send time for pushes, at read time for the activity feed — so that names, counts and language are current.</p>
+<pre><code># template "like_post_agg" in ICU MessageFormat (handles plurals per language)
+en: "{actor1}{count, plural,
+        =1 { liked your post.}
+        =2 { and {actor2} liked your post.}
+        other { and {others, number} others liked your post.}}"
+hi: "{actor1}{count, plural, =1 { ने आपकी पोस्ट पसंद की।} other { और {others, number} अन्य लोगों ने आपकी पोस्ट पसंद की।}}"
+
+render(template="like_post_agg", locale="en-IN",
+       args={actor1:"maya", actor2:"arjun", count:50, others:48})
+→ "maya and 48 others liked your post."</code></pre>
+<ul>
+  <li><strong>Locale and plural rules</strong>: languages have different plural categories (English has 2 forms, Arabic 6, Japanese 1). Never build sentences by string concatenation; use a localization library with per-language plural rules, number formatting, and right-to-left (RTL) support.</li>
+  <li><strong>Recipient's locale, not the actor's</strong>, from the user profile/device registry.</li>
+  <li><strong>Safe truncation</strong>: comment previews are cut on grapheme boundaries (don't split an emoji) and stay within provider limits (APNs and FCM payloads are capped at 4 KB).</li>
+  <li><strong>Deep links</strong>: the payload carries a URI such as <code>instagram://media?id=3170538912345678&amp;comment=…</code> plus a <code>notification_id</code> for open tracking.</li>
+  <li><strong>Rich media</strong>: a thumbnail URL (signed <a href="cdn.html">CDN</a> URL) that the app's notification extension downloads to show an image in the banner.</li>
+  <li><strong>Privacy-aware text</strong>: DM previews may be hidden ("New message") depending on settings or E2EE, where the server can't read the content.</li>
+</ul>
+
+<h3>4.5 Rate limits, fatigue and quiet hours</h3>
+<p>Even after aggregation, an active user can receive a lot. Over-notifying has a real cost: users <strong>turn off push</strong> or uninstall, and a disabled channel is very hard to win back. Guards:</p>
+<ul>
+  <li><strong>Per-user caps</strong>: e.g. at most N non-critical pushes per hour and M per day (a <a href="rate-limiting.html">token bucket</a> per user, stored in Redis). Excess notifications are dropped from push but remain in the in-app feed.</li>
+  <li><strong>Per-category caps</strong>: e.g. at most one "suggested account" push per day.</li>
+  <li><strong>Quiet hours</strong>: using the device's time zone, defer low-priority pushes during the night (e.g. 23:00–08:00) to a <strong>delay queue</strong>; at wake-up, send a single summary instead of the backlog. Critical notifications (login codes, security alerts, DMs per user settings) bypass quiet hours.</li>
+  <li><strong>Relevance models</strong>: large platforms use ML to predict, for each candidate, the probability of an open versus the probability the user disables notifications, and send only when the expected value is positive. The volume budget per user becomes a learned quantity rather than a fixed constant.</li>
+  <li><strong>Global and per-provider limits</strong>: protect APNs/FCM quotas and your own backend from self-inflicted spikes (section 7).</li>
+</ul>
+<div class="callout warn"><span class="callout-title">⚠️ Expiry matters</span>
+A deferred notification can become wrong: "maya is live now" is useless after the live video has ended, and a comment notification is embarrassing if the comment was deleted. Every notification carries an <strong>expiry</strong>, and the delivery worker re-validates the object state just before sending. Providers support this too (APNs <code>apns-expiration</code>, FCM <code>ttl</code>): if the device is unreachable until after expiry, the provider drops it.</div>
+
+<h3>4.6 Priority queues</h3>
+<p>Not all notifications are equal, and they must not share a single queue. If a celebrity's post generates 5 million low-value pushes, a login code queued behind them would arrive 10 minutes late. So the pipeline uses <strong>separate queues (Kafka topics or queue partitions) per priority</strong>, each with dedicated worker capacity — a <em>bulkhead</em> (see <a href="resilience-patterns.html">Resilience patterns</a>).</p>
+<div class="table-wrap"><table>
+  <tr><th>Priority</th><th>Examples</th><th>Target latency</th><th>Treatment</th></tr>
+  <tr><td><b>Critical / high</b></td><td>Login/2FA codes, security alerts, DMs, incoming call</td><td>&lt; 1–2 s</td><td>Never aggregated or capped; bypass quiet hours; reserved worker capacity; retried aggressively; may fall back to SMS/email</td></tr>
+  <tr><td><b>Normal</b></td><td>Comments, mentions, tags, follows, first like</td><td>Seconds</td><td>Aggregated, capped, quiet hours respected</td></tr>
+  <tr><td><b>Low</b></td><td>Like summaries, milestones, "X posted for the first time in a while", suggestions</td><td>Minutes to hours</td><td>Heavily aggregated, deferrable, first to be shed under load</td></tr>
+  <tr><td><b>Bulk / scheduled</b></td><td>Celebrity fan-out, digests, re-engagement emails</td><td>Minutes; spread over time</td><td>Throttled, staggered, run on separate infrastructure</td></tr>
+</table></div>
+<p>Workers pull from the high-priority queue first (strict priority) or use weighted scheduling so that low-priority work still progresses. A <strong>delay queue</strong> (e.g. a sorted set keyed by send-time, or a scheduler service) holds deferred items for quiet hours and aggregation windows.</p>
+
+<h3>4.7 Delivery workers and the push providers</h3>
+<p>Delivery workers take a rendered notification, look up the recipient's device tokens, call the right provider for each device, and report outcomes. You can't push to a phone directly — the OS vendors run the only connection that can wake a sleeping device:</p>
+<div class="flow">
+  <div class="fnode async">Delivery worker<small>payload + token</small></div><div class="farrow">→<small>HTTP/2 + JWT</small></div>
+  <div class="fnode ext">APNs<small>Apple</small></div><div class="farrow">→<small>OS-held connection</small></div>
+  <div class="fnode client">📱 iPhone<small>banner</small></div>
+</div>
+<div class="flow">
+  <div class="fnode async">Delivery worker<small>payload + token</small></div><div class="farrow">→<small>HTTPS, FCM v1 API</small></div>
+  <div class="fnode ext">FCM<small>Google</small></div><div class="farrow">→<small>OS-held connection</small></div>
+  <div class="fnode client">📱 Android<small>banner</small></div>
+</div>
+<pre><code># APNs request (HTTP/2) — one stream per notification, many streams per connection
+POST /3/device/&lt;device_token&gt;
+authorization: bearer &lt;JWT signed with the app's .p8 key&gt;
+apns-topic: com.example.instagram
+apns-push-type: alert
+apns-priority: 10                       # 10 = immediate, 5 = power-friendly
+apns-expiration: 1730003600             # drop if not deliverable by then
+apns-collapse-id: like:3170538912345678 # newer push with same id replaces older
+apns-id: 6f1c2d4e-...                   # our notification id (UUID)
+{ "aps": { "alert": { "title": "Instagram", "body": "maya and 48 others liked your post." },
+           "badge": 7, "sound": "default", "thread-id": "post-3170538912345678",
+           "mutable-content": 1 },
+  "deeplink": "instagram://media?id=3170538912345678", "nid": "n_8e1f..." }
+
+# Responses the worker must handle
+200                      → accepted by APNs (NOT the same as displayed!)
+400 BadDeviceToken       → token malformed / wrong environment → delete token
+410 Unregistered         → app uninstalled / token invalid      → delete token
+429 TooManyRequests      → back off and retry
+500 / 503                → provider trouble → retry with exponential backoff</code></pre>
+<ul>
+  <li><strong>Connections</strong>: APNs uses HTTP/2, so one TLS connection multiplexes many concurrent requests; workers keep pools of long-lived connections (see <a href="networking-basics.html">Networking basics</a>). FCM's HTTP v1 API is similar (OAuth2 access token, JSON body; <code>UNREGISTERED</code> error for dead tokens; <code>collapse_key</code> / <code>android.ttl</code> for collapsing and expiry).</li>
+  <li><strong>"Accepted" ≠ "delivered" ≠ "seen"</strong>: providers only confirm they accepted the message. They store-and-forward a limited number per device while it's offline (APNs keeps only the most recent one per app; FCM keeps a bounded number), and may collapse or drop. Real delivery confirmation requires the app to report back (section 8).</li>
+  <li><strong>Silent / data pushes</strong> (no banner) can wake the app to sync content — e.g. pre-fetch the DM before the user opens it — but the OS throttles them heavily, so never rely on them.</li>
+  <li><strong>Email and SMS workers</strong> follow the same pattern with different providers (an email delivery API; an SMS aggregator), with extra concerns: email bounce/complaint handling and unsubscribe links; SMS cost control and fraud ("SMS pumping" attacks that trigger codes to premium numbers — rate-limit and verify).</li>
+</ul>
+
+<h2>5. The device token registry</h2>
+<p>A <strong>device token</strong> is an opaque string issued by APNs/FCM to one installation of the app on one device; it's the "address" for push. Users have several devices, tokens change, and apps get uninstalled — so tokens need a well-maintained registry.</p>
+<pre><code>device_tokens  (partition key: user_id)
+  user_id      bigint
+  device_id    text        -- stable per installation (generated by the app)
+  platform     text        -- ios | android | web
+  token        text        -- APNs / FCM token (unique index token → user for reassignment)
+  environment  text        -- production | sandbox (APNs)
+  app_version  text
+  locale       text        -- e.g. "hi-IN"   (used for rendering)
+  timezone     text        -- e.g. "Asia/Kolkata" (used for quiet hours)
+  push_enabled boolean     -- OS permission as last reported by the app
+  last_seen_at timestamp
+  PRIMARY KEY (user_id, device_id)</code></pre>
+<h3>5.1 Token lifecycle</h3>
+<ol class="steps">
+  <li><strong>Register</strong>: on every app start (and when the OS reports a new token), the app calls <code>PUT /devices/{device_id}</code> with its current token, permission state, locale and time zone. Upsert is idempotent.</li>
+  <li><strong>Rotate</strong>: tokens can change after OS updates, app reinstalls or restores; the newest registration for a device_id wins.</li>
+  <li><strong>Reassign</strong>: if user A logs out and user B logs in on the same phone, the same token now belongs to B. The unique token index lets registration remove it from A — otherwise A's notifications would appear on B's phone, a privacy bug.</li>
+  <li><strong>Logout</strong>: delete the device's token row (and tell the app to stop showing cached notifications).</li>
+  <li><strong>Prune on feedback</strong>: when APNs answers <code>410 Unregistered</code>/<code>BadDeviceToken</code> or FCM answers <code>UNREGISTERED</code>, the delivery worker emits a <code>token.invalid</code> event and the registry deletes that token.</li>
+  <li><strong>Prune stale tokens</strong>: a periodic job removes tokens not seen for, say, 60–90 days — they almost certainly belong to abandoned installs and waste send capacity.</li>
+</ol>
+<p>Why pruning matters: without it, a growing fraction of every send goes to dead tokens. If 30% of tokens are dead, 30% of provider calls and worker capacity are wasted, and providers may view high invalid-token rates as abusive. Reads of the registry are a single-partition lookup per recipient (cached), so it scales simply by <a href="sharding.html">sharding</a> on user_id.</p>
+
+<h2>6. Reliability: retries, dedup and ordering</h2>
+
+<h3>6.1 Retries with backoff</h3>
+<p>Failures happen at every step: a worker crashes mid-batch, APNs returns 503, a network blip times out a request. The rules (see <a href="resilience-patterns.html">Resilience patterns</a>):</p>
+<ul>
+  <li><strong>Retry transient errors only</strong> (timeouts, 429, 5xx). Never retry permanent errors (410, 400 BadDeviceToken, payload too large) — prune or drop and log.</li>
+  <li><strong>Exponential backoff with jitter</strong>: wait ~1 s, 2 s, 4 s, 8 s… with randomisation, so thousands of workers don't retry in lockstep against a recovering provider. Honour <code>Retry-After</code> headers.</li>
+  <li><strong>Bounded attempts and expiry</strong>: after N attempts or once the notification's expiry passes, give up and move it to a <strong>dead-letter queue</strong> for inspection. A "like" from 3 hours ago is not worth delivering late.</li>
+  <li><strong>Circuit breaker</strong> per provider: if FCM is failing broadly, stop hammering it, buffer high-priority items, shed low-priority ones.</li>
+  <li><strong>Fallback channels</strong> for critical messages: if a login-code push isn't confirmed quickly, offer SMS/email.</li>
+</ul>
+
+<h3>6.2 Deduplication with idempotency keys</h3>
+<p>Kafka consumers are <strong>at-least-once</strong>: after a crash, a worker reprocesses events whose offsets weren't committed, and a retry after a lost provider response may resend something that was actually delivered. Users must not get the same push twice. Layers of dedup:</p>
+<ol>
+  <li><strong>Event-level</strong>: the Notification Service records processed <code>event_id</code>s (or makes processing naturally idempotent — e.g. adding actor 4821 to an aggregate set twice has no effect).</li>
+  <li><strong>Notification-level idempotency key</strong>: each outgoing notification gets a deterministic ID, e.g. <code>nid = hash(recipient, type, object_id, aggregation_window, version)</code>. Before sending, the worker does <code>SET sent:{nid} 1 NX EX 86400</code> in Redis; if the key already exists, the send is skipped. Deterministic means a reprocessed event produces the <em>same</em> nid, so the check catches it.</li>
+  <li><strong>Device-level</strong>: the same <code>apns-collapse-id</code> / FCM <code>collapse_key</code> makes a duplicate replace rather than stack; the app can also ignore an <code>nid</code> it has already displayed.</li>
+</ol>
+<div class="callout tip"><span class="callout-title">💡 Mark before or after sending?</span>
+If you set the "sent" marker <em>before</em> calling APNs and then crash, the notification is never sent (at-most-once). If you set it <em>after</em> and crash in between, it may be sent twice (at-least-once). For social notifications, prefer a short "in-progress" lease before sending and "sent" after — a crash causes at most a rare duplicate that collapse IDs then hide. For critical codes, prefer at-least-once: a duplicate login code is harmless; a missing one locks the user out.</div>
+
+<h3>6.3 Ordering</h3>
+<p>Global ordering of notifications is neither possible (providers don't guarantee order) nor needed. What matters:</p>
+<ul>
+  <li><strong>Per-user processing order</strong>: partitioning by recipient_id keeps one user's events in order through the pipeline, which makes aggregation and caps consistent.</li>
+  <li><strong>Display order</strong>: the activity feed sorts by the item's <em>last updated</em> time, so an aggregate that gained a like moves to the top. The app sorts pushes in its notification center by timestamp, and collapse IDs ensure the newest version of an aggregate wins even if an older push arrives late.</li>
+  <li><strong>Causality checks</strong>: "maya commented" must not be sent if a later "comment deleted" event was already processed — hence re-validation of object state at send time, rather than trusting event order.</li>
+</ul>
+
+<h2>7. Celebrity events: millions of notifications at once</h2>
+<p>Two different celebrity problems hit the notification system, one on each side.</p>
+
+<h3>7.1 Outbound: a celebrity posts or goes live</h3>
+<p>Followers can turn on "post notifications" or "live notifications" for an account. For an account with 400M followers, assume 2% did → <strong>8 million pushes</strong> for one event. Doing this naively has three failure modes: it floods the shared queues (delaying everyone's DMs), it can exceed provider throughput, and — most dangerously — it makes <strong>millions of people open the app in the same minute</strong>, all requesting the same post, the feed, the profile and the media: a self-inflicted thundering herd.</p>
+<ol class="steps">
+  <li><strong>Maintain a subscriber list</strong> per account (users who enabled post/live notifications) instead of scanning all 400M followers and checking each one's settings.</li>
+  <li><strong>Create a fan-out job</strong> on the <em>bulk</em> queue, never on the normal/high queues. The job pages through subscribers (e.g. 10,000 per page) and emits per-recipient tasks.</li>
+  <li><strong>Render once per locale</strong>, not once per recipient: group recipients by locale and reuse the payload ("taylor just went live" in ~50 languages).</li>
+  <li><strong>Throttle with a token bucket</strong> per job (e.g. 50,000 sends/s) and globally across concurrent jobs.</li>
+  <li><strong>Stagger and prioritise</strong>: send first to the most engaged subscribers (most likely to open; for live video, to start the audience quickly), and spread the rest over several minutes; respect quiet hours per time zone.</li>
+  <li><strong>Prepare the backend</strong>: pre-warm the <a href="cdn.html">CDN</a> with the post's media and cache the post object before the first push goes out.</li>
+  <li><strong>Re-check before each page</strong>: if the post was deleted or the live ended mid-fan-out, stop the job.</li>
+</ol>
+<pre><code>8M recipients at a throttle of 50,000/s  → 160 s to send everything
+If 10% open within ~2 minutes of receiving:
+   unstaggered → 800k app opens in ~2 min ≈ 6,700 opens/s extra, each = feed + post + media requests
+   staggered over 10 min → ~1,300 opens/s extra — absorbed by normal headroom</code></pre>
+<p>FCM also offers <strong>topic messaging</strong> (devices subscribe to a topic; one API call fans out inside Google), which offloads fan-out for broadcast-style messages, at the cost of less per-user control (no per-user caps, personalisation or tracking granularity). APNs has no equivalent for regular alerts, so each device is a separate (cheap, multiplexed) HTTP/2 request.</p>
+
+<h3>7.2 Inbound: a celebrity <em>receives</em> a million likes</h3>
+<p>When a celebrity's post gets 1M likes in 10 minutes, all those events target <strong>one recipient</strong>. Because the pipeline partitions by recipient_id, they all land on <strong>one Kafka partition and one worker</strong> — a hot partition (see <a href="sharding.html">hot keys</a>). Fixes:</p>
+<ul>
+  <li><strong>Pre-aggregate upstream</strong>: a stream processor counts likes per (post, minute) before the notification stage, so the Notification Service sees "+1,700 likes in the last minute" instead of 1,700 events.</li>
+  <li><strong>Different rules for very large accounts</strong>: no per-like processing at all; periodic summaries ("Your post has 1M likes") and activity items only from accounts they follow or interact with.</li>
+  <li><strong>Sharded counters</strong> for the aggregate itself (see <a href="likes-comments.html">Likes &amp; counters</a>).</li>
+</ul>
+
+<h2>8. Delivery and open tracking</h2>
+<p>You can't improve what you don't measure, and providers tell you little. The system emits a tracking event at each step, keyed by <code>nid</code>:</p>
+<div class="table-wrap"><table>
+  <tr><th>Event</th><th>Emitted by</th><th>Meaning</th></tr>
+  <tr><td><code>created</code></td><td>Notification Service</td><td>A candidate notification exists for this recipient</td></tr>
+  <tr><td><code>suppressed</code> (+ reason)</td><td>Prefs / aggregator / rate limiter</td><td>Dropped: setting off, muted, capped, aggregated into another, expired, quiet hours</td></tr>
+  <tr><td><code>sent</code> / <code>provider_accepted</code></td><td>Delivery worker</td><td>APNs/FCM returned success</td></tr>
+  <tr><td><code>failed</code> (+ error)</td><td>Delivery worker</td><td>Invalid token, throttled, provider error</td></tr>
+  <tr><td><code>delivered</code></td><td>The app (notification service extension / message handler), reported back asynchronously</td><td>The device actually received it</td></tr>
+  <tr><td><code>opened</code></td><td>The app, when launched via a notification tap (the payload carries nid)</td><td>User engaged</td></tr>
+  <tr><td><code>dismissed</code>, <code>disabled</code></td><td>The app (where the OS exposes it) / settings change</td><td>Negative feedback — the most important guardrail</td></tr>
+</table></div>
+<p>All events go to Kafka and then to the data warehouse and real-time dashboards (see <a href="analytics-ml.html">Analytics</a> and <a href="observability.html">Observability</a>). Key metrics: <strong>delivery rate</strong> (delivered/sent — exposes dead tokens and provider issues), <strong>open rate</strong> (opened/delivered, per type), <strong>end-to-end latency</strong> (event ts → provider accepted, per priority), <strong>suppression breakdown</strong>, and <strong>opt-out rate</strong>. These same events are training data for the relevance/fatigue models in section 4.5.</p>
+
+<h2>9. The in-app activity feed</h2>
+<p>The Activity tab is a per-user, reverse-chronological list of aggregated items with an unread badge — structurally a tiny <a href="news-feed.html">news feed</a> with only one writer per item (the notification pipeline) and one reader (the user).</p>
+<pre><code>-- Item details: one row per aggregation key; UPSERTed as new actors arrive
+CREATE TABLE activity_items (
+  user_id     bigint,
+  agg_key     text,          -- "like:3170538912345678", "follow:2024-10-23", "comment:...:c991"
+  type        text,
+  actors      list&lt;bigint&gt;,  -- latest 3 actors for display
+  actor_count int,
+  object_ref  text,          -- post / comment / user being referenced
+  created_at  timestamp,
+  updated_at  timestamp,
+  PRIMARY KEY (user_id, agg_key)
+) WITH default_time_to_live = 7776000;      -- 90 days
+
+-- Time index: append a row each time an item is updated; read newest-first
+CREATE TABLE activity_timeline (
+  user_id    bigint,
+  updated_at timestamp,
+  agg_key    text,
+  PRIMARY KEY (user_id, updated_at, agg_key)
+) WITH CLUSTERING ORDER BY (updated_at DESC) AND default_time_to_live = 7776000;</code></pre>
+<ul>
+  <li><strong>Write</strong>: upsert the item; append a timeline row. A bumped aggregate leaves an older timeline row behind; the read path <strong>dedups by agg_key</strong> (keep the newest), and old rows expire via TTL. (Alternatively keep the recent window in a Redis sorted set with score = updated_at, where re-adding a member just moves it.)</li>
+  <li><strong>Read</strong>: page through <code>activity_timeline</code> with a cursor (<code>updated_at &lt; last</code>), multi-get the items, <strong>hydrate</strong> actor names/avatars and post thumbnails, render templates in the viewer's locale, and group into "New / Today / This week / This month".</li>
+  <li><strong>Unread badge</strong>: store <code>last_seen_activity_at</code> per user; unread = number of items updated after it (capped, e.g. "99+"), maintained as a counter incremented on new items and reset when the tab is opened. The badge number in push payloads comes from the same counter.</li>
+  <li><strong>Retention</strong>: 30–90 days of activity is plenty; TTLs keep storage bounded. Rough size: 3B upserts/day of ~200 B ≈ 600 GB/day, but with TTL and aggregation the live dataset stays at tens of TB — a moderate <a href="databases.html">Cassandra</a> cluster partitioned by user_id.</li>
+  <li><strong>Visibility at read time</strong>: drop items whose actor is now blocked or whose object was deleted — same "derived data is not the source of truth" rule as the feed.</li>
+</ul>
+
+<h2>10. Experimentation</h2>
+<p>Almost every parameter in this pipeline is a product decision with uncertain effects: How long should the like-aggregation window be? Which copy gets more opens: "maya liked your post" or "maya liked your photo from Goa"? Should we push "suggested account" notifications at all? Notification systems are therefore built for <strong>A/B testing</strong>:</p>
+<ul>
+  <li><strong>Assignment</strong>: users are deterministically bucketed (hash(user_id, experiment) mod 100), so the same user always sees the same variant across stages.</li>
+  <li><strong>Hook points</strong>: preference defaults, aggregation windows, caps, ML thresholds, template text, send-time (immediately vs batched), channel choice. Each stage reads the user's variant from a config/experiment service.</li>
+  <li><strong>Metrics</strong>: open rate and sessions are the obvious success metrics, but the <strong>guardrails</strong> matter more — notification disable rate, uninstall rate, spam reports, long-term retention. A variant that lifts opens 5% but doubles opt-outs is a loss.</li>
+  <li><strong>Long-term holdouts</strong>: a small group receiving fewer notifications for months reveals fatigue effects short tests miss.</li>
+  <li><strong>Network effects</strong>: notifications cause actions that cause notifications for others (B gets notified, comments, which notifies C). Treating users as independent can mislead; cluster-based randomisation is sometimes used.</li>
+</ul>
+
+<h2>11. End-to-end sequence: a like becomes a push</h2>
+<pre class="ascii">
+ Maya app   Like Svc   Kafka      Notif Svc    Prefs    Aggregator   Activity   Renderer +   Priority   Delivery   Token     APNs     Raj's iPhone
+    |  like   |          |        (consumer)   cache    (Redis)       store      rate limit   queue      worker     registry
+    |--------&gt;|-- write like, publish like.created -------&gt;|            |            |            |          |          |         |           |
+    |&lt;-- 200 -|          |-- event (partition = recipient 17 = Raj) -&gt; |            |            |          |          |         |           |
+    |         |          |          |-- likes push? muted maya? -------&gt;|            |            |          |          |         |           |
+    |         |          |          |&lt;-- allowed --|          |          |            |            |          |          |         |           |
+    |         |          |          |-- add actor to agg:17:like:P ----&gt;|            |            |          |          |         |           |
+    |         |          |          |&lt;-- count = 1 (first like) --------|            |            |          |          |         |           |
+    |         |          |          |-- upsert in-app item ---------------------------&gt;|          |          |          |         |           |
+    |         |          |          |-- render "maya liked your post." (Raj's locale) -----------&gt;|          |          |         |           |
+    |         |          |          |   check per-user cap, quiet hours (Raj's timezone) → OK     |          |          |         |           |
+    |         |          |          |-- enqueue {nid, priority: normal} ---------------------------&gt;|          |          |         |           |
+    |         |          |          |   schedule flush of agg:17:like:P in 30 min                  |-- pull --&gt;|          |         |           |
+    |         |          |          |          |              |             |            |          |  SETNX sent:nid → OK |         |           |
+    |         |          |          |          |              |             |            |          |-- tokens(17) ------&gt;|         |           |
+    |         |          |          |          |              |             |            |          |&lt;-- 2 devices --------|         |           |
+    |         |          |          |          |              |             |            |          |-- POST /3/device/… (HTTP/2) ----&gt;|        |
+    |         |          |          |          |              |             |            |          |&lt;-- 200 (device 1) / 410 (device 2) |        |
+    |         |          |          |          |              |             |            |          |-- token.invalid(device 2) → prune  |        |
+    |         |          |          |          |              |             |            |          |-- tracking: sent ──► Kafka         |--push-&gt;|
+    |         |          |          |          |              |             |            |          |          |          |  Raj taps banner → app opens
+    |         |          |          |          |              |             |            |          |          |          |  deep link → post; tracking: opened(nid)
+    |   ... 30 min later, 48 more likes arrived: flush → ONE push "maya and 48 others liked your post." (same collapse id → replaces banner)
+</pre>
+
+<h2>12. How Instagram uses the notification system</h2>
+<p>In the main architecture diagram, the <strong>Notification Service</strong> is a consumer of the <strong>Kafka</strong> event bus, alongside the Search Indexer, Feed Fan-out Workers, Media Processing Workers and Analytics. It sends through <strong>Push Providers (APNs/FCM)</strong> to phones. Concretely:</p>
+<ol>
+  <li>The <strong>Like &amp; Comment</strong>, <strong>Follow/Graph</strong>, <strong>Upload</strong>, <strong>Stories</strong> and <strong>Direct Messaging</strong> services publish events; none of them know notifications exist — adding a new notification type means adding a consumer rule, not changing producers.</li>
+  <li>The Notification Service resolves recipients, checks preferences and relationships, aggregates, writes the in-app <strong>Activity</strong> item, renders in the recipient's language, applies caps and quiet hours, and queues by priority.</li>
+  <li>Delivery workers fetch tokens from the device registry and call <strong>APNs/FCM</strong>; invalid tokens are pruned; outcomes go back to Kafka.</li>
+  <li>When a user taps a push, the app deep-links to the post/comment/profile, loading data through the normal API path and media through the <strong>CDN</strong>.</li>
+  <li>Tracking data feeds <strong>Analytics &amp; ML</strong>, which trains models deciding which notifications are worth sending.</li>
+</ol>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+Instagram's public settings expose exactly the controls this design needs: per-category push settings (likes, comments, follows, DMs, live, reminders) with options such as "Off / From people I follow / From everyone", per-account post/story/reel/live notification toggles, "Pause all", and muting. The Activity tab shows aggregated items like "maya and 48 others liked your post". Instagram's early engineering talks described sending push notifications through asynchronous task queues rather than in the request path; today Meta runs shared notification infrastructure across its apps. Internal details (thresholds, models, exact volumes) are not public — all numbers here are illustrative assumptions.</div>
+<div class="callout instagram"><span class="callout-title">📸 Rough numbers for an Instagram-scale notification system (assumptions)</span>
+<ul>
+  <li>~5–6B notification-worthy events/day (~65k/s avg, ~200k/s peak) from Kafka.</li>
+  <li>~3B in-app activity upserts/day; ~2–3B pushes/day (~30k/s avg, 100k+/s peaks); ~100M emails; ~10–20M SMS.</li>
+  <li>Critical (login code, DM) latency target: &lt; 2 s end to end; normal: seconds; low: minutes or deferred.</li>
+  <li>Celebrity fan-out: up to ~10M pushes per event, throttled at ~50k/s and staggered over minutes.</li>
+  <li>Token registry: billions of device rows; 10–30% of tokens may go stale over a year without pruning.</li>
+</ul></div>
+
+<h2>13. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Asynchronous, staged pipeline: benefits</h4><ul>
+    <li>Producers are fully decoupled; notification outages never block likes or posts</li>
+    <li>Early filtering and aggregation cut volume dramatically</li>
+    <li>Priority queues guarantee critical messages aren't stuck behind bulk work</li>
+    <li>Each stage scales and fails independently</li>
+    <li>Late rendering gives correct names, counts and language</li>
+    <li>Full funnel tracking enables tuning and experiments</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs</h4><ul>
+    <li>Aggregation and quiet hours deliberately add delay</li>
+    <li>At-least-once processing requires careful dedup at several layers</li>
+    <li>Dependence on third-party providers with limited delivery feedback</li>
+    <li>Many interacting knobs (caps, windows, models) are hard to reason about</li>
+    <li>Hot recipients and celebrity fan-outs need special paths</li>
+    <li>Tracking data volume exceeds notification volume</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Sending pushes synchronously in the request path</strong> — a slow APNs call makes liking slow. Always go through a queue.</li>
+  <li><strong>One queue for everything</strong> — a bulk fan-out delays login codes. Separate by priority.</li>
+  <li><strong>No aggregation</strong> — 500 pushes for 500 likes; users disable notifications forever.</li>
+  <li><strong>Building text by concatenation</strong> — broken plurals and grammar in most languages; use ICU-style templates.</li>
+  <li><strong>Never pruning tokens</strong> — wasted capacity, misleading metrics, provider warnings.</li>
+  <li><strong>Not handling token reassignment</strong> on logout/login — notifications for one account appear on another person's phone.</li>
+  <li><strong>Treating "200 from APNs" as delivered</strong> — measure delivery and opens from the app.</li>
+  <li><strong>Retrying permanent errors</strong> or retrying without backoff/jitter — hammering a struggling provider.</li>
+  <li><strong>Sending stale notifications</strong> — no expiry or re-validation, so users get "live now" for an ended stream or a deleted comment.</li>
+  <li><strong>Celebrity fan-out without staggering</strong> — the notification system DDoSes your own backend through app opens.</li>
+</ul>
+
+<h2>14. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>Role</th><th>When to use it</th></tr>
+  <tr><td>Apple Push Notification service (APNs)</td><td>The only way to push to iOS/macOS devices</td><td>Any iOS app; HTTP/2 + token (JWT) auth</td></tr>
+  <tr><td>Firebase Cloud Messaging (FCM)</td><td>Push to Android (and web/iOS via APNs bridging); topics</td><td>Any Android app; topic messaging for broadcasts</td></tr>
+  <tr><td>Web Push (VAPID)</td><td>Push to browsers via their push services</td><td>Web clients</td></tr>
+  <tr><td>Amazon SNS, Azure Notification Hubs</td><td>Managed multi-platform push fan-out</td><td>When you don't want to manage provider connections yourself</td></tr>
+  <tr><td>OneSignal, Braze, Airship, Iterable</td><td>Hosted engagement platforms: segmentation, templates, A/B tests, analytics</td><td>Marketing/lifecycle messaging; smaller teams</td></tr>
+  <tr><td>Amazon SES, SendGrid, Mailgun</td><td>Email delivery with bounce/complaint feedback</td><td>Transactional email and digests</td></tr>
+  <tr><td>Twilio, Vonage, MessageBird</td><td>SMS (and WhatsApp/voice) gateways</td><td>Verification codes, critical alerts</td></tr>
+  <tr><td>Kafka</td><td>Event ingestion, priority topics, tracking events</td><td>The backbone of the pipeline</td></tr>
+  <tr><td>Redis</td><td>Aggregation state, idempotency keys, per-user rate limits, delay queues</td><td>Fast, TTL-based soft state</td></tr>
+  <tr><td>Cassandra / DynamoDB</td><td>In-app activity feed, token registry, preferences</td><td>Large, per-user partitioned data</td></tr>
+  <tr><td>ICU MessageFormat / FormatJS / Fluent</td><td>Localization with plurals and gender</td><td>Rendering text in dozens of languages</td></tr>
+</table></div>
+
+<h2>15. Interview corner</h2>
+<details class="qa"><summary>Design the notification system for Instagram.</summary>
+<p>Event-driven pipeline consuming Kafka domain events (like, comment, follow, mention, live, DM, security). Stages: recipient resolution → preference/mute/block checks (cached per-user settings) → aggregation keyed by (recipient, type, object) with "first fast, then batch" windows and milestones → write/update the in-app activity item (Cassandra, partitioned by user_id, TTL 90 days) → late template rendering with ICU plurals in the recipient's locale → per-user caps and quiet hours (Redis token buckets, delay queue) → priority queues (critical / normal / low / bulk) → delivery workers that look up device tokens and call APNs (HTTP/2) and FCM, with collapse IDs and expiry → feedback: prune invalid tokens, emit sent/delivered/opened events for metrics, ML and experiments. Partition by recipient_id for per-user consistency; idempotency keys for dedup; special paths for celebrity fan-out and hot recipients.</p></details>
+<details class="qa"><summary>How do you avoid sending duplicate notifications?</summary>
+<p>Assume at-least-once everywhere. Make processing idempotent (adding an actor to an aggregate set twice is a no-op), give every notification a deterministic ID derived from (recipient, type, object, window, version) and check-and-set it in Redis before sending, use provider collapse IDs so any duplicate that slips through replaces the earlier banner, and let the client ignore an nid it already displayed. Decide per priority whether a crash should risk duplicates (critical codes) or loss (low-value likes).</p></details>
+<details class="qa"><summary>How would you implement "maya and 20 others liked your post"?</summary>
+<p>Aggregate by key (recipient, "like", post_id): store count and the latest few actor IDs in Redis (or the activity item). The first like triggers a quick push and schedules a flush; subsequent likes update the count and the in-app item without pushing; at window end or milestones, send one summary push with the same collapse ID so it replaces the earlier banner. Render with a plural-aware template at send time so names and counts are current; handle unlikes by decrementing and cancelling if zero.</p></details>
+<details class="qa"><summary>A celebrity with 300M followers goes live. How do you notify subscribers without breaking anything?</summary>
+<p>Keep a separate subscriber list (users who opted into live notifications) — say 2–3% → ~6–9M recipients. Run a fan-out job on an isolated bulk queue, paging subscribers, rendering once per locale, throttled by a token bucket, ordered by engagement so the likeliest viewers get it first, staggered over a few minutes and respecting quiet hours. Pre-warm caches/CDN for the live stream; stop the job if the live ends; set short expiry so late pushes are dropped. Critical queues keep their reserved capacity throughout.</p></details>
+<details class="qa"><summary>How do you manage device tokens?</summary>
+<p>A registry partitioned by user_id with rows per device: token, platform, environment, app version, locale, time zone, push permission, last_seen. Apps upsert on every start and on token refresh; a unique index on token handles reassignment between accounts on the same device; logout deletes. Delivery workers delete tokens when APNs returns 410/BadDeviceToken or FCM returns UNREGISTERED, and a periodic job prunes tokens not seen for 60–90 days.</p></details>
+<details class="qa"><summary>How do you make sure a 2FA code isn't delayed by a flood of like notifications?</summary>
+<p>Priority isolation: critical notifications go on a dedicated topic/queue with reserved worker capacity and separate provider connections, skip aggregation, caps and quiet hours, use high APNs priority, retry aggressively with short backoff, and fall back to SMS/email if not confirmed. Bulk and low-priority work runs on separate queues and is the first to be shed under load.</p></details>
+<details class="qa"><summary>How do you know if notifications are working well?</summary>
+<p>Track a per-nid funnel: created → suppressed (with reason) → sent → provider accepted → delivered (reported by the app) → opened → dismissed/disabled. Monitor delivery rate, end-to-end latency per priority, provider error rates, open rate per type, and opt-out/uninstall rates as guardrails. Run A/B tests on windows, caps, copy and timing with long-term holdouts, because short-term open-rate gains can hide long-term fatigue.</p></details>
+
+<h2>16. Check your understanding</h2>
+<details class="quiz"><summary>Why is the Notification Service a Kafka consumer instead of being called directly by the Like Service?</summary>
+<p>Decoupling: likes must succeed fast even if notifications (or APNs) are slow or down. Kafka buffers events durably, lets the Notification Service scale and retry independently, and lets other consumers (analytics, feed, search) use the same events. Producers don't need to know notification rules.</p></details>
+<details class="quiz"><summary>A post gets 2,000 likes in an hour. With a "first like immediately, then a summary at milestones 10, 100, 1,000 and at window end" rule, how many pushes does the owner receive?</summary>
+<p>At most <strong>5</strong>: first like, milestones 10, 100 and 1,000, plus the window-end summary (2,000) — and with a shared collapse ID, only the latest is visible on the lock screen. Compare with 2,000 pushes without aggregation.</p></details>
+<details class="quiz"><summary>APNs returns HTTP 200 for a push. Can you conclude the user saw it?</summary>
+<p>No. 200 only means APNs accepted it. The device may be offline (APNs keeps just the latest notification per app and drops it after expiry), notifications may be disabled or silenced, or a newer push may have collapsed it. Delivery and opens must be reported by the app itself.</p></details>
+<details class="quiz"><summary>Scenario: users report receiving another person's notifications after that person logged out on a shared phone. What's the bug and the fix?</summary>
+<p>The device token is still registered to the old account. Fix: delete the device's token row on logout, and on registration enforce token uniqueness — if the token already belongs to another user, move it to the new user. Also clear displayed notifications on logout.</p></details>
+<details class="quiz"><summary>8M subscribers must be notified at a 40,000/s throttle. How long does it take, and why might you deliberately go slower?</summary>
+<p>8,000,000 / 40,000 = <strong>200 s</strong>. Going slower (staggering over ~10 minutes) spreads the resulting app opens — each one a burst of feed, post and media requests — so the backend and CDN aren't hit by a self-inflicted thundering herd, and it leaves provider and worker capacity for other notifications.</p></details>
+<details class="quiz"><summary>Why render notification text at send time instead of when the event is first processed?</summary>
+<p>Aggregates keep changing (count, latest actors), users may rename themselves, the recipient may change language, and deferred notifications (quiet hours) can be sent hours later. Storing a structured record and rendering late ensures correct, current, localized text — and lets experiments change copy without reprocessing.</p></details>
+<details class="quiz"><summary>All like events for a mega-celebrity land on one Kafka partition. Why, and what do you do?</summary>
+<p>The pipeline partitions by recipient_id to keep per-user processing consistent, so one recipient = one partition = one worker — a hot partition. Pre-aggregate upstream (stream processor counting likes per post per minute), use special rules for very large accounts (summaries only), and use sharded counters for the aggregate.</p></details>
+<details class="quiz"><summary>Which errors should a delivery worker retry: (a) APNs 503, (b) APNs 410 Unregistered, (c) FCM 429, (d) payload too large?</summary>
+<p>Retry <strong>(a)</strong> and <strong>(c)</strong> with exponential backoff and jitter (honouring Retry-After). <strong>(b)</strong> is permanent → prune the token. <strong>(d)</strong> is a bug in rendering → drop, log and alert; retrying will never succeed.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Notifications are an <strong>asynchronous, staged pipeline</strong> fed by Kafka: resolve → filter (prefs, mutes) → <strong>aggregate</strong> → render (i18n) → <strong>rate-limit / quiet hours</strong> → <strong>priority queues</strong> → delivery → feedback.</li>
+    <li><strong>Filter and aggregate early</strong>: "X and 20 others" with collapse IDs beats 21 pushes; the in-app activity feed keeps everything, push gets only what's worth interrupting for.</li>
+    <li>Push goes through <strong>APNs/FCM</strong> using a <strong>device token registry</strong> that must handle rotation, reassignment and <strong>pruning</strong> of invalid tokens.</li>
+    <li>Assume <strong>at-least-once</strong>: retries with <strong>backoff + jitter</strong>, <strong>deterministic idempotency keys</strong>, expiry and re-validation before send.</li>
+    <li><strong>Isolate priorities</strong> and treat <strong>celebrity fan-outs</strong> as throttled, staggered bulk jobs — protect both providers and your own backend.</li>
+    <li>Measure the whole funnel and <strong>experiment</strong> with guardrails — the real constraint is user attention, not throughput.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="message-queues.html">Message Queues, Pub/Sub &amp; Kafka</a> — the event bus, partitions and delivery guarantees the pipeline depends on</li>
+  <li><a href="news-feed.html">News Feed</a> — the same fan-out trade-offs, and the in-app activity feed's bigger sibling</li>
+  <li><a href="direct-messaging.html">Real-time Direct Messaging</a> — pushes for offline DM recipients</li>
+  <li><a href="rate-limiting.html">Rate Limiting</a> — token buckets used for per-user caps and fan-out throttling</li>
+  <li><a href="resilience-patterns.html">Resilience patterns</a> — retries, backoff, circuit breakers and bulkheads</li>
+  <li><a href="likes-comments.html">Likes, Comments &amp; Counters</a> — the events and hot-key counters behind most notifications</li>
+  <li><a href="analytics-ml.html">Analytics &amp; ML</a> — tracking data, relevance/fatigue models and experiments</li>
+  <li><a href="caching.html">Caching</a> — Redis for preferences, aggregation state and idempotency keys</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

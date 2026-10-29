@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Real-time Direct Messaging — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="direct-messaging">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>Chat flips the normal web model: the <strong>server must push</strong> messages to phones the instant they arrive. That needs a <strong>persistent connection</strong> per online device — usually a <strong>WebSocket</strong> (or <strong>MQTT</strong>, which Facebook Messenger publicly adopted) — instead of request/response polling.</li>
+    <li>Dedicated <strong>gateway servers</strong> each hold hundreds of thousands of open connections; a <strong>session registry</strong> (Redis: user → device → gateway) tells the stateless <strong>Chat Service</strong> where to route each message.</li>
+    <li>Messages are persisted <em>before</em> delivery in a wide-column store (Cassandra/HBase) <strong>partitioned by conversation_id and clustered by a time-ordered message ID</strong>; a per-conversation <strong>sequence number</strong> gives every participant the same order.</li>
+    <li>Delivery is <strong>at-least-once with acks and retries</strong>, made safe by <strong>client-generated message IDs</strong> for dedup. Offline devices get a <strong>push notification</strong> and <strong>sync from a cursor</strong> when they reconnect — which also keeps multiple devices in sync.</li>
+    <li>Receipts (sent ✓ / delivered ✓✓ / seen), <strong>presence</strong> (heartbeats) and <strong>typing indicators</strong> (ephemeral, best-effort) are separate, cheaper channels. <strong>E2EE</strong> (Signal protocol) means the server only relays ciphertext.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why is messaging different from everything else?</h2>
+<p>Almost everything else in Instagram is <strong>client-initiated</strong>: the app asks ("give me my feed", "like this post") and the server answers. Direct messages break that model. When your friend sends you "are you coming?", <em>nobody on your side asked for it</em> — the server has to reach your phone on its own, within a fraction of a second, while you're looking at a chat screen.</p>
+<p>That single difference creates a cascade of hard problems:</p>
+<ul>
+  <li><strong>Server push</strong>: plain HTTP can't push. We need a long-lived connection from every online device — that's tens or hundreds of millions of open connections at once.</li>
+  <li><strong>Routing</strong>: the message arrives at one server; the recipient is connected to a different one, among hundreds. Who knows where they are?</li>
+  <li><strong>Reliability</strong>: phones drop off networks constantly (elevators, tunnels, app backgrounded). A message must never be lost, never be shown twice, and must reach the user eventually even if they're offline for a week.</li>
+  <li><strong>Ordering</strong>: if Alice sends "Do you want pizza?" then "Or sushi?", Bob must see them in that order — on every one of his devices, and in group chats everyone must see the same order.</li>
+  <li><strong>State signals</strong>: delivered/seen receipts, "online now", "typing…" — all of which are high-frequency and must be cheap.</li>
+</ul>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  Think of a huge hotel switchboard. Every guest who's in their room has a <strong>phone line kept open</strong> to the front desk (the persistent connection). The desk has many operators (gateway servers), each handling thousands of lines, and a <strong>room directory</strong> on the wall saying which operator holds which guest's line (the session registry). When a message comes in for room 512, the desk first <strong>writes it in the logbook</strong> (persistence), checks the directory, and the right operator reads it down the open line. If the guest is out, the message stays in the logbook, a note is slipped under their door (push notification), and when they return they ask "anything since my last message, number 41?" (sync from a cursor).
+</div>
+
+<h2>2. Requirements and numbers</h2>
+
+<h3>2.1 Functional requirements</h3>
+<ul>
+  <li><strong>1:1 and group conversations</strong> (groups up to a few hundred members — an assumption).</li>
+  <li><strong>Real-time delivery</strong> to online recipients; <strong>offline delivery</strong> when they return, plus push notifications.</li>
+  <li><strong>Ordering</strong>: all participants see a conversation's messages in the same order.</li>
+  <li><strong>Receipts</strong>: sent, delivered and read ("Seen").</li>
+  <li><strong>Presence</strong> ("Active now", "Active 5m ago") and <strong>typing indicators</strong>.</li>
+  <li><strong>Media</strong>: photos, videos, voice notes, shared posts/Reels.</li>
+  <li><strong>Multi-device sync</strong>: phone, tablet and web show the same history and read state.</li>
+  <li><strong>History</strong>: scroll back through old messages; inbox list sorted by last activity.</li>
+  <li><em>Optional</em>: <strong>end-to-end encryption (E2EE)</strong>.</li>
+</ul>
+
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+  <li><strong>Low latency</strong>: end-to-end delivery to an online recipient in ~100–500 ms.</li>
+  <li><strong>Durability</strong>: once the sender sees "sent", the message must never be lost.</li>
+  <li><strong>Exactly-once <em>appearance</em></strong>: no visible duplicates, even though the network forces retries.</li>
+  <li><strong>High availability</strong>: chat is expected to "always work"; a gateway crash should cost a reconnect, not data.</li>
+  <li><strong>Consistency</strong>: per-conversation ordering is required; global ordering across conversations is not.</li>
+</ul>
+
+<h3>2.3 Back-of-the-envelope (assumptions)</h3>
+<pre><code>Assume 300M daily DM users, 40 messages sent per user per day
+  → 12B messages/day → 12B / 86,400 ≈ 140,000 msgs/s average, ~400,000/s peak
+  → deliveries are higher: a message to a 10-person group = 9 deliveries
+
+Storage: ~300 bytes per message row (text + IDs + metadata; media stored separately in S3)
+  → 12B × 300 B ≈ 3.6 TB/day ≈ 1.3 PB/year, ×3 replicas ≈ 4 PB/year
+
+Concurrent connections at peak: assume ~150M online devices
+  Each gateway server holds ~500k connections (tuned event-loop server)
+  → 150M / 500k = 300 gateway servers (+ headroom for failures → ~400-500)
+
+Heartbeats: 150M connections pinging every 30 s → 5M tiny frames/s
+  (this is why heartbeats are handled at the gateway and never touch a database)</code></pre>
+<p>Notice the two very different workloads: a <strong>connection-holding</strong> tier (huge numbers of mostly idle sockets, low CPU) and a <strong>message-processing</strong> tier (hundreds of thousands of writes per second). Separating them is the first architectural decision.</p>
+
+<h2>3. Real-time transport: how can the server reach the phone?</h2>
+<p>HTTP is request/response: the client speaks first, the server answers, done. There are four classic ways to get "server push" anyway, plus MQTT.</p>
+<pre class="ascii">
+ SHORT POLLING                         LONG POLLING
+ client          server                client          server
+   |-- any new? -----&gt;|                  |-- any new? -----&gt;|
+   |&lt;--- no ---------|                  |                  |  (server HOLDS the request
+   |   ...wait 5 s... |                  |                  |   until data or ~30 s timeout)
+   |-- any new? -----&gt;|                  |&lt;--- msg #1 ------|
+   |&lt;--- no ---------|                  |-- any new? -----&gt;|  (immediately re-asks)
+   |-- any new? -----&gt;|                  |                  |
+   |&lt;--- msg #1 -----|  up to 5 s late   |&lt;--- msg #2 ------|
+
+ SERVER-SENT EVENTS (SSE)              WEBSOCKET
+ client          server                client          server
+   |-- GET /events --&gt;|                  |-- HTTP Upgrade -&gt;|
+   |&lt;== 200, stream open, never ends    |&lt;-- 101 Switching-|
+   |&lt;--- event: msg #1                  |&lt;=== full-duplex frames ===&gt;|
+   |&lt;--- event: msg #2                  |--- send msg ----&gt;|
+   |  (one direction only: server→client) |&lt;--- msg #1 ------|
+   |  client sends via separate POSTs     |&lt;--- typing… -----|
+</pre>
+
+<h3>3.1 The options compared</h3>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Short polling</th><th>Long polling</th><th>Server-Sent Events</th><th>WebSocket</th><th>MQTT (over TCP/TLS or WebSocket)</th></tr>
+  <tr><td><b>How it works</b></td><td>Client asks every N seconds</td><td>Server holds each request open until data arrives, then client re-asks</td><td>One HTTP response that streams events forever</td><td>HTTP request "upgraded" to a persistent, bidirectional frame channel</td><td>Lightweight publish/subscribe protocol over a persistent connection</td></tr>
+  <tr><td><b>Direction</b></td><td>Client → server only</td><td>Simulated push</td><td>Server → client only</td><td>Both ways</td><td>Both ways (pub/sub topics)</td></tr>
+  <tr><td><b>Latency</b></td><td>Up to the poll interval</td><td>Near real-time (one RTT after each delivery)</td><td>Real-time</td><td>Real-time</td><td>Real-time</td></tr>
+  <tr><td><b>Overhead</b></td><td>Very high: mostly empty responses, full HTTP headers each time</td><td>Medium: one request per message batch</td><td>Low</td><td>Very low: 2–14 byte frame headers</td><td>Very low: 2-byte minimum header; designed for flaky mobile networks and battery</td></tr>
+  <tr><td><b>Battery (mobile)</b></td><td>Bad — radio wakes constantly</td><td>OK</td><td>Good</td><td>Good</td><td>Very good</td></tr>
+  <tr><td><b>Infrastructure</b></td><td>Plain HTTP, trivially scalable</td><td>Many hanging requests; timeouts at proxies</td><td>Plain HTTP; some proxies buffer streams</td><td>Needs WebSocket-aware LBs and stateful gateways</td><td>Needs an MQTT broker/gateway tier</td></tr>
+  <tr><td><b>Good for</b></td><td>Rare updates, simplest fallback</td><td>Fallback when WebSockets are blocked</td><td>Live feeds, notifications, dashboards</td><td>Chat, games, collaboration</td><td>Mobile messaging, IoT</td></tr>
+</table></div>
+<ul>
+  <li><strong>Short polling</strong> at Instagram scale is absurd: 150M devices polling every 5 s = 30M requests/s, almost all answering "nothing new", and still up to 5 s of latency.</li>
+  <li><strong>Long polling</strong> was the classic pre-WebSocket solution (early Facebook chat used it). It works through any proxy, but each delivered message costs a new HTTP request with full headers, and every hop must tolerate requests hanging for 30+ seconds.</li>
+  <li><strong>SSE</strong> is great when only the server talks (live scores, a notification stream) and it auto-reconnects with a <code>Last-Event-ID</code>, but sending still needs separate HTTP requests.</li>
+  <li><strong>WebSocket</strong> starts as an HTTP request with <code>Upgrade: websocket</code>; after a <code>101 Switching Protocols</code> response the same TCP (+TLS) connection carries small bidirectional frames. This is the standard for browser chat and what our architecture diagram shows. See <a href="api-design.html">API design</a> for how it fits next to REST and gRPC.</li>
+  <li><strong>MQTT</strong> is a publish/subscribe protocol designed for unreliable, low-bandwidth networks. Facebook publicly wrote (2011) that Messenger used MQTT to keep a persistent connection with low battery and bandwidth cost; Meta's mobile apps have continued to use MQTT-based connections for real-time features. The concepts below are identical whichever protocol carries the bytes.</li>
+</ul>
+<div class="callout tip"><span class="callout-title">💡 Push notifications are not a transport</span>
+APNs/FCM push notifications wake the app or show a banner when it's <em>not</em> connected; they're best-effort, rate-limited and may be delayed or collapsed. They complement the persistent connection for offline devices — they never replace it (see <a href="notifications.html">Notifications</a>).</div>
+
+<h2>4. Gateway servers: holding millions of connections</h2>
+<p>A <strong>gateway</strong> (also called connection server, edge server or "front-end") is a server whose main job is to keep sockets open and shuttle frames between devices and the backend. It contains no business logic, which keeps it simple, stable and rarely redeployed.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 880 390" width="880" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-dm-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <rect x="20" y="55" width="130" height="46" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="85" y="75" text-anchor="middle" font-weight="600">📱 Alice</text><text x="85" y="92" text-anchor="middle" font-size="11">sender</text>
+  <rect x="20" y="285" width="130" height="46" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="85" y="305" text-anchor="middle" font-weight="600">📱 Bob</text><text x="85" y="322" text-anchor="middle" font-size="11">recipient</text>
+  <rect x="200" y="55" width="180" height="46" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="290" y="75" text-anchor="middle" font-weight="600">Gateway 12</text><text x="290" y="92" text-anchor="middle" font-size="11">~500k open WebSockets</text>
+  <rect x="200" y="285" width="180" height="46" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="290" y="305" text-anchor="middle" font-weight="600">Gateway 47</text><text x="290" y="322" text-anchor="middle" font-size="11">~500k open WebSockets</text>
+  <rect x="440" y="168" width="200" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="540" y="189" text-anchor="middle" font-weight="600">Chat Service</text><text x="540" y="206" text-anchor="middle" font-size="11">sequence · persist · route</text>
+  <rect x="700" y="20" width="165" height="50" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="782" y="41" text-anchor="middle" font-weight="600">Session registry</text><text x="782" y="58" text-anchor="middle" font-size="11">Redis: user → gateway</text>
+  <rect x="700" y="110" width="165" height="50" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="782" y="131" text-anchor="middle" font-weight="600">Messages store</text><text x="782" y="148" text-anchor="middle" font-size="11">Cassandra / HBase</text>
+  <rect x="700" y="200" width="165" height="50" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="782" y="221" text-anchor="middle" font-weight="600">Kafka</text><text x="782" y="238" text-anchor="middle" font-size="11">message events</text>
+  <rect x="700" y="290" width="165" height="50" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="782" y="311" text-anchor="middle" font-weight="600">Notification Svc</text><text x="782" y="328" text-anchor="middle" font-size="11">APNs / FCM if offline</text>
+  <g stroke="#555" stroke-width="1.5" fill="none">
+    <path d="M150,78 L198,78" marker-end="url(#ar-dm-1)" marker-start="url(#ar-dm-1)"/>
+    <path d="M150,308 L198,308" marker-end="url(#ar-dm-1)" marker-start="url(#ar-dm-1)"/>
+    <path d="M380,90 L455,166" marker-end="url(#ar-dm-1)"/>
+    <path d="M465,218 L380,296" marker-end="url(#ar-dm-1)"/>
+    <path d="M640,180 L698,48" marker-end="url(#ar-dm-1)"/>
+    <path d="M640,188 L698,137" marker-end="url(#ar-dm-1)"/>
+    <path d="M640,200 L698,222" marker-end="url(#ar-dm-1)"/>
+    <path d="M640,210 L698,312" marker-end="url(#ar-dm-1)"/>
+  </g>
+  <text x="440" y="118" font-size="11" fill="#555">① send</text>
+  <text x="422" y="282" font-size="11" fill="#555">④ deliver</text>
+  <text x="665" y="100" text-anchor="end" font-size="11" fill="#555">③ lookup</text>
+  <text x="664" y="184" font-size="11" fill="#555">② persist</text>
+  <text x="175" y="45" font-size="11" fill="#555">persistent connection</text>
+</svg>
+<div class="caption">Gateways hold connections; the stateless Chat Service persists, looks up where the recipient is connected, and routes the message to that gateway.</div>
+</div>
+
+<h3>4.1 How one server holds 500,000+ connections</h3>
+<ul>
+  <li><strong>Event-driven I/O</strong>: instead of one thread per connection (500k threads would need hundreds of GB of stack memory and drown in context switches), the server uses an event loop on top of <code>epoll</code> (Linux) / <code>kqueue</code>: a few threads are told by the kernel "these 30 sockets have data", handle them, and go back to waiting. Netty (Java), Go's netpoller, Node.js, Erlang/BEAM all work this way. WhatsApp publicly reported holding over 2 million connections on a single Erlang server back in 2012.</li>
+  <li><strong>Memory per connection</strong> is the real limit: kernel socket buffers + TLS session state + application state ≈ 10–50 KB each. 500k × 30 KB ≈ 15 GB of RAM — fine for a modern server.</li>
+  <li><strong>OS tuning</strong>: raise the file-descriptor limit (each socket is a file descriptor), tune TCP buffer sizes and keep-alive. A server listening on one port can hold millions of connections (each is identified by the client's IP and port, so the server's ports don't run out).</li>
+  <li><strong>TLS termination</strong> at the gateway (or a TLS-terminating L4 proxy in front of it), using session resumption so reconnects are cheap (see <a href="networking-basics.html">Networking basics</a>).</li>
+</ul>
+
+<h3>4.2 Load balancing long-lived connections</h3>
+<p>A <a href="load-balancer.html">load balancer</a> spreads <em>new</em> connections across gateways (least-connections works well). But connections live for hours, so the usual "add servers and traffic rebalances" doesn't happen by itself:</p>
+<ul>
+  <li><strong>Deploys and draining</strong>: to restart a gateway, stop routing new connections to it, then close existing ones gradually (e.g. over 10 minutes) with a "please reconnect" frame so clients move to other gateways.</li>
+  <li><strong>Reconnect storms</strong>: if a gateway with 500k connections crashes, 500k clients reconnect at once — and each reconnect triggers a TLS handshake, an auth check and a sync. Clients must use <strong>exponential backoff with random jitter</strong> (e.g. retry after random 0–2 s, then 0–4 s…), and the backend must rate-limit sync work (see <a href="resilience-patterns.html">Resilience patterns</a>).</li>
+  <li><strong>Heartbeats</strong> (ping/pong every ~30–60 s) keep NATs and mobile carrier middleboxes from silently dropping idle connections and let the gateway detect dead clients.</li>
+</ul>
+
+<h2>5. The session registry: who is connected where?</h2>
+<p>When Alice's message for Bob arrives, the Chat Service must know: <em>is Bob online, on which devices, and which gateway holds each device's connection?</em> That mapping is the <strong>session registry</strong>, typically a Redis cluster (fast, in-memory, with TTLs).</p>
+<pre><code># Bob's phone connects to gateway 47 (connection id c-88123)
+HSET   sess:bob  phone-7f3a  "gw47|c-88123|1730000000"
+EXPIRE sess:bob  90                    # refreshed by every heartbeat; auto-expires if gateway dies
+
+# Bob's laptop connects to gateway 12
+HSET   sess:bob  web-21cc    "gw12|c-55102|1730000004"
+
+# Chat Service routing a message to Bob
+HGETALL sess:bob
+→ phone-7f3a: gw47|c-88123|…   web-21cc: gw12|c-55102|…   → deliver to BOTH gateways
+
+# Clean disconnect
+HDEL   sess:bob  phone-7f3a</code></pre>
+<ul>
+  <li><strong>Per device, not per user</strong>: each device has its own connection and its own sync cursor (multi-device).</li>
+  <li><strong>TTL as a safety net</strong>: if a gateway crashes without cleaning up, entries expire within ~90 s. Until then a route may point at a dead gateway — delivery fails, and the message is simply picked up on reconnect via sync. The registry is a <em>hint</em>, never the source of truth for delivery.</li>
+  <li><strong>Load</strong>: writes happen on connect/disconnect (and TTL refresh, which can be batched per gateway), reads once per message recipient. Both are cheap single-key operations, sharded across a Redis cluster by user ID.</li>
+  <li><strong>Gateway-to-gateway routing</strong>: once you know "gw47", how do you send to it? Either a direct RPC (Chat Service → gw47's internal address), or a <strong>pub/sub channel per gateway</strong> (Redis pub/sub or a lightweight broker topic <code>gw47</code> that the gateway subscribes to). Direct RPC is simplest and lowest latency.</li>
+</ul>
+
+<h2>6. Sending a message: the full sequence</h2>
+<p>Here is the complete path of one message from Alice (connected to gateway 12) to Bob (connected to gateway 47), including every acknowledgement:</p>
+<pre class="ascii">
+ Alice app      Gateway 12      Chat Service        Messages store    Session registry   Gateway 47     Bob app
+    |                |                |                     |                 |               |              |
+    | 1. SEND {conv:c9, client_msg_id:"a1b2", text:"pizza?"} (shown locally with a 🕓 clock)    |              |
+    |---------------&gt;|                |                     |                 |               |              |
+    |                |-- 2. forward (+ authenticated user=alice) --&gt;|          |               |              |
+    |                |                | 3. check alice ∈ c9, not blocked, rate limit, size    |              |
+    |                |                | 4. dedup: seen client_msg_id "a1b2" before? → no      |              |
+    |                |                | 5. assign msg_id (time-ordered) + seq=42 for c9       |              |
+    |                |                |-- 6. write row ----&gt;|                 |               |              |
+    |                |                |&lt;-- ok (quorum) -----|                 |               |              |
+    |                |&lt;-- 7. ACK {client_msg_id:"a1b2", msg_id, seq:42} ---  |               |              |
+    |&lt;-- SENT ✓ -----|                |                     |                 |               |              |
+    |                |                |-- 8. publish msg event to Kafka (inbox update, notif, analytics)     |
+    |                |                |-- 9. HGETALL sess:bob ---------------&gt;|               |              |
+    |                |                |&lt;-- phone-7f3a @ gw47 -----------------|               |              |
+    |                |                |-- 10. deliver(conn c-88123, msg) ---------------------&gt;|              |
+    |                |                |                     |                 |               |-- 11. push -&gt;|
+    |                |                |                     |                 |               |&lt;- 12. ACK ---|
+    |                |                |&lt;-- 13. delivered(bob, c9, seq 42) ---------------------|  (stores msg,|
+    |                |                |   update delivered watermark          |               |   dedups by  |
+    |                |&lt;-- 14. receipt: delivered up to seq 42 --------------  |               |   msg_id)    |
+    |&lt;-- DELIVERED ✓✓|                |                     |                 |               |              |
+    |                |                |                     |                 |               |  Bob opens chat
+    |                |                |&lt;-- 15. read(bob, c9, up to seq 42) ---------------------------------- |
+    |&lt;-- SEEN -------|&lt;---------------|   update read watermark, relay receipt to alice's devices            |
+</pre>
+<p>Important details hidden in those steps:</p>
+<ul>
+  <li><strong>Persist before ack (step 6 → 7)</strong>: Alice's "sent ✓" means the message is durably stored (written to a quorum of replicas). If the Chat Service crashes after step 6 but before step 7, Alice's app retries with the same <code>client_msg_id</code> and step 4 recognises the duplicate.</li>
+  <li><strong>Persist before deliver</strong>: Bob may receive it via real-time push <em>or</em> via sync later — both read from the same stored log, so nothing depends on the push succeeding.</li>
+  <li><strong>Delivery is decoupled from sending</strong>: steps 9–12 can fail (Bob's gateway just died) without affecting Alice. The message waits in storage; Bob's next sync fetches it.</li>
+  <li><strong>Sender's other devices</strong>: Alice's laptop must also show the message she sent from her phone — so the Chat Service delivers it to all of Alice's <em>other</em> devices too (multi-device sync is "deliver to everyone in the conversation, including the sender's other devices").</li>
+  <li><strong>Offline path</strong>: if step 9 finds no sessions for Bob, the Kafka event at step 8 lets the <a href="notifications.html">Notification Service</a> send a push notification (step 9 may also explicitly trigger it).</li>
+  <li><strong>Media messages</strong>: the app first uploads the photo/voice note to object storage with a <a href="media-upload.html">pre-signed URL</a>, then sends a normal message containing the media key. Recipients download via the CDN with signed URLs. Chat servers never relay large binary payloads.</li>
+</ul>
+
+<h2>7. Storing messages</h2>
+
+<h3>7.1 Access patterns decide the model</h3>
+<p>Chat storage is overwhelmingly <strong>write-heavy</strong> and read in one specific way: "the latest N messages of conversation X, then the N before that as I scroll up", plus "everything in X after sequence S" for sync. Messages are almost never updated (except edits, unsends and reactions). That's a perfect fit for a <strong>wide-column store</strong> (see <a href="databases.html">Databases</a>) built on LSM-trees, which turns random writes into sequential ones (see <a href="indexing.html">Indexing</a>).</p>
+<pre><code>-- Cassandra-style schema (CQL)
+CREATE TABLE messages (
+  conversation_id  bigint,
+  bucket           int,        -- e.g. month number: bounds partition size
+  message_id       bigint,     -- 64-bit time-ordered ID (Snowflake/Instagram-style)
+  seq              bigint,     -- per-conversation sequence number
+  sender_id        bigint,
+  client_msg_id    uuid,       -- sender-generated idempotency key
+  type             text,       -- text | media | post_share | reaction | system
+  body             blob,       -- text, or ciphertext if E2EE
+  media_ref        text,
+  PRIMARY KEY ((conversation_id, bucket), message_id)
+) WITH CLUSTERING ORDER BY (message_id DESC);
+
+-- "Load the chat": newest 30 messages
+SELECT * FROM messages WHERE conversation_id = 9 AND bucket = 658 LIMIT 30;
+-- "Scroll up": 30 older than the oldest I have
+SELECT * FROM messages WHERE conversation_id = 9 AND bucket = 658
+  AND message_id &lt; 7234011234567890 LIMIT 30;</code></pre>
+<ul>
+  <li><strong>Partition key = conversation_id</strong> (plus a time bucket): all messages of a conversation live together on the same replica set, so reading a chat is a single-partition, sequential read. Different conversations spread evenly across the cluster (<a href="sharding.html">sharding</a> by hash of the partition key — <a href="consistent-hashing.html">consistent hashing</a> in Cassandra).</li>
+  <li><strong>Clustering key = message_id descending</strong>: within a partition rows are physically sorted, so "latest 30" is the first 30 rows — no sorting at query time. A <strong>time-ordered 64-bit ID</strong> (timestamp in the high bits, see <a href="id-generation.html">ID generation</a>) gives roughly chronological order and uniqueness without coordination.</li>
+  <li><strong>Buckets</strong> prevent unbounded partitions: a group chat active for five years could accumulate millions of messages; Cassandra partitions should stay well under ~100 MB. Bucketing by month means "scroll up" occasionally crosses into the previous bucket.</li>
+</ul>
+
+<h3>7.2 The inbox (conversation list)</h3>
+<p>The DM inbox shows your conversations sorted by latest activity with a preview and unread badge. That's a different access pattern ("all conversations for user U, newest first"), so it gets its own table, maintained asynchronously from the Kafka message events:</p>
+<pre><code>user_inbox: PRIMARY KEY (user_id, last_activity_ts DESC, conversation_id)
+            → last message preview, unread count, muted flag
+conversation_members: PRIMARY KEY (conversation_id, user_id) → role, joined_at, read/delivered watermarks</code></pre>
+<p>Because Cassandra can't "update the sort key in place", moving a conversation to the top means delete-old-row + insert-new-row; many systems instead keep the inbox in Redis sorted sets (score = last activity) backed by the durable table.</p>
+
+<h3>7.3 Why HBase / Cassandra?</h3>
+<div class="table-wrap"><table>
+  <tr><th>Property needed</th><th>Wide-column store (Cassandra / HBase)</th><th>Sharded relational DB</th></tr>
+  <tr><td>~400k writes/s, growing forever</td><td>✅ LSM-tree writes are sequential and cheap; scale by adding nodes</td><td>⚠️ Possible with many shards, but B-tree write amplification and manual resharding</td></tr>
+  <tr><td>"Latest N in a conversation"</td><td>✅ One partition, pre-sorted by clustering key</td><td>✅ Index on (conversation_id, message_id)</td></tr>
+  <tr><td>Multi-row transactions</td><td>❌ Limited (single-partition only)</td><td>✅ Full ACID</td></tr>
+  <tr><td>Multi-datacenter replication</td><td>✅ Built in (Cassandra)</td><td>⚠️ Usually leader-based, more operational work</td></tr>
+  <tr><td>Petabytes of mostly cold data</td><td>✅ Compaction + tiered storage friendly</td><td>⚠️ Expensive</td></tr>
+</table></div>
+<div class="callout instagram"><span class="callout-title">📸 Public precedent</span>
+Facebook publicly explained (2010) that it chose <strong>HBase</strong> to store the new Facebook Messages system because of its high write throughput and good handling of a small, ever-growing working set; Facebook later wrote (2018) about migrating Messenger's storage to a MySQL/MyRocks-based system (also an LSM-tree engine). Instagram has publicly described running large Cassandra clusters. Either way the shape is the same: <strong>partition by conversation, sort by time-ordered ID, LSM storage</strong>.</div>
+
+<h2>8. Ordering: everyone sees the same sequence</h2>
+<h3>8.1 Why timestamps alone fail</h3>
+<ul>
+  <li><strong>Client clocks lie.</strong> A phone with a clock 3 minutes fast would place its messages "in the future". Never order by device time.</li>
+  <li><strong>Server clocks drift too.</strong> Two Chat Service instances receiving Alice's and Bob's simultaneous messages may disagree by a few milliseconds; time-ordered IDs from different machines aren't strictly ordered across machines (see <a href="id-generation.html">ID generation</a>).</li>
+  <li><strong>Concurrent sends</strong> in a group chat: if Carol and Dan send at the same moment, both orders are "correct" — what matters is that <em>everyone sees the same one</em>.</li>
+</ul>
+
+<h3>8.2 Per-conversation sequence numbers</h3>
+<p>The robust solution is a <strong>monotonic sequence number per conversation</strong>: 1, 2, 3, … assigned by the server at write time. It gives a total order <em>within</em> a conversation (which is all users can perceive) while different conversations proceed fully in parallel — no global ordering bottleneck.</p>
+<p>Who assigns <code>seq</code> without races?</p>
+<div class="table-wrap"><table>
+  <tr><th>Approach</th><th>How</th><th>Trade-off</th></tr>
+  <tr><td><b>Single writer per conversation</b> ⭐</td><td>Route all sends for conversation c9 to one owner (e.g. hash(conversation_id) → a Chat Service shard, or a Kafka partition keyed by conversation_id consumed by one worker). The owner increments an in-memory counter, persisted with each message.</td><td>Simple, fast, strictly ordered. Needs failover: a new owner must read the last seq from storage before continuing.</td></tr>
+  <tr><td><b>Atomic counter</b></td><td><code>INCR seq:c9</code> in Redis before writing the message.</td><td>Easy, but the counter becomes a durability concern (lost on failover without persistence) and every message needs an extra round trip.</td></tr>
+  <tr><td><b>Conditional write</b></td><td>Compare-and-set / lightweight transaction: insert seq = last+1 only if it doesn't exist.</td><td>Correct, but consensus-based writes (e.g. Cassandra LWT/Paxos) are several times slower.</td></tr>
+</table></div>
+<p>On the client side:</p>
+<ul>
+  <li>The sender's message is shown immediately with a <strong>pending</strong> state at the bottom, then repositioned (if necessary) when the ACK returns its real <code>seq</code>.</li>
+  <li>Recipients insert messages by <code>seq</code>. If they receive seq 45 while their last is 43, they know <strong>44 is missing</strong> (perhaps still in flight, perhaps lost on a dying connection) and request the gap via sync.</li>
+  <li>Sequence numbers double as <strong>sync cursors</strong> and <strong>receipt watermarks</strong> ("read up to 45") — one concept, three uses.</li>
+</ul>
+
+<h2>9. Delivery guarantees: at-least-once plus dedup</h2>
+<p>Networks offer no "exactly-once delivery". A send can fail in three indistinguishable ways: the request was lost, the server crashed after processing, or the ACK was lost. The client can't tell which — so it must <strong>retry</strong>, and retries create duplicates. The standard recipe (see <a href="message-queues.html">delivery guarantees</a> and <a href="api-design.html">idempotency keys</a>):</p>
+<ol class="steps">
+  <li><strong>The client generates a unique <code>client_msg_id</code></strong> (a UUID) when the user hits send, and stores the message in a local outbox.</li>
+  <li>It sends and waits for an ACK; on timeout it <strong>retries with the same <code>client_msg_id</code></strong> (with backoff), across reconnects and even app restarts.</li>
+  <li>The server keeps a dedup record <code>(sender, client_msg_id) → (msg_id, seq)</code> for a period (e.g. 24 h in Redis, or a unique index in the store). A duplicate send simply returns the original ACK — <strong>idempotent</strong>.</li>
+  <li>Server → recipient delivery is also at-least-once: the gateway pushes, waits for the device's ACK, and the backend relies on sync to fill anything un-acked. The recipient <strong>dedups by <code>msg_id</code></strong> (a local unique index) before displaying.</li>
+</ol>
+<pre><code>// client-side outbox (simplified)
+function send(convId, text) {
+  const msg = { clientMsgId: uuidv4(), convId, text, state: "PENDING" };
+  localDb.outbox.insert(msg);  ui.append(msg);
+  trySend(msg);
+}
+function trySend(msg, attempt = 0) {
+  socket.send({ type: "SEND", ...msg });
+  timers.set(msg.clientMsgId, setTimeout(
+    () =&gt; trySend(msg, attempt + 1),
+    Math.min(30000, 1000 * 2 ** attempt) * (0.5 + Math.random())));  // backoff + jitter
+}
+socket.on("ACK", ({ clientMsgId, msgId, seq }) =&gt; {
+  clearTimeout(timers.get(clientMsgId));
+  localDb.outbox.markSent(clientMsgId, msgId, seq);    // ✓ sent
+});</code></pre>
+<p>The combination — <strong>at-least-once transport + idempotent processing + dedup on display</strong> — gives users the experience of exactly-once, which is the only kind of exactly-once real distributed systems can offer.</p>
+
+<h2>10. Offline users, push and sync</h2>
+<p>Most of the time the recipient is <em>not</em> connected: the app is closed or the phone is asleep. The design must treat offline as the normal case.</p>
+<ol class="steps">
+  <li><strong>Store</strong>: the message is already durable in the messages store (step 6 above). Nothing is "queued for Bob" separately — the conversation log <em>is</em> the queue.</li>
+  <li><strong>Notify</strong>: the Notification Service, consuming the message event from Kafka, sends a push via <strong>APNs/FCM</strong>: "Alice: pizza?" (or a generic "New message" when content must stay private). Pushes for the same conversation are collapsed so 20 messages don't produce 20 banners.</li>
+  <li><strong>Reconnect</strong>: when Bob opens the app, it establishes a connection, registers in the session registry, and immediately <strong>syncs</strong>.</li>
+  <li><strong>Sync from a cursor</strong>: the device sends the last position it has fully processed; the server returns everything after it, in order, in pages.</li>
+</ol>
+<p>Two common cursor designs:</p>
+<div class="table-wrap"><table>
+  <tr><th>Design</th><th>How sync works</th><th>Pros / cons</th></tr>
+  <tr><td><b>Per-conversation cursors</b></td><td>Device sends <code>{c9: 41, c12: 1007, …}</code>; server returns messages with <code>seq</code> greater than each.</td><td>Simple; but a user in 500 conversations must check 500 cursors, most unchanged.</td></tr>
+  <tr><td><b>Per-user update log</b> ⭐</td><td>Every event relevant to a user (new message, receipt, reaction, conversation renamed) is appended to that user's own ordered log with a user-level sequence. Device sends one number: "I have up to 88,214."</td><td>One cheap range read per sync, covers every event type; costs an extra write per recipient (fan-out on write). Facebook has publicly described a per-user ordered queue design ("Iris") for Messenger sync.</td></tr>
+</table></div>
+<pre><code>GET /v1/sync?cursor=88214&amp;limit=200
+→ { "events": [
+      {"useq": 88215, "type": "message", "conv": "c9", "seq": 42, "from": "alice", "text": "pizza?"},
+      {"useq": 88216, "type": "read",    "conv": "c12", "user": "carol", "up_to_seq": 1007},
+      {"useq": 88217, "type": "reaction","conv": "c9", "seq": 42, "emoji": "❤️", "from": "dan"} ],
+    "next_cursor": 88217, "has_more": false }</code></pre>
+<p>This same mechanism solves <strong>multi-device sync</strong>: each device keeps its own cursor into the same per-user log, so the phone and laptop independently catch up to the same state. A device offline for months may get a "cursor too old" response and do a full resync of recent conversations instead.</p>
+
+<h2>11. Receipts: sent, delivered, seen</h2>
+<div class="flow">
+  <div class="fnode client">🕓 Pending<small>in local outbox</small></div><div class="farrow">→<small>server ACK</small></div>
+  <div class="fnode svc">✓ Sent<small>durably stored</small></div><div class="farrow">→<small>device ACK</small></div>
+  <div class="fnode svc">✓✓ Delivered<small>on recipient device</small></div><div class="farrow">→<small>chat opened</small></div>
+  <div class="fnode client">👁 Seen<small>read watermark</small></div>
+</div>
+<p>A naive design stores a status row per message per recipient and updates it twice. For a 100-member group that's 200 writes per message — far more than the message itself. The efficient design uses <strong>watermarks</strong>:</p>
+<ul>
+  <li>For each (conversation, member) store <code>last_delivered_seq</code> and <code>last_read_seq</code>. Because sequence numbers are ordered, "read up to 45" implies 1–45 are all read. One small update covers any number of messages.</li>
+  <li>Bob's device sends <code>read(c9, up_to=45)</code> when the chat is visible; the server updates the watermark only if it <strong>increases</strong> (monotonic — duplicates and out-of-order receipts are harmless) and relays it to the other members' devices as an event.</li>
+  <li>The sender's UI computes each message's state by comparing its <code>seq</code> with the watermarks: in a group, "Seen by Carol, Dan + 3" = members whose <code>last_read_seq ≥ seq</code>.</li>
+  <li>Receipts are <strong>coalesced</strong>: if Bob reads 30 messages, one receipt is sent, not 30. Delivered receipts can be batched per device every second or so.</li>
+  <li>Users can disable read receipts; the server then simply doesn't relay them (it may still store the watermark to sync Bob's own devices' unread badges).</li>
+</ul>
+
+<h2>12. Presence and typing indicators</h2>
+<h3>12.1 Presence via heartbeats</h3>
+<p><strong>Presence</strong> = is the user online now, or when were they last active? The gateway already knows when a connection opens, closes or goes silent, so presence is derived from connection state plus heartbeats:</p>
+<pre><code># on connect and on every heartbeat (~30 s), the gateway batches updates:
+SET presence:bob  "online"  EX 70          # expires if 2 heartbeats are missed
+SET last_active:bob 1730000123             # for "Active 5m ago"
+
+# a viewer's inbox shows 20 conversations → one batched read:
+MGET presence:alice presence:carol presence:dan ...</code></pre>
+<ul>
+  <li><strong>Don't broadcast every change to everyone.</strong> If each of 150M users toggles online/offline ~10 times a day and has ~200 contacts, pushing every change would be 300B presence messages/day. Instead use <strong>interest-based delivery</strong>: fetch presence when you open the inbox or a chat (pull), and <em>subscribe</em> to live changes only for the conversations currently on screen.</li>
+  <li><strong>Debounce flapping</strong>: a phone switching from Wi-Fi to 4G disconnects for a second. Mark someone offline only after the TTL expires (e.g. ~60 s without heartbeat), and treat a quick reconnect as continuous presence.</li>
+  <li><strong>Approximate is fine</strong>: "Active now" being 30 s stale is invisible to users, so presence lives only in memory with TTLs — never in the durable store.</li>
+  <li><strong>Privacy</strong>: users can hide activity status; presence is only shown to people you follow or have chatted with.</li>
+</ul>
+
+<h3>12.2 Typing indicators</h3>
+<p>"Alice is typing…" is the most ephemeral signal of all:</p>
+<ul>
+  <li>The client sends <code>typing(c9)</code> when the user starts typing and then at most once every ~3–5 s while they keep typing — never per keystroke.</li>
+  <li>The Chat Service relays it straight to the online participants' gateways: <strong>no persistence, no Kafka, no retries, no push notifications, no sync</strong>. If it's lost, nobody cares.</li>
+  <li>The receiver shows the indicator and <strong>auto-hides it after ~5–6 s</strong> without a refresh (so a sender who closes the app doesn't leave "typing…" forever).</li>
+  <li>Under load, typing indicators are the first thing to shed (see <a href="resilience-patterns.html">graceful degradation</a>).</li>
+</ul>
+<div class="callout tip"><span class="callout-title">💡 Classify every signal by its guarantees</span>
+Messages: durable, ordered, at-least-once, synced. Receipts: durable watermarks, monotonic, coalesced. Presence: in-memory, TTL'd, pulled on demand. Typing: fire-and-forget. Giving each signal only the guarantees it needs is what keeps the system affordable.</div>
+
+<h2>13. Group conversations and fan-out</h2>
+<p>A message to a group of <em>n</em> members needs <em>n − 1</em> deliveries (times the number of devices each). The question — just like in the <a href="news-feed.html">news feed</a> — is where to fan out.</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Shared conversation log (write once) ⭐</th><th>Per-member copies (write diffusion)</th></tr>
+  <tr><td><b>Storage write</b></td><td>1 row in <code>messages</code> for the conversation</td><td>n rows, one in each member's mailbox</td></tr>
+  <tr><td><b>Reading history</b></td><td>Read the conversation partition</td><td>Read your own mailbox</td></tr>
+  <tr><td><b>Per-member work</b></td><td>Small: inbox pointer/unread count + user update-log entry + delivery to online devices</td><td>Full message copy per member</td></tr>
+  <tr><td><b>Edits, unsend, reactions</b></td><td>Change one row</td><td>Change n rows</td></tr>
+  <tr><td><b>Best for</b></td><td>Groups of any size; the default</td><td>Small groups where per-user mailboxes simplify sync (some systems do this)</td></tr>
+</table></div>
+<p>Delivery itself always fans out: the Chat Service looks up the members (cached <code>conversation_members</code>), batch-reads their sessions from the registry (one pipelined call), groups the target devices by gateway, and sends <strong>one batched RPC per gateway</strong> containing all of its recipients. For a 250-member group with ~1.5 devices online each, that's ~370 device pushes but only a few dozen RPCs. Offline members get a (collapsed, possibly muted) push notification and pick the message up on sync.</p>
+<ul>
+  <li><strong>Cap group size</strong> (a few hundred members) so fan-out per message stays bounded; very large audiences are a different product (broadcast channels) with fan-out-on-read semantics.</li>
+  <li><strong>Ordering</strong> in groups comes from the same per-conversation <code>seq</code> — critical because concurrent senders are common.</li>
+  <li><strong>Membership changes</strong> are themselves messages in the log ("Dan added Erin") with a seq, so every device applies them in the same order relative to messages; a removed member stops receiving deliveries from that seq onward.</li>
+</ul>
+
+<h2>14. End-to-end encryption (E2EE) basics</h2>
+<p>With normal (transport) encryption, TLS protects messages <em>on the wire</em>, but the server decrypts and stores them — so the company (or an attacker who breaches it) could read them. With <strong>end-to-end encryption</strong>, only the participants' devices hold the keys; the server stores and forwards <strong>ciphertext</strong> it cannot read.</p>
+<h3>14.1 The Signal protocol idea</h3>
+<p>The <strong>Signal protocol</strong>, used by Signal and WhatsApp and adopted by Meta for Messenger and Instagram DMs, combines two pieces:</p>
+<ol class="steps">
+  <li><strong>Key publication</strong>: each device generates a long-term <em>identity key pair</em>, a <em>signed prekey</em> and a batch of <em>one-time prekeys</em>, and uploads only the <strong>public</strong> halves to the server's key directory. Private keys never leave the device.</li>
+  <li><strong>X3DH (initial key agreement)</strong>: to start a chat with Bob even while he's offline, Alice fetches Bob's public "prekey bundle" and combines several Diffie-Hellman calculations (her identity and a fresh ephemeral key with his identity, signed prekey and a one-time prekey). Both sides can derive the same <strong>shared secret</strong>, but the server — which only saw public keys — cannot.</li>
+  <li><strong>Double Ratchet (ongoing messages)</strong>: every message is encrypted with a <strong>new key</strong> derived by "ratcheting" a chain forward, mixed with fresh Diffie-Hellman exchanges as replies flow. Stealing today's key doesn't decrypt past messages (<strong>forward secrecy</strong>), and the conversation heals after a compromise once new DH exchanges happen (<strong>post-compromise security</strong>).</li>
+</ol>
+<pre class="ascii">
+ Bob's device                    Server (relay + key directory)                 Alice's device
+ gen IK_B, SPK_B, OPK_B[1..100]
+ ── upload PUBLIC keys ─────────► stores IK_B, SPK_B, OPK_B…
+                                 ◄──────────────────── fetch Bob's bundle ───── (first message)
+                                                         X3DH: DH(IK_A,SPK_B), DH(EK_A,IK_B),
+                                                               DH(EK_A,SPK_B), DH(EK_A,OPK_B) → secret
+                                 ◄─── ciphertext + EK_A(public) + OPK id ────── Double Ratchet: msg key #1
+ ◄── relay ciphertext ──────────  (sees: sender, recipient, time, size —
+ same DH math → same secret        NOT the content)
+ decrypt; ratchet forward
+</pre>
+<h3>14.2 What E2EE changes in the system design</h3>
+<ul>
+  <li><strong>Multi-device</strong>: each device has its own keys, so the sender encrypts a message separately for <em>every device</em> of every participant (client-side fan-out). Groups use "sender keys": a sender distributes a group key once per member device (pairwise-encrypted), then encrypts each message once.</li>
+  <li><strong>Server features shrink</strong>: no server-side search of message text, no server-generated link previews, no content-based spam/abuse scanning (systems rely on metadata, user reports — which forward the reported plaintext — and client-side signals instead).</li>
+  <li><strong>History and new devices</strong>: a new device can't decrypt old messages from the server; history needs encrypted backups or device-to-device transfer.</li>
+  <li><strong>Metadata remains visible</strong>: who talks to whom and when is still needed for routing; minimising and protecting it is a separate effort (see <a href="security.html">Security &amp; privacy</a>).</li>
+  <li>The storage, ordering, receipts and sync designs above are <strong>unchanged</strong> — they just carry opaque <code>body</code> bytes.</li>
+</ul>
+
+<h2>15. Scaling: the numbers end to end</h2>
+<div class="table-wrap"><table>
+  <tr><th>Component</th><th>Load (assumptions from section 2.3)</th><th>How it scales</th></tr>
+  <tr><td>Gateways</td><td>~150M concurrent connections; ~5M heartbeats/s</td><td>~300–500 servers at ~300–500k connections each; add servers, drain gracefully; regional deployment near users</td></tr>
+  <tr><td>Chat Service</td><td>~400k sends/s peak, plus receipts (often more than messages)</td><td>Stateless instances behind internal LB; conversation-affinity routing for sequencing; scale horizontally</td></tr>
+  <tr><td>Session registry</td><td>~1M+ lookups/s (one per recipient), writes on connect/disconnect</td><td>Redis cluster sharded by user_id, replicas; TTL-based cleanup</td></tr>
+  <tr><td>Messages store</td><td>~400k writes/s; ~3.6 TB/day raw; ~4 PB/year with replication</td><td>Cassandra/HBase cluster of hundreds of nodes; partition by conversation; tiered/cold storage for old buckets</td></tr>
+  <tr><td>Per-user update log / inbox</td><td>Writes = deliveries (×group size)</td><td>Partition by user_id; trim old entries (devices that fall too far behind do full resync)</td></tr>
+  <tr><td>Kafka</td><td>Message events for notifications, inbox, analytics, search-of-own-inbox (if not E2EE)</td><td>Partition by conversation_id; consumer groups per downstream</td></tr>
+  <tr><td>Push notifications</td><td>Tens of thousands/s, collapsed per conversation</td><td>Notification Service → APNs/FCM with batching and rate limits</td></tr>
+</table></div>
+<p>Latency budget for an online-to-online message (assumptions): client → gateway ~30–80 ms (mobile network), gateway → Chat Service ~1 ms, persist with quorum ~5–10 ms, registry lookup ~1 ms, route to recipient gateway ~1–2 ms (same region), gateway → device ~30–80 ms. Total ≈ <strong>70–180 ms</strong>; cross-region conversations add an inter-region hop (~50–150 ms).</p>
+<p><strong>Multi-region</strong>: users connect to the nearest region's gateways. A conversation needs one home for sequencing (e.g. the region of its creator or a consistent hash), and cross-region delivery goes through region-to-region links; the message store replicates across regions for disaster recovery (see <a href="multi-region.html">Multi-region</a>).</p>
+
+<h2>16. How Instagram uses real-time messaging</h2>
+<ol>
+  <li>When the app is open, it keeps a <strong>persistent connection</strong> through the load balancer to a gateway (the diagram's "Direct Messaging (WebSocket)" service).</li>
+  <li>Sending a DM goes over that connection to the <strong>Direct Messaging service</strong>, which validates, sequences and persists it in the <strong>Messages Store (Cassandra/HBase)</strong>, then routes it via the session registry to the recipient's gateway.</li>
+  <li>A <strong>Kafka</strong> event drives the inbox update, analytics, and the <strong>Notification Service → APNs/FCM</strong> push for offline recipients.</li>
+  <li>Photos, videos and voice notes go to <strong>Object Storage</strong> via pre-signed URLs and are served by the <strong>CDN</strong>; shared posts and Reels are sent as references (IDs), hydrated like feed posts.</li>
+  <li>On reconnect, the app <strong>syncs from its cursor</strong>, so the phone, tablet and web client converge on the same history and read state.</li>
+</ol>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+Instagram Direct launched in 2013. In 2020 Meta publicly announced cross-app messaging between Instagram and Messenger, which implies the two share messaging infrastructure. Facebook's public engineering posts describe Messenger's evolution: <strong>MQTT</strong> persistent connections on mobile (2011), <strong>HBase</strong> message storage (2010), a per-user ordered sync queue called <strong>Iris</strong> (2014), a move of storage to MySQL/MyRocks (2018), and Signal-protocol-based <strong>E2EE</strong> rolled out for Messenger and Instagram DMs. Exact internals and numbers are not public; the design in this lesson is consistent with those public descriptions and with how other large chat systems (WhatsApp, Discord, Slack) describe theirs.</div>
+
+<h2>17. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Persistent connections + durable log + sync: benefits</h4><ul>
+    <li>Sub-second delivery to online users</li>
+    <li>No message loss: persist-before-ack, sync fills every gap</li>
+    <li>No visible duplicates thanks to client IDs and dedup</li>
+    <li>Same order on every device via per-conversation seq</li>
+    <li>Multi-device and offline handled by one mechanism (cursor sync)</li>
+    <li>Gateways are simple and stable; logic lives in stateless services</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs</h4><ul>
+    <li>Hundreds of stateful gateway servers and reconnect-storm risk</li>
+    <li>Session registry is a soft-state dependency that can be stale</li>
+    <li>Per-conversation sequencing needs single-writer routing and failover care</li>
+    <li>Receipts and presence can generate more traffic than messages</li>
+    <li>E2EE removes server-side search, previews and content moderation</li>
+    <li>Multi-region conversations add latency and complexity</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Acking before persisting</strong> — a crash loses messages the sender believes were sent.</li>
+  <li><strong>Treating the push notification or the WebSocket push as the delivery guarantee</strong> — both are best-effort; the stored log + sync is the guarantee.</li>
+  <li><strong>Ordering by client timestamps</strong> — clock skew scrambles conversations. Use server-assigned per-conversation sequence numbers.</li>
+  <li><strong>Retrying without an idempotency key</strong> — duplicate messages on flaky networks.</li>
+  <li><strong>Per-message receipt rows</strong> — use monotonic watermarks.</li>
+  <li><strong>Broadcasting presence to all contacts</strong> — use pull + subscribe-while-visible.</li>
+  <li><strong>Business logic in gateways</strong> — every logic change then forces reconnecting millions of clients.</li>
+  <li><strong>Clients reconnecting without jitter</strong> — a gateway crash becomes a self-inflicted DDoS.</li>
+  <li><strong>Unbounded partitions</strong> for long-lived busy conversations — bucket by time.</li>
+</ul>
+
+<h2>18. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>Role</th><th>When to use it</th></tr>
+  <tr><td>WebSocket servers (Netty, Go, Node.js ws, Elixir Phoenix)</td><td>Gateway tier holding persistent connections</td><td>Browser and app chat; the default choice</td></tr>
+  <tr><td>MQTT brokers (EMQX, HiveMQ, Mosquitto)</td><td>Pub/sub over persistent connections, small headers, QoS levels</td><td>Mobile messaging on poor networks, IoT</td></tr>
+  <tr><td>Erlang/Elixir (BEAM)</td><td>Massive concurrency with lightweight processes</td><td>Connection-heavy systems (WhatsApp, Discord publicly use it)</td></tr>
+  <tr><td>Redis</td><td>Session registry, presence with TTLs, dedup keys, inbox sorted sets, pub/sub</td><td>Soft, fast, in-memory state</td></tr>
+  <tr><td>Cassandra / ScyllaDB / HBase</td><td>Durable message history partitioned by conversation</td><td>High write throughput, time-ordered data (Discord publicly moved from Cassandra to ScyllaDB)</td></tr>
+  <tr><td>Kafka</td><td>Message events to notification, inbox and analytics consumers</td><td>Decoupled asynchronous side effects</td></tr>
+  <tr><td>APNs / FCM</td><td>OS push notifications to offline devices</td><td>Waking or alerting devices without a live connection</td></tr>
+  <tr><td>libsignal</td><td>Signal protocol implementation (X3DH, Double Ratchet)</td><td>Adding E2EE</td></tr>
+  <tr><td>Managed: Firebase Realtime DB/Firestore, Pusher, Ably, AWS AppSync / API Gateway WebSockets</td><td>Hosted real-time messaging infrastructure</td><td>Small and medium apps that don't want to run gateways</td></tr>
+</table></div>
+
+<h2>19. Interview corner</h2>
+<details class="qa"><summary>Design Instagram Direct. Walk me through sending a message.</summary>
+<p>Online devices keep a WebSocket/MQTT connection to a gateway; the gateway registers user/device → gateway in a Redis session registry. Alice sends {conversation_id, client_msg_id, body}; the gateway forwards to the stateless Chat Service, which authorises, dedups on client_msg_id, assigns a time-ordered msg_id and a per-conversation seq (single writer per conversation), writes to Cassandra (partition conversation_id+bucket, clustered by msg_id), then ACKs Alice ("sent"). It publishes a Kafka event (inbox, notifications, analytics), looks up Bob's devices in the registry and pushes to their gateways; Bob's device ACKs ("delivered") and later sends a read watermark ("seen"). If Bob is offline, he gets an APNs/FCM push and syncs from his cursor on reconnect.</p></details>
+<details class="qa"><summary>WebSockets vs long polling vs SSE — which and why?</summary>
+<p>WebSockets (or MQTT on mobile): full-duplex, tiny frame overhead, real-time in both directions — exactly what chat with typing indicators and receipts needs. Long polling works through any proxy and is a good fallback, but costs a full HTTP request per delivery and hanging requests at every hop. SSE is server→client only, so sends need separate HTTP calls; good for notification streams, not interactive chat. Short polling wastes enormous capacity and still adds seconds of latency.</p></details>
+<details class="qa"><summary>How do you guarantee messages are not lost and not duplicated?</summary>
+<p>No loss: persist to a replicated store before ACKing the sender; the client keeps unacked messages in a local outbox and retries; recipients get messages either by push or by cursor-based sync from the durable log, so a failed push is never a lost message. No duplicates: the client attaches a UUID client_msg_id reused across retries; the server dedups (sender, client_msg_id) and returns the original ACK; recipients dedup by msg_id before display. That's at-least-once delivery with idempotent processing — effectively exactly-once to the user.</p></details>
+<details class="qa"><summary>How do you order messages in a group chat?</summary>
+<p>A per-conversation monotonically increasing sequence number assigned by a single writer for that conversation (route by hash of conversation_id to an owner; on failover the new owner reads the last seq from storage). Every member orders by seq, so everyone sees the same order; clients detect gaps (got 45, have 43) and fetch the missing range via sync. Client timestamps are never used for ordering; time-ordered IDs alone aren't strictly ordered across servers.</p></details>
+<details class="qa"><summary>A gateway server with 400k connections crashes. What happens?</summary>
+<p>Those clients detect the broken connection (TCP reset or missed heartbeat) and reconnect with exponential backoff + jitter, landing on other gateways via the load balancer. Registry entries for the dead gateway expire via TTL (or are cleaned by a health monitor). Messages routed to the dead gateway in the meantime fail to deliver but are already persisted; each reconnecting client syncs from its cursor and receives them. Backend sync capacity must be rate-limited to absorb the burst; no data is lost.</p></details>
+<details class="qa"><summary>How would you implement presence for hundreds of millions of users?</summary>
+<p>Derive it from connections: gateways batch heartbeat updates into Redis keys with TTL (~60–70 s) plus a last_active timestamp. Don't push presence changes to all contacts; clients fetch presence for visible conversations (batched MGET) and subscribe to changes only while a chat or inbox is on screen. Debounce flapping by waiting for TTL expiry before showing offline. Keep it in memory only; it's approximate by design and respects privacy settings.</p></details>
+<details class="qa"><summary>Why Cassandra/HBase for messages, and what's the key design?</summary>
+<p>The workload is write-heavy, append-only, time-ordered, enormous, and read as "latest N of a conversation" or "everything after seq S" — ideal for an LSM-based wide-column store that scales horizontally with built-in replication. Partition key (conversation_id, time bucket) keeps a conversation together and bounds partition size; clustering key message_id DESC stores rows pre-sorted for newest-first reads. Facebook publicly used HBase for Messages. The inbox (per-user conversation list) is a separate table/sorted set because it's a different access pattern.</p></details>
+<details class="qa"><summary>What changes if we add end-to-end encryption?</summary>
+<p>Devices generate key pairs and upload public prekeys; senders run X3DH to establish a shared secret and Double Ratchet to derive per-message keys (forward secrecy). The server stores and routes ciphertext only. Each device of each participant needs its own encrypted copy (or sender keys for groups), so client-side fan-out grows. We lose server-side message search, link previews and content scanning; history on new devices needs encrypted backup. Ordering, receipts, storage and sync stay the same — they operate on metadata.</p></details>
+
+<h2>20. Check your understanding</h2>
+<details class="quiz"><summary>150M devices short-poll every 5 seconds. How many requests per second is that, and what fraction is wasted if a device receives a message on average once every 10 minutes?</summary>
+<p>150M / 5 = <strong>30M requests/s</strong>. A device polls 120 times per 10 minutes and gets data in ~1 of them, so ~99% of requests return nothing — and messages still wait up to 5 s. This is why persistent connections are used.</p></details>
+<details class="quiz"><summary>Why does the Chat Service persist the message before sending the ACK to the sender, rather than after delivering to the recipient?</summary>
+<p>The ACK is a promise that the message won't be lost. Persisting first makes that true even if the service crashes immediately after. Waiting for delivery would make sending as slow as the recipient's network — and impossible when the recipient is offline. Delivery is a separate, retriable step backed by sync.</p></details>
+<details class="quiz"><summary>Bob's phone received messages with seq 41, 42 and 44 in conversation c9. What should it do?</summary>
+<p>Display 41 and 42; hold 44 (or display it with a gap) and request the missing range via sync (<code>seq &gt; 42</code>). Seq 43 may still be in flight or may have been lost on a broken connection; the sync from the durable log guarantees it arrives, and then 43 and 44 are shown in order.</p></details>
+<details class="quiz"><summary>Alice taps send in a tunnel; the request reaches the server and is stored, but the ACK is lost. She retries 3 times. How many messages does Bob see, and why?</summary>
+<p><strong>One.</strong> All retries carry the same client_msg_id; the server finds (alice, client_msg_id) already processed and returns the original msg_id/seq without storing a new row. Even if a duplicate delivery reached Bob, his app dedups by msg_id.</p></details>
+<details class="quiz"><summary>A group has 200 members and receives 1,000 messages a day. Compare receipt writes for per-message status rows vs watermarks if each member reads the chat 5 times a day.</summary>
+<p>Per-message rows: 1,000 messages × 199 recipients × 2 statuses ≈ <strong>~400,000 writes/day</strong>. Watermarks: each member advances read (and delivered) watermarks a handful of times per session — e.g. 200 members × 5 reads × ~2 updates ≈ <strong>~2,000 writes/day</strong>. Roughly 200× fewer.</p></details>
+<details class="quiz"><summary>Which of these should be persisted durably: (a) a message, (b) a typing indicator, (c) a read receipt, (d) "Active now"?</summary>
+<p>(a) yes — the source of truth. (c) yes, as a compact watermark, so read state syncs across devices. (b) no — fire-and-forget relay. (d) no — in-memory with a TTL; only the coarse last_active timestamp might be persisted.</p></details>
+<details class="quiz"><summary>Why should gateways contain no business logic?</summary>
+<p>Every gateway deploy disconnects hundreds of thousands of clients, causing reconnect storms and sync load. Keeping gateways as dumb connection holders means they rarely change, while logic (validation, sequencing, routing) lives in stateless services that can be redeployed freely without dropping connections.</p></details>
+<details class="quiz"><summary>With 500k connections per gateway at ~30 KB each, how much RAM does connection state need, and how many gateways for 150M connections with 30% headroom?</summary>
+<p>500k × 30 KB ≈ <strong>15 GB</strong> per server. 150M / 500k = 300 servers; with 30% headroom (to absorb a failed server's or zone's reconnects) ≈ <strong>~390–400 gateways</strong>.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Chat needs <strong>server push</strong>: persistent <strong>WebSocket/MQTT</strong> connections held by dedicated, logic-free <strong>gateways</strong> (hundreds of thousands of sockets each via event loops).</li>
+    <li>A TTL'd <strong>session registry</strong> maps user → device → gateway so the stateless Chat Service can route; it's a hint, not a guarantee.</li>
+    <li><strong>Persist before ACK</strong> in a store partitioned by <strong>conversation_id</strong> and clustered by <strong>time-ordered message ID</strong>; order by a server-assigned <strong>per-conversation seq</strong>.</li>
+    <li><strong>At-least-once + client_msg_id dedup</strong> = no loss, no duplicates. Offline users get <strong>push notifications</strong> and <strong>cursor-based sync</strong>, which also powers multi-device.</li>
+    <li>Give each signal only the guarantees it needs: receipts as <strong>watermarks</strong>, presence via <strong>heartbeats + TTL</strong>, typing as <strong>fire-and-forget</strong>.</li>
+    <li><strong>E2EE</strong> (Signal: X3DH + Double Ratchet) makes the server a relay of ciphertext — the pipeline stays, server-side content features go away.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="api-design.html">API Design</a> — WebSockets vs REST/gRPC, idempotency keys</li>
+  <li><a href="networking-basics.html">Networking Basics</a> — TCP, TLS and keep-alive under persistent connections</li>
+  <li><a href="load-balancer.html">Load Balancing</a> — L4 balancing and draining of long-lived connections</li>
+  <li><a href="message-queues.html">Message Queues &amp; Kafka</a> — delivery guarantees and the events behind inbox and notifications</li>
+  <li><a href="databases.html">Databases</a> — why wide-column stores fit message history</li>
+  <li><a href="id-generation.html">Unique ID Generation</a> — time-ordered message IDs</li>
+  <li><a href="notifications.html">Notification System</a> — pushes for offline recipients</li>
+  <li><a href="security.html">Security &amp; Privacy</a> — encryption in transit, at rest and end to end</li>
+  <li><a href="resilience-patterns.html">Resilience patterns</a> — backoff with jitter, reconnect storms, graceful degradation</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authentication &amp; Authorization — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="authentication">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li><strong>Authentication (AuthN)</strong> proves <em>who you are</em>; <strong>authorization (AuthZ)</strong> decides <em>what you may do</em>. Instagram does both on every request.</li>
+    <li>Passwords are never stored — only a <strong>slow, salted hash</strong> (bcrypt, scrypt or Argon2), optionally with a secret <strong>pepper</strong>.</li>
+    <li>After login a client holds either a <strong>session ID</strong> (looked up in a store like Redis) or a <strong>signed token</strong> such as a JWT (validated statelessly). Short-lived <strong>access tokens</strong> + long-lived, rotating <strong>refresh tokens</strong> give the best of both.</li>
+    <li><strong>OAuth 2.0</strong> (with <strong>PKCE</strong> for mobile) delegates access; <strong>OpenID Connect</strong> adds identity on top — that's how "Log in with Facebook" works. <strong>MFA</strong> adds a second factor (prefer TOTP/passkeys over SMS).</li>
+    <li>The <strong>gateway validates identity</strong>; each <strong>service enforces object-level permissions</strong> (private accounts, blocks, close friends) — skipping that causes <strong>IDOR</strong> vulnerabilities.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why authentication and authorization are hard at Instagram</h2>
+<p>Instagram has well over a billion accounts. Each account holds private photos, private messages, a phone number and an email, and for many people it's their business or livelihood. Every one of the millions of API requests per second must answer two questions correctly:</p>
+<ol>
+  <li><strong>Who is making this request?</strong> Is it really @alice on her phone, or an attacker who stole her password, or a bot?</li>
+  <li><strong>Is that person allowed to do this?</strong> Can Bob see this post (Alice's account is private and Bob doesn't follow her)? Can Bob delete this comment (only if he wrote it or owns the post)? Can Carol DM Alice (not if Alice blocked her)?</li>
+</ol>
+<p>And it must do this <strong>fast</strong> (a millisecond or less of overhead), <strong>at massive scale</strong>, while being resistant to constant attack: credential stuffing (trying leaked passwords from other sites), phishing, SIM-swap attacks on SMS codes, stolen tokens and automated account creation. A single bug in an authorization check can leak private photos of millions of people.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  At an airport, the <strong>passport check</strong> is authentication: an officer verifies that you are who you claim to be. Your <strong>boarding pass</strong> is authorization: it says which flight, which seat and which lounge you're allowed into. Once you've passed security you get a wristband-like boarding pass instead of showing your passport at every door (that's the token). And the gate agent still checks <em>this</em> boarding pass is for <em>this</em> flight (that's the object-level check) — being inside the airport doesn't let you board any plane you like.
+</div>
+
+<h2>2. Authentication vs authorization</h2>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Authentication (AuthN)</th><th>Authorization (AuthZ)</th></tr>
+  <tr><td><b>Question</b></td><td>"Who are you?"</td><td>"What are you allowed to do?"</td></tr>
+  <tr><td><b>Input</b></td><td>Credentials: password, OTP code, passkey, social login, a token</td><td>An authenticated identity + the action + the resource + context</td></tr>
+  <tr><td><b>Output</b></td><td>A verified identity (user ID), usually materialised as a session or token</td><td>Allow / deny (sometimes "allow with filters")</td></tr>
+  <tr><td><b>Frequency</b></td><td>Full login rarely; token check on every request</td><td>On every request and often for every object returned</td></tr>
+  <tr><td><b>Failure status</b></td><td><code>401 Unauthorized</code> (confusingly named — it means <em>unauthenticated</em>)</td><td><code>403 Forbidden</code> (or <code>404</code> to avoid revealing existence)</td></tr>
+  <tr><td><b>Instagram example</b></td><td>Logging in with username + password + 2FA code</td><td>Hiding a private account's posts from non-followers</td></tr>
+</table></div>
+
+<h2>3. Storing passwords safely</h2>
+<p>The first rule: <strong>never store passwords in plain text, and never store them with reversible encryption.</strong> Databases get leaked — through backups, SQL injection, insiders or misconfigured buckets. If that happens, attackers must not be able to recover users' passwords (which people reuse on their bank and email).</p>
+
+<h3>3.1 Hashing, and why plain SHA-256 is not enough</h3>
+<p>A <strong>cryptographic hash function</strong> turns any input into a fixed-size fingerprint, one-way: easy to compute <code>H(password)</code>, infeasible to reverse. At login you compute <code>H(submitted)</code> and compare it to the stored hash.</p>
+<p>But general-purpose hashes like SHA-256 are designed to be <strong>fast</strong> — a modern GPU computes <em>billions</em> of SHA-256 hashes per second. Since human passwords come from a small space (dictionary words, names, "Summer2024!"), an attacker with a leaked table can simply try every likely password:</p>
+<pre><code>Assume an attacker's GPU rig does 10 billion SHA-256/s.
+All 8-character lowercase+digit passwords: 36^8 ≈ 2.8 × 10^12 → ~280 seconds.
+A 10-million-word dictionary × 1,000 common mutations = 10^10 guesses → 1 second.
+
+With bcrypt at cost 12 (~250 ms per hash on a server CPU; GPUs gain little):
+  roughly a few thousand guesses/s per GPU → the same dictionary takes months per user.</code></pre>
+<p>Plain hashes also have two more problems: identical passwords produce identical hashes (crack one, crack all), and attackers can use <strong>precomputed rainbow tables</strong>.</p>
+
+<h3>3.2 Salt</h3>
+<p>A <strong>salt</strong> is a random value (e.g. 16 bytes), unique per user, generated at signup and stored <em>next to</em> the hash. We hash <code>H(salt + password)</code>. Now:</p>
+<ul>
+  <li>Two users with password "sunshine1" have completely different hashes.</li>
+  <li>Precomputed tables are useless — they'd have to be rebuilt for every salt.</li>
+  <li>An attacker must attack each user's hash separately.</li>
+</ul>
+<p>Salts are not secret. Their job is uniqueness, not secrecy.</p>
+
+<h3>3.3 Slow, memory-hard password hashing: bcrypt, scrypt, Argon2</h3>
+<div class="table-wrap"><table>
+  <tr><th>Algorithm</th><th>Key idea</th><th>Tunable parameters</th><th>Notes</th></tr>
+  <tr><td><b>bcrypt</b> (1999)</td><td>Deliberately expensive key setup based on Blowfish; built-in salt</td><td>Cost factor (2^cost iterations; 10–12 typical)</td><td>Battle-tested, everywhere; input truncated at 72 bytes; not memory-hard</td></tr>
+  <tr><td><b>scrypt</b> (2009)</td><td>Memory-hard: requires lots of RAM, which makes GPU/ASIC attacks expensive</td><td>N (CPU/memory cost), r, p</td><td>Good choice; used in some cryptocurrencies</td></tr>
+  <tr><td><b>Argon2id</b> (2015)</td><td>Winner of the Password Hashing Competition; memory-hard and side-channel resistant</td><td>Memory (e.g. 64 MiB), iterations, parallelism</td><td>Current best-practice recommendation (OWASP)</td></tr>
+</table></div>
+<p>All of them produce a self-describing string that stores algorithm, parameters, salt and hash together, e.g.:</p>
+<pre><code>$argon2id$v=19$m=65536,t=3,p=1$c29tZXNhbHRzb21lc2FsdA$Rdescudvc4K1dYtr5Pe0rI2RhWw0eQ3J2X2sW6mY1kE
+$2b$12$R9h/cIPz0gi.URNNX3kh2OPST9/PgBkqquzi.Ss7KIUgO2t0jWMUW    (bcrypt, cost 12)</code></pre>
+<p>Because the parameters are stored in the string, you can <strong>raise the cost over time</strong>: on a user's next successful login, verify with the old parameters, then re-hash with the new ones.</p>
+
+<h3>3.4 Pepper</h3>
+<p>A <strong>pepper</strong> is a secret value shared by all users, stored <em>outside</em> the database (in a secrets manager or HSM). Typically you compute <code>HMAC(pepper, password)</code> and then Argon2 that, or encrypt the final hash with a key in the HSM. If only the database leaks, the attacker can't even start guessing without the pepper. The cost: pepper rotation is awkward (you can't re-hash without the plaintext, so you keep versions).</p>
+<pre><code>signup(password):
+    salt   = random_bytes(16)
+    peppered = HMAC_SHA256(PEPPER_v3, password)
+    hash   = argon2id(peppered, salt, m=64MiB, t=3, p=1)
+    store(user_id, hash_string, pepper_version=3)
+
+login(username, password):
+    row = users.find(username)                 # ALWAYS do the hash work, even if user not found
+    if row is None: argon2id(dummy...); return FAIL   # avoid timing leaks revealing which usernames exist
+    peppered = HMAC_SHA256(PEPPER[row.pepper_version], password)
+    if constant_time_equals(argon2id_verify(row.hash_string, peppered)):
+        maybe_rehash_with_stronger_params(...)
+        return OK
+    return FAIL</code></pre>
+<div class="callout tip"><span class="callout-title">💡 Capacity note</span>
+Slow hashing is deliberate, but it costs <em>your</em> servers too. Assume 20k logins/s at peak × 100 ms CPU each = 2,000 CPU cores just for password verification. That's why login endpoints are heavily <a href="rate-limiting.html">rate limited</a> (attackers could otherwise DoS you by forcing expensive hashes), and why most requests use cheap token checks instead of passwords.</div>
+
+<h2>4. Staying logged in: sessions vs tokens</h2>
+<p>After you prove your password once, the server gives the client a <strong>credential to present on every subsequent request</strong>. Two families exist.</p>
+
+<h3>4.1 Session-based authentication (stateful)</h3>
+<ol class="steps">
+  <li>On login, the server generates a long random <strong>session ID</strong> (e.g. 128+ bits from a CSPRNG).</li>
+  <li>It stores <code>session_id → {user_id, device_id, created_at, expires_at, ip}</code> in a <strong>session store</strong> — typically <a href="caching.html">Redis</a> (fast, TTL support) backed by a durable DB.</li>
+  <li>The client sends the session ID on every request: in a cookie for web (<code>Set-Cookie: sessionid=…; HttpOnly; Secure; SameSite=Lax</code>) or a header for mobile.</li>
+  <li>The server looks up the ID on each request. Found and unexpired → authenticated as that user.</li>
+  <li>Logout or "log out of all devices" = delete the session(s). <strong>Revocation is instant.</strong></li>
+</ol>
+<p>The session ID itself means nothing — it's an opaque pointer, like a coat-check ticket. Costs: a store lookup (~0.5 ms in Redis) on every request, and the session store becomes critical infrastructure that must scale and replicate (assume 2B active sessions × ~200 bytes ≈ 400 GB — sharded across a Redis cluster).</p>
+
+<h3>4.2 Token-based authentication with JWT (stateless)</h3>
+<p>A <strong>JSON Web Token (JWT)</strong> is a self-contained, signed credential. The server puts the claims (user ID, expiry, scopes) <em>into</em> the token and signs it. Any server holding the verification key can check it <strong>without a database lookup</strong>. A JWT has three Base64URL-encoded parts separated by dots: <code>header.payload.signature</code>.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 260" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <rect x="20" y="20" width="780" height="40" rx="6" fill="#eceff1" stroke="#455a64"/>
+  <text x="410" y="45" text-anchor="middle" font-family="Consolas, monospace" font-size="12.5"><tspan fill="#c62828">eyJhbGciOiJSUzI1NiIsImtpZCI6ImsyMDI2In0</tspan>.<tspan fill="#6a1b9a">eyJzdWIiOiIxMjM0IiwiZXhwIjoxNzkzMDk5ODAwfQ</tspan>.<tspan fill="#2e7d32">kX9f…Qz</tspan></text>
+  <g font-weight="600">
+    <rect x="20" y="100" width="240" height="140" rx="8" fill="#fdecea" stroke="#c62828"/><text x="140" y="124" text-anchor="middle">Header</text>
+    <rect x="290" y="100" width="260" height="140" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="420" y="124" text-anchor="middle">Payload (claims)</text>
+    <rect x="580" y="100" width="220" height="140" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="690" y="124" text-anchor="middle">Signature</text>
+  </g>
+  <g font-family="Consolas, monospace" font-size="11.5">
+    <text x="35" y="150">{</text>
+    <text x="45" y="168">"alg": "RS256",</text>
+    <text x="45" y="186">"kid": "k2026",</text>
+    <text x="45" y="204">"typ": "JWT"</text>
+    <text x="35" y="222">}</text>
+    <text x="305" y="150">{ "sub": "1234",</text>
+    <text x="313" y="168">"iss": "auth.instagram",</text>
+    <text x="313" y="186">"aud": "api", "did": "d-55",</text>
+    <text x="313" y="204">"iat": 1793098900,</text>
+    <text x="313" y="222">"exp": 1793099800 }</text>
+    <text x="595" y="150">RSA_sign(</text>
+    <text x="605" y="168">private_key,</text>
+    <text x="605" y="186">b64(header) + "." +</text>
+    <text x="605" y="204">b64(payload)</text>
+    <text x="595" y="222">)</text>
+  </g>
+  <g stroke="#555" stroke-width="1.2" fill="none" stroke-dasharray="4 3">
+    <path d="M200,60 L140,98"/><path d="M500,60 L420,98"/><path d="M745,60 L690,98"/>
+  </g>
+</svg>
+<div class="caption">A JWT: the header says how it's signed, the payload carries claims (Base64-encoded, NOT encrypted), and the signature proves nobody altered them.</div>
+</div>
+
+<ul>
+  <li><strong>Header</strong> — algorithm (<code>alg</code>) and key ID (<code>kid</code>, so verifiers know which public key to use during key rotation).</li>
+  <li><strong>Payload</strong> — <em>claims</em>: <code>sub</code> (subject = user ID), <code>iss</code> (issuer), <code>aud</code> (intended audience), <code>exp</code> (expiry), <code>iat</code> (issued at), <code>jti</code> (unique token ID), plus custom claims like device ID or scopes. <strong>Anyone can decode it</strong> — never put secrets or personal data in it.</li>
+  <li><strong>Signature</strong> — computed over <code>base64url(header) + "." + base64url(payload)</code>. Changing a single character of the payload invalidates it.</li>
+</ul>
+
+<h4>Signing: HS256 vs RS256 (and ES256/EdDSA)</h4>
+<div class="table-wrap"><table>
+  <tr><th></th><th>HS256 (HMAC + SHA-256)</th><th>RS256 (RSA signature + SHA-256)</th></tr>
+  <tr><td><b>Key type</b></td><td>Symmetric: one shared secret signs <em>and</em> verifies</td><td>Asymmetric: private key signs, public key verifies</td></tr>
+  <tr><td><b>Who can verify</b></td><td>Anyone with the secret — who can therefore also <em>forge</em> tokens</td><td>Anyone with the public key — they cannot forge</td></tr>
+  <tr><td><b>Speed</b></td><td>Very fast</td><td>Verify fast, sign slower; tokens bigger (256-byte signature for 2048-bit keys)</td></tr>
+  <tr><td><b>Key distribution</b></td><td>Secret must be copied to every verifier — larger blast radius if leaked</td><td>Public keys published (e.g. a JWKS endpoint); only the auth service holds the private key</td></tr>
+  <tr><td><b>Best for</b></td><td>A single service that both issues and verifies</td><td>Many verifiers (gateway fleet, many services, third parties) — Instagram's case</td></tr>
+</table></div>
+<p><strong>ES256</strong> (ECDSA) and <strong>EdDSA</strong> (Ed25519) are asymmetric like RS256 but with much smaller keys and signatures — increasingly preferred. Classic JWT pitfalls: accepting <code>"alg": "none"</code>, or letting an attacker switch RS256 to HS256 and sign with the <em>public</em> key as an HMAC secret. Always pin the expected algorithm in the verifier.</p>
+
+<h4>Stateless validation</h4>
+<pre><code>verify(token):
+    header, payload, sig = split(token, ".")
+    h = json(b64decode(header))
+    if h.alg != "RS256": reject                     # pin algorithm
+    key = jwks_cache[h.kid]                          # public keys cached locally, refreshed periodically
+    if not rsa_verify(key, header + "." + payload, sig): reject
+    claims = json(b64decode(payload))
+    if claims.exp &lt; now() - 30s_skew: reject (401, "token expired")
+    if claims.iss != "auth.instagram" or claims.aud != "api": reject
+    return claims.sub   # user id — no database call needed</code></pre>
+
+<h4>The revocation problem</h4>
+<p>Statelessness is a double-edged sword: if a token is valid by signature and expiry, every server will accept it — <strong>even after the user logs out, changes their password, or the token is stolen</strong>. Options:</p>
+<ul>
+  <li><strong>Short expiry</strong> (5–15 minutes): a stolen token is useful only briefly. This is why access tokens are short-lived.</li>
+  <li><strong>Denylist</strong>: store revoked <code>jti</code>s (or "tokens for user X issued before time T are invalid") in Redis, checked on each request. Small, because entries only need to live until the token would have expired anyway. But now you've reintroduced a lookup.</li>
+  <li><strong>Token version</strong> per user: put <code>ver</code> in the token; bump the user's version on password change; services compare against a cached value.</li>
+  <li><strong>Refresh-token revocation</strong>: revoke the long-lived refresh token in the database; the client can't get new access tokens, so access ends within one access-token lifetime.</li>
+</ul>
+
+<h3>4.3 Sessions vs JWTs compared</h3>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Opaque session ID + store</th><th>JWT (self-contained)</th></tr>
+  <tr><td><b>Server state</b></td><td>Session store required</td><td>None for validation</td></tr>
+  <tr><td><b>Per-request cost</b></td><td>Network lookup (~0.5 ms)</td><td>Local signature check (~0.05–0.2 ms)</td></tr>
+  <tr><td><b>Revocation</b></td><td>Instant — delete the session</td><td>Hard — wait for expiry or maintain a denylist</td></tr>
+  <tr><td><b>Cross-service</b></td><td>Every service needs store access (or gateway translates)</td><td>Any service with the public key can verify</td></tr>
+  <tr><td><b>Data freshness</b></td><td>Always current</td><td>Claims frozen until expiry (e.g. stale roles)</td></tr>
+</table></div>
+<p>Large systems usually combine them: an opaque or JWT <strong>access token</strong> checked at the gateway, plus a <strong>refresh token</strong> recorded server-side in a sessions table so it can be listed ("where you're logged in") and revoked.</p>
+
+<h2>5. Access tokens, refresh tokens and rotation</h2>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Access token</th><th>Refresh token</th></tr>
+  <tr><td><b>Purpose</b></td><td>Sent on every API call</td><td>Used only to obtain new access tokens</td></tr>
+  <tr><td><b>Lifetime</b></td><td>Short: minutes to an hour</td><td>Long: weeks to months (sliding)</td></tr>
+  <tr><td><b>Format</b></td><td>Often JWT (stateless check)</td><td>Opaque random string, stored hashed in the DB (stateful, revocable)</td></tr>
+  <tr><td><b>Sent to</b></td><td>Every API endpoint via the gateway</td><td>Only the auth service's <code>/token</code> endpoint</td></tr>
+  <tr><td><b>Stored on device</b></td><td>Memory</td><td>Secure storage: iOS Keychain / Android Keystore; HttpOnly cookie on web</td></tr>
+</table></div>
+<p><strong>Refresh token rotation:</strong> every time the client uses a refresh token, the server issues a <em>new</em> refresh token and invalidates the old one. If an <strong>old</strong> refresh token is ever presented again, someone has stolen and replayed it — the server revokes the entire token family (that device's session) and forces re-login.</p>
+<pre class="ascii">
+ App                                     Auth Service                         sessions DB
+  | -- GET /v1/feed (access A1, expired) --&gt; Gateway: 401 token_expired          |
+  | -- POST /v1/auth/token {refresh: R1} ---&gt; |  lookup hash(R1): valid, family F |
+  |                                          |  mark R1 used; create R2 ---------&gt;|
+  | &lt;-- {access: A2 (15 min), refresh: R2} --|                                   |
+  | -- GET /v1/feed (A2) --&gt; 200 OK                                              |
+  |                                                                              |
+  |   ... attacker replays stolen R1 later ...                                   |
+  |   Attacker -- {refresh: R1} -----------&gt; |  R1 already used! → REUSE DETECTED |
+  |                                          |  revoke whole family F ----------&gt;|
+  |   (both attacker and real app must log in again; user alerted)               |
+</pre>
+
+<h2>6. OAuth 2.0, PKCE and OpenID Connect</h2>
+
+<h3>6.1 What OAuth 2.0 solves</h3>
+<p><strong>OAuth 2.0</strong> is a framework for <strong>delegated authorization</strong>: letting an application access resources on a user's behalf <em>without ever seeing the user's password</em>. Example: a scheduling tool for businesses wants to publish posts to your Instagram professional account. Before OAuth, you'd have to give it your password — full access, forever. With OAuth, you grant it a limited-scope token (e.g. "publish content") that you can revoke.</p>
+<h4>The four roles</h4>
+<div class="cards">
+  <div class="card"><h4>👤 Resource owner</h4><p>The user who owns the data and grants access (you).</p></div>
+  <div class="card"><h4>📲 Client</h4><p>The app wanting access (the scheduling tool, or Instagram's own mobile app).</p></div>
+  <div class="card"><h4>🔐 Authorization server</h4><p>Authenticates the user, shows the consent screen, issues tokens (Instagram/Meta's auth service).</p></div>
+  <div class="card"><h4>🗄️ Resource server</h4><p>The API that accepts access tokens (Instagram's API behind the gateway).</p></div>
+</div>
+<p>Key terms: <strong>scopes</strong> (what access is requested, e.g. <code>profile:read media:publish</code>), <strong>redirect URI</strong> (where the user is sent back with a code), <strong>authorization code</strong> (a short-lived one-time code exchanged for tokens), <strong>grant types</strong> (authorization code, client credentials for machine-to-machine, refresh token; the old "implicit" and "password" grants are deprecated).</p>
+
+<h3>6.2 Authorization code flow with PKCE</h3>
+<p>Mobile apps and single-page web apps are <strong>public clients</strong>: they cannot keep a client secret (anyone can decompile the app). A malicious app on the same phone could register the same custom URL scheme and intercept the authorization code. <strong>PKCE</strong> (Proof Key for Code Exchange, pronounced "pixie") fixes this:</p>
+<ol>
+  <li>The app generates a random <code>code_verifier</code> (43–128 chars) and keeps it secret in memory.</li>
+  <li>It sends <code>code_challenge = BASE64URL(SHA256(code_verifier))</code> with the authorization request.</li>
+  <li>When exchanging the code for tokens, it must present the original <code>code_verifier</code>. The server hashes it and compares. An attacker who intercepted only the code can't produce the verifier.</li>
+</ol>
+<pre class="ascii">
+ User        Mobile App (client)          System Browser          Auth Server              Resource Server (API)
+  |  tap "Log in"   |                            |                        |                              |
+  |---------------&gt; | gen code_verifier V        |                        |                              |
+  |                 | C = b64url(sha256(V))      |                        |                              |
+  |                 |-- open /authorize?response_type=code&amp;client_id=app                                |
+  |                 |   &amp;redirect_uri=app://cb&amp;scope=openid profile&amp;state=S&amp;code_challenge=C           |
+  |                 |   &amp;code_challenge_method=S256 --&gt;|                        |                              |
+  |                 |                            |-- GET /authorize -----&gt;|                              |
+  |  &lt;------------- login page + consent --------|&lt;-----------------------|                              |
+  |-- password + 2FA, "Allow" ------------------&gt;|----------------------&gt; | verify user, store C          |
+  |                 |                            |&lt;-- 302 app://cb?code=K&amp;state=S                         |
+  |                 |&lt;-- redirect (code K, state S) ----|                 |                              |
+  |                 | check state == S (CSRF)    |                        |                              |
+  |                 |-- POST /token {code=K, code_verifier=V, redirect_uri} -----&gt;|                       |
+  |                 |                            |                        | sha256(V) == C ? ✔           |
+  |                 |&lt;-- {access_token, refresh_token, id_token} ---------|                              |
+  |                 |-- GET /v1/feed  Authorization: Bearer access_token ---------------------------------&gt;|
+  |                 |&lt;-- 200 feed JSON -----------------------------------------------------------------|
+</pre>
+<p>Notes: use the <strong>system browser</strong> (ASWebAuthenticationSession / Custom Tabs), not an embedded WebView, so the app can't snoop on the password and the user benefits from existing browser sessions. The <code>state</code> parameter defends against CSRF. Codes are single-use and expire in ~1 minute. For confidential server-side clients, the client also authenticates with its secret — and PKCE is now recommended for them too (OAuth 2.1).</p>
+
+<h3>6.3 OpenID Connect (OIDC)</h3>
+<p>OAuth 2.0 is about <em>authorization</em> ("this app may publish posts"); it doesn't define how to tell the app <em>who the user is</em>. <strong>OpenID Connect</strong> is a thin identity layer on top: when the client requests the <code>openid</code> scope, the authorization server also returns an <strong>ID token</strong> — a JWT about the user's authentication:</p>
+<pre><code>{
+  "iss": "https://auth.example-idp.com",
+  "sub": "8f2c1e",              // stable user identifier at this provider
+  "aud": "instagram-client-id", // this ID token is for Instagram only
+  "exp": 1793099800, "iat": 1793099200,
+  "nonce": "n-0S6_WzA2Mj",      // replay protection, echoed from the request
+  "email": "alice@example.com", "email_verified": true,
+  "name": "Alice"
+}</code></pre>
+<p>OIDC also defines a <code>/userinfo</code> endpoint, discovery documents (<code>/.well-known/openid-configuration</code>) and JWKS public keys. Rule of thumb: <strong>ID token = for the client, to know who logged in; access token = for the API, to authorize calls.</strong> Never send the ID token to APIs as an access token.</p>
+
+<h3>6.4 SSO and "Log in with Facebook"</h3>
+<p><strong>Single sign-on (SSO)</strong> means one authentication grants access to multiple applications. Instagram offers "Continue with Facebook" and, through Meta's Accounts Center, linked accounts across Meta apps. Conceptually:</p>
+<ol class="steps">
+  <li>The user taps "Continue with Facebook". The Instagram app starts an OAuth/OIDC-style flow with Facebook as the <strong>identity provider (IdP)</strong>; if the Facebook app is installed and logged in, the user just confirms.</li>
+  <li>Facebook returns a code/token proving identity for a Facebook user ID, with consented scopes.</li>
+  <li>Instagram's Auth service verifies it server-side (signature, audience = Instagram, expiry), then looks up a <strong>linked identity</strong> row: <code>(provider="facebook", provider_user_id) → instagram user_id</code>.</li>
+  <li>If linked → issue Instagram's own access + refresh tokens. If not linked → offer to create an account or link an existing one (after verifying it with password).</li>
+</ol>
+<p>Important: Instagram issues <em>its own</em> session/tokens afterwards; the external IdP is only used to prove identity at login.</p>
+
+<h2>7. Multi-factor authentication (MFA / 2FA)</h2>
+<p><strong>MFA</strong> requires two or more independent factors: something you <strong>know</strong> (password), something you <strong>have</strong> (phone, security key), something you <strong>are</strong> (biometrics). A stolen password alone is then not enough.</p>
+<h3>7.1 TOTP (authenticator apps)</h3>
+<p><strong>Time-based One-Time Passwords</strong> (RFC 6238): at enrolment, server and authenticator app share a random secret (via a QR code). Both compute a 6-digit code from the secret and the current 30-second time step:</p>
+<pre><code>T    = floor(unix_time / 30)
+hmac = HMAC_SHA1(shared_secret, T as 8-byte big-endian)
+off  = hmac[19] &amp; 0x0F
+code = (int32(hmac[off..off+3]) &amp; 0x7FFFFFFF) % 1_000_000     # 6 digits
+
+server: accept codes for T-1, T, T+1 (clock drift); reject a code already used (replay);
+        rate-limit attempts (1,000,000 possibilities → must cap guesses).</code></pre>
+<p>Works offline, no SMS cost, not interceptable over the phone network.</p>
+<h3>7.2 SMS codes and their risks</h3>
+<ul>
+  <li><strong>SIM swapping:</strong> an attacker convinces the carrier to move your number to their SIM, then receives your codes. A notorious way high-value Instagram handles have been stolen.</li>
+  <li><strong>SS7 interception</strong> and malware reading SMS.</li>
+  <li><strong>Phishing:</strong> users type the code into a fake site in real time.</li>
+  <li><strong>Cost and abuse:</strong> each SMS costs money; attackers trigger mass SMS to premium numbers ("SMS pumping fraud") — rate limit hard.</li>
+</ul>
+<p>SMS is still far better than nothing, but prefer authenticator apps, push approval on a logged-in device, or <strong>passkeys / security keys</strong> (WebAuthn/FIDO2 — phishing-resistant because the signature is bound to the real domain). Instagram offers authenticator-app, SMS and WhatsApp codes for 2FA, plus backup codes, and trusted-device login approvals. Use <strong>step-up authentication</strong> — extra verification only for risky events such as a new-country login or changing email/password — to keep everyday friction low.</p>
+
+<h2>8. Authorization models</h2>
+<h3>8.1 RBAC — role-based access control</h3>
+<p>Permissions are attached to <strong>roles</strong>, and users get roles: <code>admin</code>, <code>moderator</code>, <code>user</code>. Simple and auditable. Instagram examples: internal content moderators can view reported content; a business account can grant a teammate the "advertiser" role on its page. RBAC alone can't express "Bob can see Alice's post because Bob follows Alice".</p>
+<h3>8.2 ABAC — attribute-based access control</h3>
+<p>Decisions are rules over <strong>attributes</strong> of user, resource, action and environment: <code>allow if resource.visibility == "public" or (viewer.age &gt;= 18 and resource.age_restricted) …</code>. Very flexible (time, location, device trust), but rules can become hard to reason about. Policy engines like OPA (Rego) or AWS Cedar express such rules.</p>
+<h3>8.3 Relationship-based (ReBAC) and ownership checks</h3>
+<p>Social apps mostly need <strong>relationship-based</strong> authorization: access depends on the graph between viewer and owner. Google's <em>Zanzibar</em> paper popularised this model (open-source descendants: SpiceDB, OpenFGA). For Instagram:</p>
+<div class="table-wrap"><table>
+  <tr><th>Rule</th><th>Check</th><th>Data needed</th></tr>
+  <tr><td><b>Ownership</b></td><td>Only the author can edit/delete a post; post owner or comment author can delete a comment</td><td><code>post.author_id == viewer_id</code></td></tr>
+  <tr><td><b>Private accounts</b></td><td>Posts/stories visible only to approved followers</td><td>Account privacy flag + follow edge (status = accepted) from the <a href="social-graph.html">graph store</a></td></tr>
+  <tr><td><b>Blocking</b></td><td>If either user blocked the other: can't see profile, posts, comments; can't DM, follow or mention</td><td>Block edges in both directions</td></tr>
+  <tr><td><b>Close Friends</b></td><td>A close-friends story is visible only to users on the author's list</td><td>Author's close-friends list membership</td></tr>
+</table></div>
+<pre><code>def can_view_post(viewer_id, post):
+    author = post.author_id
+    if viewer_id == author:                       return True
+    if graph.is_blocked_either_way(viewer_id, author): return False
+    if post.audience == "close_friends":
+        return graph.in_close_friends(author, viewer_id)
+    if users.is_private(author):
+        return graph.follows(viewer_id, author, status="accepted")
+    return True            # public account</code></pre>
+<p>These checks run for <em>every object</em> returned — a feed page of 20 posts from 20 authors means batching: fetch all block/follow edges in one call (<code>graph.batch_check(viewer, [authors])</code>) and cache aggressively, with careful invalidation (an unfollow or block must take effect quickly).</p>
+
+<h3>8.4 IDOR: the most common authorization bug</h3>
+<p><strong>Insecure Direct Object Reference (IDOR)</strong> happens when an API takes an object ID from the client and returns or modifies that object <em>without checking the caller is allowed to</em>. The gateway authenticated the user, so the developer assumed "logged in = allowed":</p>
+<pre><code># VULNERABLE: any logged-in user can read any post, including private accounts' posts
+GET /v1/posts/987654
+def get_post(request, post_id):
+    return db.posts.get(post_id)
+
+# VULNERABLE: any user can delete anyone's comment by changing the ID
+DELETE /v1/comments/555
+def delete_comment(request, comment_id):
+    db.comments.delete(comment_id)
+
+# FIXED
+def delete_comment(request, comment_id):
+    c = db.comments.get(comment_id) or raise NotFound()
+    post = db.posts.get(c.post_id)
+    if request.user_id not in (c.author_id, post.author_id):
+        raise NotFound()          # 404 rather than 403 avoids confirming the object exists
+    db.comments.delete(comment_id)</code></pre>
+<p>Defences: centralise authorization helpers (<code>can_view_post</code>) and make every data-access path call them; deny by default; write tests that attempt cross-user access; use non-sequential IDs (helps against enumeration but is <em>not</em> a fix on its own). Publicly disclosed bug-bounty reports against large social apps, Instagram included, have featured exactly this class of bug — e.g. viewing private content by manipulating media IDs.</p>
+
+<h2>9. Where the checks happen</h2>
+<div class="diagram">
+<svg viewBox="0 0 820 230" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-auth-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600">
+    <rect x="10" y="70" width="120" height="60" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="70" y="96" text-anchor="middle">📱 App</text><text x="70" y="114" text-anchor="middle" font-weight="400" font-size="11.5">Bearer token</text>
+    <rect x="175" y="55" width="190" height="90" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="270" y="80" text-anchor="middle">API Gateway</text><text x="270" y="100" text-anchor="middle" font-weight="400" font-size="11.5">AuthN: verify token</text><text x="270" y="116" text-anchor="middle" font-weight="400" font-size="11.5">coarse AuthZ: scopes</text><text x="270" y="132" text-anchor="middle" font-weight="400" font-size="11.5">→ X-User-Id: 1234</text>
+    <rect x="410" y="55" width="200" height="90" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="510" y="80" text-anchor="middle">Post / Feed Service</text><text x="510" y="100" text-anchor="middle" font-weight="400" font-size="11.5">object-level AuthZ:</text><text x="510" y="116" text-anchor="middle" font-weight="400" font-size="11.5">private? blocked?</text><text x="510" y="132" text-anchor="middle" font-weight="400" font-size="11.5">close friends? owner?</text>
+    <rect x="655" y="20" width="155" height="44" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="732" y="47" text-anchor="middle">Follow/Graph</text>
+    <rect x="655" y="80" width="155" height="44" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="732" y="107" text-anchor="middle">Post metadata</text>
+    <rect x="655" y="140" width="155" height="44" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="732" y="167" text-anchor="middle">User DB (privacy)</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" marker-end="url(#ar-auth-1)" fill="none">
+    <path d="M130,100 L173,100"/><path d="M365,100 L408,100"/>
+    <path d="M610,80 L653,45"/><path d="M610,100 L653,102"/><path d="M610,120 L653,160"/>
+  </g>
+  <text x="270" y="170" text-anchor="middle" font-size="11.5" fill="#c62828">fails → 401</text>
+  <text x="510" y="170" text-anchor="middle" font-size="11.5" fill="#c62828">fails → 403 / 404</text>
+  <text x="410" y="210" text-anchor="middle" font-size="12" fill="#555">Identity is established once at the edge; permission is decided where the data lives.</text>
+</svg>
+<div class="caption">The gateway answers "who"; the owning service answers "may they, for this object".</div>
+</div>
+<ul>
+  <li><strong>Gateway:</strong> validates the access token (signature, expiry, audience), rejects with 401, checks coarse scopes for third-party apps, strips spoofed identity headers and forwards a trusted identity. See <a href="api-gateway.html">API Gateway</a>.</li>
+  <li><strong>Services:</strong> enforce object-level permissions using their own data plus graph lookups. They should accept identity only from the gateway/mesh (mTLS), never from client-supplied headers.</li>
+  <li><strong>Service-to-service:</strong> services authenticate each other (mTLS identities in a service mesh) and propagate the end-user context so downstream services can still apply per-user rules.</li>
+  <li><strong>Async consumers:</strong> e.g. the <a href="news-feed.html">feed fan-out workers</a> and <a href="notifications.html">notification service</a> must also respect blocks and privacy — a fan-out to a blocked user's timeline is a privacy bug too. Re-check at read time as a safety net.</li>
+</ul>
+
+<h2>10. Designing the User/Auth service</h2>
+<h3>10.1 Data model</h3>
+<p>Account data lives in the <strong>User DB</strong> — in Instagram's architecture, sharded PostgreSQL with replicas (see <a href="sharding.html">Sharding</a> and <a href="replication.html">Replication</a>). Assume:</p>
+<pre><code>CREATE TABLE users (
+  user_id          BIGINT PRIMARY KEY,          -- 64-bit ID (see id-generation)
+  username         VARCHAR(30) NOT NULL,         -- stored lower-cased/normalised
+  display_name     VARCHAR(64),
+  email            VARCHAR(255),
+  email_verified   BOOLEAN DEFAULT FALSE,
+  phone_e164       VARCHAR(16),
+  phone_verified   BOOLEAN DEFAULT FALSE,
+  password_hash    TEXT,                          -- argon2id/bcrypt string; NULL for social-only
+  pepper_version   SMALLINT,
+  is_private       BOOLEAN DEFAULT FALSE,
+  account_status   VARCHAR(16) DEFAULT 'active',  -- active, disabled, deactivated, locked
+  mfa_enabled      BOOLEAN DEFAULT FALSE,
+  token_version    INT DEFAULT 0,                 -- bump to invalidate all access tokens
+  created_at       TIMESTAMPTZ NOT NULL,
+  updated_at       TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE usernames (            -- global uniqueness lookup (unsharded or sharded by username)
+  username_normalized VARCHAR(30) PRIMARY KEY,
+  user_id             BIGINT NOT NULL
+);
+
+CREATE TABLE mfa_factors (
+  factor_id BIGINT PRIMARY KEY, user_id BIGINT, type VARCHAR(16),   -- totp, sms, webauthn
+  secret_encrypted BYTEA, phone_e164 VARCHAR(16), created_at TIMESTAMPTZ, last_used_at TIMESTAMPTZ
+);
+
+CREATE TABLE linked_identities (
+  provider VARCHAR(16), provider_user_id VARCHAR(64), user_id BIGINT,
+  PRIMARY KEY (provider, provider_user_id)
+);
+
+CREATE TABLE sessions (             -- one row per logged-in device
+  session_id          BIGINT PRIMARY KEY,
+  user_id             BIGINT NOT NULL,
+  device_id           VARCHAR(64),
+  device_name         VARCHAR(64),     -- "iPhone 15, Instagram 3xx"
+  refresh_token_hash  BYTEA NOT NULL,  -- SHA-256 of the refresh token, never the token itself
+  token_family_id     BIGINT,
+  created_at TIMESTAMPTZ, last_seen_at TIMESTAMPTZ, last_ip INET, last_geo VARCHAR(64),
+  revoked_at TIMESTAMPTZ
+);
+CREATE INDEX ON sessions (user_id);</code></pre>
+<p>Refresh tokens are stored <strong>hashed</strong> (a fast SHA-256 is fine here because they are long random values, not guessable passwords), so a DB leak doesn't hand out live sessions.</p>
+
+<h3>10.2 Username uniqueness needs strong consistency</h3>
+<p>Two people trying to claim <code>@sunset</code> at the same moment must not both succeed. Most of Instagram can be <a href="cap-consistency.html">eventually consistent</a> (like counts, feed), but uniqueness needs a <strong>linearizable</strong> check-and-set. Approaches:</p>
+<ul>
+  <li><strong>Unique constraint in one authoritative place:</strong> the <code>usernames</code> table keyed by normalised username (lower-case, Unicode-normalised, confusable characters handled). Signup does <code>INSERT … ON CONFLICT DO NOTHING</code> in a transaction; zero rows inserted → "username taken". If the user table is sharded by <code>user_id</code>, the username index must be its own table sharded by <em>username</em> (so the uniqueness check lands on one shard) — or a separate strongly consistent store.</li>
+  <li><strong>Reserve-then-commit:</strong> claim the username in the uniqueness table with a short TTL, create the user row on its shard, then confirm the claim. A cleanup job releases claims whose user creation failed. (A two-step "saga" instead of a distributed transaction.)</li>
+  <li><strong>Multi-region:</strong> uniqueness must be decided by a single leader/quorum (e.g. a consensus-based store like Spanner, CockroachDB, or a primary region for the username table) — two regions accepting writes independently would allow duplicates.</li>
+  <li><strong>Availability check vs claim:</strong> the "is this available?" check while typing can hit a cache or read replica (may be slightly stale); only the final claim must be strongly consistent.</li>
+</ul>
+
+<h3>10.3 Devices and sessions</h3>
+<p>Each login creates a session row per device. This powers the "Where you're logged in" screen (device name, location, last active) and "Log out of all sessions" (set <code>revoked_at</code> on all rows, bump <code>token_version</code>, push a denylist entry). Assume 1.5B users × ~2 devices ≈ 3B session rows — sharded by <code>user_id</code> alongside the user's other data so "list my sessions" is a single-shard query.</p>
+
+<h3>10.4 Login anomaly detection</h3>
+<p>Every login attempt is scored for risk using signals such as:</p>
+<ul>
+  <li>New device or app install vs a known <code>device_id</code>; new country/ASN; "impossible travel" (Mumbai, then São Paulo 20 minutes later).</li>
+  <li>IP reputation (data-center/proxy IPs, IPs seen in credential-stuffing waves), many accounts tried from one IP, many IPs trying one account.</li>
+  <li>Password appears in known breach corpuses; behavioural/device-integrity signals.</li>
+</ul>
+<p>The response is graduated: allow; allow and notify ("New login from Chrome on Windows near Berlin — was this you?"); <strong>challenge</strong> (2FA, email/SMS code, CAPTCHA, approval from a logged-in device); or block. Signals flow through <a href="message-queues.html">Kafka</a> to the anti-abuse pipeline and <a href="analytics-ml.html">ML models</a>; the real-time decision uses features cached in Redis so login stays fast.</p>
+
+<h3>10.5 Account recovery</h3>
+<p>Recovery is the softest target: attackers who can't beat your password simply attack the "forgot password" flow. Good design:</p>
+<ol class="steps">
+  <li>User requests a reset by username/email/phone. The response is identical whether or not the account exists (prevents enumeration). Rate limit per account, per IP, per phone.</li>
+  <li>Generate a <strong>single-use, short-lived (e.g. 15–60 min), high-entropy</strong> token; store only its hash; send a link/code to the verified email or phone.</li>
+  <li>On use: verify hash and expiry, require a new password (checked against breach lists), <strong>invalidate all existing sessions and refresh tokens</strong>, notify all contact points.</li>
+  <li>If the attacker changed the email/phone, the old address gets a "revert this change" link valid for days. For hijacked accounts with no access left, offer identity verification (e.g. a video selfie compared with profile photos — Instagram has publicly described using video-selfie verification for account recovery).</li>
+  <li>Keep 2FA in force: a reset must not silently disable MFA; use backup codes or a stricter process.</li>
+</ol>
+
+<h2>11. How Instagram does it: from login to authenticated API calls</h2>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+Instagram's backend started as Django — whose built-in auth framework stores salted, iterated password hashes and uses server-side sessions — and its user data lives in sharded PostgreSQL. Today Instagram supports username/email/phone login, "Continue with Facebook" via Meta's Accounts Center, 2FA through authenticator apps, SMS or WhatsApp, login-activity screens, login alerts and suspicious-login challenges. The exact token formats Meta uses internally are not public; the flow below is a representative, interview-ready design consistent with that behaviour.</div>
+
+<div class="flow">
+  <div class="fnode client">📱 App<small>credentials</small></div><div class="farrow">→<small>TLS</small></div>
+  <div class="fnode edge">Gateway<small>rate limit login</small></div><div class="farrow">→</div>
+  <div class="fnode svc">User/Auth Service<small>hash verify, risk, 2FA</small></div><div class="farrow">→</div>
+  <div class="fnode store">User DB + Redis<small>sessions</small></div><div class="farrow">→<small>tokens</small></div>
+  <div class="fnode client">📱 App<small>Keychain/Keystore</small></div>
+</div>
+
+<ol class="steps">
+  <li><strong>Login request.</strong> The app sends <code>POST /v1/auth/login {username, password, device_id}</code> over TLS (with certificate pinning on mobile, so a malicious Wi-Fi proxy can't intercept). Payload also carries device signals for risk scoring.</li>
+  <li><strong>Gateway pre-checks.</strong> This endpoint is unauthenticated, so the gateway applies strict <a href="rate-limiting.html">rate limits</a> per IP, per device and per username, plus bot detection.</li>
+  <li><strong>Lookup &amp; verify.</strong> The Auth service resolves the username → <code>user_id</code> via the username table, loads the user row from its PostgreSQL shard, and verifies the password hash (constant-time comparison, dummy hashing for unknown users).</li>
+  <li><strong>Risk evaluation.</strong> Known device and usual location → low risk. New device in a new country → challenge.</li>
+  <li><strong>Second factor.</strong> If 2FA is on (or risk is high), respond <code>200 {"two_factor_required": true, "challenge_id": "…"}</code>; the app asks for the TOTP/SMS code and submits it to <code>POST /v1/auth/2fa</code>.</li>
+  <li><strong>Session creation.</strong> Create a <code>sessions</code> row (device, IP, geo), generate a refresh token (store its hash) and a short-lived signed access token (<code>sub</code>=user_id, <code>did</code>=device, <code>exp</code>=15 min). Cache session metadata in Redis.</li>
+  <li><strong>Side effects (async).</strong> Publish <code>user.logged_in</code> to Kafka → login-alert notification if the device is new, analytics, anti-abuse features.</li>
+  <li><strong>Client storage.</strong> The app stores the refresh token in the iOS Keychain / Android Keystore and keeps the access token in memory.</li>
+  <li><strong>Authenticated calls.</strong> <code>GET /v1/feed</code> with <code>Authorization: Bearer &lt;access&gt;</code>. The gateway verifies the signature locally with cached public keys (no network call), checks the token-version/denylist cache, and forwards <code>X-User-Id: 1234</code>.</li>
+  <li><strong>Object-level checks.</strong> The Feed service returns only posts the user may see (privacy, blocks, close friends); the Like service checks visibility before accepting a like.</li>
+  <li><strong>Silent refresh.</strong> After 15 minutes the gateway returns <code>401 token_expired</code>; the app calls <code>/v1/auth/token</code> with the refresh token, gets a rotated pair, and retries — invisible to the user.</li>
+  <li><strong>Logout / revoke.</strong> "Log out" deletes the session row and refresh token; "log out of all sessions" or a password change revokes all sessions and bumps <code>token_version</code>, so outstanding access tokens die within minutes at most.</li>
+</ol>
+<h3>Rough numbers</h3>
+<pre><code>Assume 500M DAU, 1.2 full logins per user per month (most stay logged in):
+  logins ≈ 500M × 1.2 / 30 ≈ 20M/day ≈ 230/s average (peaks + attacks: thousands/s)
+Token refreshes: every 15 min of activity; assume 30 min active/day → ~2 refreshes/user/day
+  ≈ 1B/day ≈ 11.6k/s → each needs a sessions-table lookup + write (hash of refresh token)
+Access-token verifications: every API call ≈ 1M+/s, all done locally at the gateway (no DB).</code></pre>
+<p>This is the core argument for short-lived stateless access tokens plus stateful refresh tokens: the hot path (every request) needs no database, while the warm path (refresh, a few times a day per user) gives you a revocation point.</p>
+
+<h2>12. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Good practices</h4><ul>
+    <li>Argon2id/bcrypt with per-user salt (+ pepper in a secrets manager)</li>
+    <li>Short-lived access tokens, rotating refresh tokens with reuse detection</li>
+    <li>Asymmetric signing (RS256/ES256/EdDSA) with key IDs and rotation</li>
+    <li>OAuth authorization code + PKCE via the system browser</li>
+    <li>MFA with TOTP/passkeys; step-up auth on risky actions</li>
+    <li>Deny-by-default, centralised object-level authorization helpers</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs &amp; tensions</h4><ul>
+    <li>Slow hashing costs CPU and invites DoS without rate limits</li>
+    <li>Stateless tokens are hard to revoke; stateful sessions need a scalable store</li>
+    <li>Security friction (2FA, challenges) vs user experience and conversion</li>
+    <li>Relationship checks on every object add latency and cache-invalidation complexity</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Fast hashes</strong> (MD5, SHA-1, SHA-256) or unsalted hashes for passwords.</li>
+  <li><strong>Putting sensitive data in JWT payloads</strong> — they're only encoded, not encrypted.</li>
+  <li><strong>Not pinning the JWT algorithm</strong> (<code>alg: none</code>, RS→HS confusion) or not checking <code>aud</code>/<code>iss</code>/<code>exp</code>.</li>
+  <li><strong>Storing tokens in browser <code>localStorage</code></strong> — readable by any XSS; prefer HttpOnly, Secure, SameSite cookies on web (and then defend against CSRF).</li>
+  <li><strong>Authorization only at the gateway</strong> → IDOR. Check every object.</li>
+  <li><strong>User enumeration</strong> via different error messages ("no such user" vs "wrong password") or timing.</li>
+  <li><strong>Forgetting async paths</strong> — notifications or fan-out leaking content to blocked users.</li>
+</ul>
+
+<h2>13. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>Category</th><th>When to use</th></tr>
+  <tr><td><b>Argon2 / bcrypt / scrypt libraries</b></td><td>Password hashing</td><td>Always, for password storage</td></tr>
+  <tr><td><b>Redis</b></td><td>Session store, denylists, login-attempt counters</td><td>Fast stateful auth data with TTLs</td></tr>
+  <tr><td><b>Auth0 / Okta / AWS Cognito / Keycloak</b></td><td>Managed or open-source identity providers (OIDC/OAuth, MFA, social login)</td><td>When you'd rather buy (or self-host) than build auth</td></tr>
+  <tr><td><b>JWT libraries (jose, PyJWT, nimbus)</b></td><td>Token signing/verification, JWKS</td><td>Stateless access tokens</td></tr>
+  <tr><td><b>WebAuthn / FIDO2 (passkeys)</b></td><td>Phishing-resistant authentication</td><td>Passwordless login, strong 2FA</td></tr>
+  <tr><td><b>OPA, AWS Cedar, Casbin</b></td><td>Policy engines (RBAC/ABAC)</td><td>Centralised, testable authorization rules</td></tr>
+  <tr><td><b>SpiceDB, OpenFGA (Zanzibar-style)</b></td><td>Relationship-based authorization</td><td>Social/sharing permissions at scale</td></tr>
+</table></div>
+
+<h2>14. Interview corner</h2>
+<details class="qa"><summary>How should passwords be stored, and why not just SHA-256?</summary>
+<p>Store a hash from a deliberately slow, memory-hard password-hashing function — Argon2id (or bcrypt/scrypt) — with a unique random salt per user, optionally an HMAC pepper held in a secrets manager/HSM. SHA-256 is designed to be fast, so GPUs can test billions of guesses per second against leaked hashes; human passwords have low entropy, so dictionaries crack most of them quickly. Salts defeat rainbow tables and make identical passwords hash differently; cost parameters make each guess expensive and can be raised over time by re-hashing on login.</p></details>
+<details class="qa"><summary>Sessions or JWTs for Instagram?</summary>
+<p>Both, in different roles. The hot path — millions of requests/second — uses short-lived signed access tokens (JWT-like, ~15 min) verified locally at the gateway with cached public keys, no DB hit. Long-lived refresh tokens are opaque, stored hashed in a sessions table (per device), rotated on each use with reuse detection. That gives cheap validation plus a revocation point: revoking the session stops refreshes, and access tokens expire quickly; a small denylist/token-version check covers urgent revocations like password changes.</p></details>
+<details class="qa"><summary>Walk through OAuth 2.0 authorization code flow with PKCE for a mobile app.</summary>
+<p>The app generates a random code_verifier and sends its SHA-256 hash (code_challenge) with an /authorize request opened in the system browser, along with client_id, redirect_uri, scopes and state. The user authenticates and consents at the authorization server, which redirects back to the app with a one-time authorization code. The app verifies state, then POSTs the code plus the original code_verifier to /token. The server checks the verifier hashes to the stored challenge and returns access, refresh (and, with OIDC, ID) tokens. PKCE prevents an app that intercepts the redirect from redeeming the code, since it doesn't know the verifier; public clients can't hold a client secret, so PKCE replaces it.</p></details>
+<details class="qa"><summary>What's the difference between OAuth 2.0 and OpenID Connect?</summary>
+<p>OAuth 2.0 is delegated authorization: it issues access tokens that let a client call an API with certain scopes; it says nothing standard about who the user is. OpenID Connect is an identity layer on OAuth: with the openid scope, the provider also issues an ID token (a signed JWT with sub, iss, aud, exp, nonce, and optional profile claims) plus a userinfo endpoint and discovery. "Log in with Facebook/Google" is OIDC (or OIDC-like) authentication; "let this app post on my behalf" is OAuth authorization.</p></details>
+<details class="qa"><summary>How do you guarantee username uniqueness in a sharded, multi-region system?</summary>
+<p>Route all claims for a given username to a single authority: a usernames table keyed (and sharded) by normalised username with a unique constraint, in a strongly consistent store with a single leader or consensus (not multi-master). Signup inserts the claim atomically (INSERT … ON CONFLICT), then creates the user row on the user_id shard, with a reservation TTL and cleanup if the second step fails. Availability hints while typing can use caches; only the final claim must be linearizable. Normalise case and Unicode confusables before comparing.</p></details>
+<details class="qa"><summary>A user reports their account was hijacked via SIM swap. What would you change in the system?</summary>
+<p>Reduce reliance on SMS: encourage authenticator apps, push approvals on trusted devices and passkeys; treat phone-number changes and SMS-based recovery as high-risk actions requiring step-up verification and cool-off periods; notify all existing contact points and devices on changes with a revert link; use risk signals (recent SIM change signals where carriers provide them, new device, new location) to require stronger proof; on recovery, revoke all sessions and refresh tokens and re-verify 2FA.</p></details>
+
+<h2>15. Check your understanding</h2>
+<details class="quiz"><summary>An API returns 401 for one request and 403 for another. What does each mean?</summary>
+<p><strong>401</strong>: not authenticated — missing, invalid or expired credentials (e.g. expired access token → refresh and retry). <strong>403</strong>: authenticated, but not permitted to perform this action on this resource (e.g. deleting someone else's comment). Many APIs return 404 instead of 403 for private objects to avoid revealing they exist.</p></details>
+<details class="quiz"><summary>Why does a salt not need to be secret, but a pepper does?</summary>
+<p>The salt's job is uniqueness: it makes each user's hash different, defeating precomputed tables and forcing per-user cracking. That works even if the attacker knows it. The pepper's job is to add a secret the attacker doesn't have if only the database leaks — so it must be stored elsewhere (secrets manager/HSM).</p></details>
+<details class="quiz"><summary>Access tokens live 15 minutes. A user changes their password at 10:00 because their phone was stolen. Without any denylist, until when could the thief keep calling the API? How do you shorten that?</summary>
+<p>Up to ~10:15 — the remaining lifetime of any access token already issued — but no longer, because the password change revokes the refresh tokens, so the thief can't obtain new access tokens. To make it immediate, bump the user's <code>token_version</code> (checked against a cached value at the gateway) or add the session's token IDs to a Redis denylist with TTL = 15 min.</p></details>
+<details class="quiz"><summary>Can you read the user ID inside a JWT without the signing key? Can you change it?</summary>
+<p>Yes, you can read it — the payload is just Base64URL-encoded JSON. No, you can't change it undetected — the signature covers the header and payload, so any modification fails verification (as long as the verifier pins the algorithm and checks the signature).</p></details>
+<details class="quiz"><summary>A developer writes <code>GET /v1/stories/{story_id}</code> that returns the story if the caller is logged in. What's the bug and the fix?</summary>
+<p>IDOR: any logged-in user can fetch any story by ID, including private accounts' and close-friends-only stories, or stories from people who blocked them. Fix: in the Stories service, load the story and run the object-level check — owner? blocked either way? audience close-friends and viewer on the list? author private and viewer an accepted follower? — and return 404 if not allowed.</p></details>
+<details class="quiz"><summary>bcrypt cost 12 takes ~250 ms per hash on one core. Peak login traffic is 4,000 attempts/s. How many cores do you need just for hashing, and what does this imply?</summary>
+<p>4,000 × 0.25 s = 1,000 core-seconds per second → ~1,000 cores. Implications: login endpoints must be strictly rate limited (otherwise attackers can force you to burn CPU — a DoS vector), consider tuning cost to a target like ~100 ms, and make sure normal API traffic uses cheap token validation, not passwords.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li><strong>AuthN = who</strong> (401), <strong>AuthZ = what</strong> (403/404). The gateway does identity; services do <strong>object-level</strong> permission checks.</li>
+    <li>Store passwords with <strong>Argon2id/bcrypt + salt (+ pepper)</strong>; never fast hashes.</li>
+    <li>Use <strong>short-lived stateless access tokens</strong> + <strong>stateful, rotating refresh tokens</strong> to balance speed and revocability.</li>
+    <li><strong>OAuth 2.0 + PKCE</strong> for delegated/mobile flows, <strong>OIDC</strong> for identity and SSO; prefer <strong>TOTP/passkeys</strong> over SMS for MFA.</li>
+    <li>Instagram's real authorization is <strong>relationship-based</strong> — private accounts, blocks, close friends — and must be enforced on every path to avoid <strong>IDOR</strong>.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="api-gateway.html">API Gateway</a> — where tokens are validated on every request</li>
+  <li><a href="rate-limiting.html">Rate Limiting</a> — protecting login, OTP and recovery endpoints</li>
+  <li><a href="security.html">Security &amp; Privacy</a> — TLS, encryption, abuse and privacy controls</li>
+  <li><a href="social-graph.html">Social Graph &amp; Follow Service</a> — the follow/block edges behind permission checks</li>
+  <li><a href="cap-consistency.html">CAP Theorem &amp; Consistency</a> — why username claims need strong consistency</li>
+  <li><a href="sharding.html">Sharding</a> — how the User DB and username index are partitioned</li>
+  <li><a href="caching.html">Caching (Redis)</a> — session stores, denylists and permission caches</li>
+  <li><a href="api-design.html">API Design</a> — status codes, auth headers and secure API conventions</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

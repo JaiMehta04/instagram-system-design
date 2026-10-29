@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Media Upload Service &amp; Pre-signed URLs — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="media-upload">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>Media bytes should <strong>never stream through your application servers</strong>. The Upload service hands the client a short-lived <strong>pre-signed URL</strong>, and the client uploads <strong>directly to object storage</strong> (S3).</li>
+    <li>The flow: <em>request upload URL → pre-signed URL → direct upload → completion callback → metadata write → <code>PostCreated</code> event</em>.</li>
+    <li>Big files use <strong>multipart/chunked</strong> uploads; flaky mobile networks need <strong>resumable</strong> uploads (upload session id + byte offsets).</li>
+    <li>Every post moves through a <strong>state machine</strong> (UPLOADING → PROCESSING → PUBLISHED / FAILED); retries are made safe with an <strong>idempotency key</strong>.</li>
+    <li>Validate (size, real MIME type, malware/abuse), dedupe by <strong>content hash</strong>, clean up <strong>orphaned blobs</strong>, and publish events reliably with a <strong>transactional outbox</strong>.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why is uploading media hard?</h2>
+<p>Posting a photo looks trivial: tap Share, done. Underneath, Instagram must accept a few megabytes (photo) to hundreds of megabytes (a long Reel) from a phone on an unreliable cellular network, store it durably forever, and do so for <strong>well over a hundred million media items a day</strong> without ever losing one or creating duplicates. Specifically:</p>
+<ul>
+  <li><strong>Size and duration.</strong> A 60 MB video over a 5 Mbps uplink takes ~96 seconds. Mobile connections drop, switch from Wi-Fi to 4G, or the user locks the phone mid-upload.</li>
+  <li><strong>Retries create duplicates.</strong> If the response is lost after the server saved the post, the app retries — and naive code creates a second post.</li>
+  <li><strong>Scale and cost.</strong> Ingest is tens of gigabytes per second at peak. Routing those bytes through Python web servers would waste enormous compute.</li>
+  <li><strong>Trust.</strong> Uploaded files come from the internet: wrong extensions, gigantic dimensions, malware, illegal content.</li>
+  <li><strong>Multiple steps.</strong> Stored bytes alone are not a post: metadata, renditions, moderation, feed fan-out and search indexing must all follow, each able to fail independently.</li>
+</ul>
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  Shipping a container of goods to a warehouse. You don't drive the truck through the head office's lobby. You phone the office, they issue a <strong>signed delivery permit</strong> valid for one bay and two hours (the pre-signed URL), and you drive <strong>straight to the warehouse</strong> (object storage). The guard checks the permit, not your identity. Once unloaded, you call the office with the receipt number (completion callback), and the office records it in the inventory ledger (metadata) and tells sales it's in stock (event). Big shipments come in several trucks (multipart); if a truck breaks down, only that truck's load is resent (resumable).
+</div>
+
+<h2>2. Why not just stream bytes through the app servers?</h2>
+<p>The naive design is <code>POST /posts</code> with a multipart body containing the photo; the web server receives it and writes it to S3. It works for a prototype and fails at scale:</p>
+<div class="table-wrap"><table>
+  <tr><th>Problem</th><th>Why it hurts</th></tr>
+  <tr><td><b>Worker occupancy</b></td><td>A synchronous Python worker (or thread) is tied up for the entire upload — 90 seconds for a slow video — doing nothing but copying bytes. 10,000 concurrent uploads = 10,000 busy workers.</td></tr>
+  <tr><td><b>Double bandwidth</b></td><td>Every byte crosses the network twice: phone → app server, then app server → S3. You pay for and provision both.</td></tr>
+  <tr><td><b>Memory/disk pressure</b></td><td>Buffering large bodies risks OOM or fills local disk — and makes the service stateful.</td></tr>
+  <tr><td><b>Timeouts</b></td><td>Load balancers and gateways have request timeouts (often 30–60 s) and body-size limits; long uploads hit them.</td></tr>
+  <tr><td><b>Coupled scaling</b></td><td>Upload traffic spikes (New Year's Eve) force you to scale the API fleet, even though the work is pure I/O.</td></tr>
+  <tr><td><b>Blast radius</b></td><td>Slow uploads exhaust the same worker pool serving feed reads — uploads degrade everything.</td></tr>
+</table></div>
+<p>Object stores like S3 are <em>built</em> to ingest enormous parallel byte streams from anywhere with high durability. The right design keeps the <strong>control plane</strong> (who may upload what, metadata, state) in your service and moves the <strong>data plane</strong> (the bytes) directly between client and storage.</p>
+
+<h2>3. Pre-signed URLs</h2>
+<h3>3.1 What they are</h3>
+<p>A <strong>pre-signed URL</strong> is a URL to a specific object in a bucket that embeds an <strong>expiry time</strong> and a <strong>cryptographic signature</strong> made with the service's secret credentials. Anyone holding it may perform exactly the operation it was signed for (e.g. <code>PUT</code> this key) until it expires — without having any storage credentials themselves.</p>
+<pre><code>PUT https://media-uploads.s3.amazonaws.com/staging/7/3141592653589793238/orig
+    ?X-Amz-Algorithm=AWS4-HMAC-SHA256
+    &amp;X-Amz-Credential=AKIA.../20261023/us-east-1/s3/aws4_request
+    &amp;X-Amz-Date=20261023T091500Z
+    &amp;X-Amz-Expires=900                       # valid for 15 minutes
+    &amp;X-Amz-SignedHeaders=content-type;host
+    &amp;X-Amz-Signature=5f2b9c...e81</code></pre>
+<h3>3.2 How the signature works</h3>
+<ol>
+  <li>The Upload service builds a <em>canonical request</em>: method (<code>PUT</code>), object key, expiry, and selected headers (e.g. <code>Content-Type: image/jpeg</code>).</li>
+  <li>It computes an HMAC-SHA256 over that string using a key derived from its secret access key, and appends the result as <code>X-Amz-Signature</code>.</li>
+  <li>When the client uses the URL, S3 recomputes the HMAC with the same secret. If anything was changed — another key, method, content type, or a later time — the signatures don't match and S3 returns <code>403</code>.</li>
+</ol>
+<p>No call to S3 is needed to <em>create</em> the URL — it's pure local cryptography, so the Upload service can mint thousands per second cheaply.</p>
+<h3>3.3 Restricting what may be uploaded</h3>
+<ul>
+  <li><strong>Short expiry</strong> (5–15 minutes; per-part URLs for multipart), so leaked URLs are useless quickly.</li>
+  <li><strong>Server-chosen object key</strong> — the client never picks the path, so it can't overwrite someone else's object.</li>
+  <li><strong>Signed headers</strong>: <code>Content-Type</code> and, where supported, a checksum header (<code>x-amz-checksum-sha256</code>) so S3 rejects bytes that don't match the declared hash.</li>
+  <li><strong>Size limits</strong>: a pre-signed <em>POST policy</em> can include <code>content-length-range</code> (e.g. 1 byte – 30 MB). With pre-signed PUT, sign <code>Content-Length</code> or verify size at completion.</li>
+  <li><strong>Staging location</strong>: uploads land in a <code>staging/</code> prefix (or bucket) that nothing serves publicly until validated.</li>
+</ul>
+<div class="callout warn"><span class="callout-title">⚠️ Upload URL ≠ download URL</span>
+Pre-signed <em>upload</em> URLs are per-user secrets: never cache them on a CDN or log them in full. Media is later served through the <a href="cdn.html">CDN</a> with separately signed, read-only URLs.</div>
+
+<h2>4. The end-to-end upload flow</h2>
+<div class="diagram">
+<svg viewBox="0 0 840 330" width="840" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-mu-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g text-anchor="middle">
+    <rect x="20" y="130" width="120" height="50" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="80" y="152" font-weight="600">📱 Mobile app</text><text x="80" y="169" font-size="11">compress, hash</text>
+    <rect x="220" y="30" width="150" height="50" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="295" y="52" font-weight="600">LB + API gateway</text><text x="295" y="69" font-size="11">auth, rate limit</text>
+    <rect x="440" y="30" width="150" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="515" y="52" font-weight="600">Upload service</text><text x="515" y="69" font-size="11">sign URLs, state</text>
+    <rect x="660" y="20" width="160" height="40" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="740" y="45" font-weight="600">Post metadata DB</text>
+    <rect x="660" y="75" width="160" height="40" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="740" y="100">outbox table</text>
+    <rect x="300" y="240" width="190" height="55" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="395" y="263" font-weight="600">Object storage (S3)</text><text x="395" y="281" font-size="11">staging/ → media/</text>
+    <rect x="660" y="160" width="160" height="40" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="740" y="185" font-weight="600">Kafka</text>
+    <rect x="660" y="240" width="160" height="55" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="740" y="262" font-weight="600">Media workers</text><text x="740" y="280" font-size="11">resize, transcode</text>
+  </g>
+  <g stroke="#555" stroke-width="1.4" fill="none" marker-end="url(#ar-mu-1)">
+    <path d="M140,140 L218,65"/>
+    <path d="M370,55 L438,55"/>
+    <path d="M590,45 L658,40"/><path d="M590,65 L658,92"/>
+    <path d="M140,170 L298,260" stroke="#0277bd" stroke-width="2.5"/>
+    <path d="M740,115 L740,158"/>
+    <path d="M740,200 L740,238"/>
+    <path d="M658,268 L492,268"/>
+  </g>
+  <g font-size="11" fill="#333">
+    <text x="60" y="105">①⑤ API calls</text>
+    <text x="400" y="45" text-anchor="middle">②⑥</text>
+  <text x="20" y="215" fill="#0277bd" font-weight="600">④ bytes go direct (PUT)</text>
+    <text x="750" y="140">⑧ relay</text>
+    <text x="750" y="225">⑨</text>
+    <text x="575" y="260" text-anchor="middle">read / write renditions</text>
+  </g>
+</svg>
+<div class="caption">Control plane (thin arrows) goes through the API; the data plane (thick blue arrow) goes straight from the phone to object storage.</div>
+</div>
+
+<pre class="ascii">
+ App                    Upload service              Metadata DB        S3 (staging)     Kafka
+  |  (1) POST /uploads      |                            |                  |              |
+  |  {idempotency_key,      |                            |                  |              |
+  |   type, size, sha256}   |                            |                  |              |
+  |-----------------------> | (2) auth, quota, validate  |                  |              |
+  |                         |     post_id = new ID       |                  |              |
+  |                         |---- INSERT post(UPLOADING) |                  |              |
+  |                         |     + upload session ----->|                  |              |
+  | &lt;-- (3) upload_id,      |                            |                  |              |
+  |     pre-signed URL(s)   |                            |                  |              |
+  |                                                                         |              |
+  |  (4) PUT bytes directly (multipart, resumable) ------------------------>|              |
+  | &lt;------------------------------------------------------- 200 + ETags --|              |
+  |                                                                         |              |
+  |  (5) POST /uploads/{id}/complete {parts, caption, ...}                  |              |
+  |-----------------------> | (6) HEAD object: size, checksum ok? ------->|              |
+  |                         | (7) one transaction:       |                  |              |
+  |                         |   post -> PROCESSING       |                  |              |
+  |                         |   outbox += MediaUploaded->|                  |              |
+  | &lt;-- 202 Accepted        |                            |                  |              |
+  |     {post_id, PROCESSING}                            | (8) relay ------------------->  |
+  |                                                      |                  |  (9) media workers,
+  |                                                      |                  |  moderation consume
+  |                         | (10) MediaReady -> post PUBLISHED + outbox PostCreated ----> |
+  |                                                                       fan-out, search,
+  |                                                                       notifications
+</pre>
+<ol class="steps">
+  <li><strong>Request an upload.</strong> The app calls <code>POST /uploads</code> with an <em>idempotency key</em>, media type, byte size and (optionally) a SHA-256 of the file. The gateway authenticates the user and applies <a href="rate-limiting.html">rate limits</a>.</li>
+  <li><strong>Create the upload session.</strong> The Upload service checks quotas and declared limits, generates a <strong>post ID</strong> (section 15), records a post row in state <code>UPLOADING</code> plus an <em>upload session</em> (expected size, parts, expiry, object key).</li>
+  <li><strong>Return pre-signed URL(s)</strong> — one for a small photo, or one per part for multipart.</li>
+  <li><strong>Direct upload.</strong> The phone PUTs bytes to object storage; S3 returns an ETag per part.</li>
+  <li><strong>Completion callback.</strong> The app calls <code>POST /uploads/{id}/complete</code> with part ETags plus caption, tags, location and audience. (Alternatively, S3 event notifications can tell the service an object arrived; many designs use both — the client callback carries the metadata, the storage event acts as a safety net.)</li>
+  <li><strong>Verify.</strong> The service completes the multipart upload and checks the object really exists with the expected size and checksum. It never trusts the client's claim.</li>
+  <li><strong>Metadata write + event, atomically.</strong> In one local transaction: post → <code>PROCESSING</code>, caption stored, and a <code>MediaUploaded</code> event inserted into the outbox. Respond <code>202 Accepted</code>.</li>
+  <li><strong>Relay</strong> publishes outbox rows to Kafka.</li>
+  <li><strong><a href="media-processing.html">Media processing</a></strong> creates renditions, thumbnails and video segments; moderation classifiers run.</li>
+  <li><strong>Publish.</strong> On <code>MediaReady</code> (and passing checks) the post becomes <code>PUBLISHED</code> and <code>PostCreated</code> is emitted via the outbox, driving <a href="news-feed.html">feed fan-out</a>, <a href="search.html">search indexing</a> and <a href="notifications.html">notifications</a>.</li>
+</ol>
+<div class="callout tip"><span class="callout-title">💡 What the user sees</span>
+The app shows the post in the author's own profile immediately (<a href="clients.html">optimistic UI</a>) with a small progress indicator, while steps 8–10 take a second or two for photos and longer for videos. Followers only see it after <code>PUBLISHED</code>.</div>
+
+<h2>5. Multipart / chunked uploads</h2>
+<p>Sending a 200 MB video as one HTTP request is fragile: any blip restarts it from zero, and a single TCP stream rarely saturates a fast link. <strong>Multipart upload</strong> splits the file into parts uploaded independently (and in parallel), then stitched together server-side.</p>
+<pre><code>1. CreateMultipartUpload(key)            → upload_id
+2. UploadPart(upload_id, part=1..N, bytes) → ETag per part   (each via its own pre-signed URL)
+3. CompleteMultipartUpload(upload_id, [(1,ETag1), (2,ETag2), ...])  → final object
+   (or AbortMultipartUpload to discard)</code></pre>
+<ul>
+  <li>S3 limits: parts are 5 MiB–5 GiB (except the last), up to 10,000 parts, objects up to 5 TiB. Other object stores have similar rules.</li>
+  <li>Parts can be uploaded <strong>in parallel</strong> (2–4 concurrent streams on mobile) and <strong>in any order</strong>; a failed part is retried alone.</li>
+  <li>Parts uploaded but never completed <strong>still cost storage</strong> until aborted (see section 12).</li>
+</ul>
+<div class="table-wrap"><table>
+  <tr><th>Chunk size</th><th>Pros</th><th>Cons</th></tr>
+  <tr><td>Small (256 KB–1 MB)</td><td>Little re-sent after a failure; good on very poor networks</td><td>Many requests and per-request overhead; below S3's 5 MiB multipart minimum, so needs a custom resumable layer</td></tr>
+  <tr><td>Medium (5–16 MB)</td><td>Good balance for mobile video; meets S3 minimum</td><td>A drop near the end of a part loses up to 16 MB</td></tr>
+  <tr><td>Large (64 MB+)</td><td>Few requests; great on fast, stable links (desktop, server-to-server)</td><td>Painful retries on mobile</td></tr>
+</table></div>
+<p>Adaptive clients pick chunk size from measured throughput: bigger on Wi-Fi, smaller on weak cellular.</p>
+
+<h2>6. Resumable uploads</h2>
+<p>Multipart helps, but mobile needs more: if the app is killed or the network vanishes for 10 minutes, the upload must <strong>continue from where it stopped</strong>, not restart. A resumable protocol revolves around an <strong>upload session</strong> stored server-side:</p>
+<pre class="ascii">
+ App                                   Upload endpoint (session store)
+  | POST /uploads {size=48MB, sha256}  ->  session u_81 {received=0, expires=+24h}
+  | PUT /uploads/u_81  Content-Range: bytes 0-8388607/50331648        -> 200 received=8MB
+  | PUT /uploads/u_81  Content-Range: bytes 8388608-16777215/50331648 -> 200 received=16MB
+  | PUT ... bytes 16777216-...   ✖ network lost (tunnel, app killed)
+  |
+  |  ... 10 minutes later, connectivity back ...
+  | HEAD /uploads/u_81                     -> 200  Upload-Offset: 16777216
+  | PUT /uploads/u_81  Content-Range: bytes 16777216-25165823/50331648 -> received=24MB
+  | ...                                    -> received=48MB, complete ✔ checksum verified
+</pre>
+<ul>
+  <li><strong>Upload session ID</strong> — created once, persisted on the device together with the file path and idempotency key, so it survives app restarts.</li>
+  <li><strong>Offset query</strong> — before resuming, the client asks "how many bytes do you have?" (the server's answer is authoritative; the client may have sent bytes that never arrived).</li>
+  <li><strong>Chunk integrity</strong> — each chunk can carry a checksum; the final object is verified against the full-file hash.</li>
+  <li><strong>Session expiry</strong> — sessions live hours to days; expired sessions are garbage-collected.</li>
+  <li><strong>Background transfer</strong> — iOS background <code>URLSession</code> and Android WorkManager let the OS continue uploads when the app isn't in the foreground.</li>
+</ul>
+<p>Standard protocols: <strong>tus</strong> (open resumable upload protocol), Google Cloud Storage resumable uploads, and S3 multipart (resume by listing already-uploaded parts). Meta's public Graph API offers a resumable upload endpoint for Instagram video/Reels publishing, a sign that the same idea is used across its apps.</p>
+
+<h2>7. Client-side work before the upload</h2>
+<ul>
+  <li><strong>Resize and compress.</strong> Phone cameras produce 12–48 MP images (5–15 MB). Instagram displays photos at up to 1080 px wide, so the app resizes to that and re-encodes (JPEG/HEIC/WebP) to a few hundred KB–~1.5 MB — a 5–10× saving on upload time, ingest bandwidth and storage. Videos are transcoded on device to a target resolution/bitrate.</li>
+  <li><strong>Strip sensitive metadata.</strong> EXIF may contain GPS coordinates; strip it (on device and again on the server) unless the user explicitly adds a location.</li>
+  <li><strong>Compute the content hash</strong> for dedup and integrity.</li>
+  <li><strong>Start early.</strong> Instagram's early engineers publicly described a classic trick: begin uploading as soon as the user picks and filters the photo, <em>while they're still typing the caption</em>. By the time Share is tapped the bytes are often already there, so posting feels instant. If the user cancels, the orphaned upload is cleaned up later.</li>
+</ul>
+<div class="callout tip"><span class="callout-title">💡 Server still re-encodes</span>
+Client compression is an optimisation, not a guarantee — clients can be old, buggy or malicious. The server-side <a href="media-processing.html">media pipeline</a> always decodes and re-encodes into its own standard renditions.</div>
+
+<h2>8. Validation and safety</h2>
+<div class="table-wrap"><table>
+  <tr><th>Check</th><th>Where</th><th>How</th></tr>
+  <tr><td><b>Size</b></td><td>Before signing + at completion</td><td>Reject declared sizes over limits; sign a <code>content-length-range</code>; verify actual size via <code>HEAD</code> on completion</td></tr>
+  <tr><td><b>Real MIME type</b></td><td>After upload, server-side</td><td>Never trust extension or <code>Content-Type</code>. Read the file's <em>magic bytes</em> (JPEG <code>FF D8 FF</code>, PNG <code>89 50 4E 47</code>, MP4 <code>ftyp</code> box) and fully decode it</td></tr>
+  <tr><td><b>Dimensions / duration</b></td><td>During decode</td><td>Reject "decompression bombs" (tiny files declaring 100,000×100,000 px) and over-long videos; decode in a sandbox with memory/time limits</td></tr>
+  <tr><td><b>Malware</b></td><td>Async scan</td><td>Antivirus scanning of staging objects; isolate image libraries (historic exploits in image parsers); re-encoding neutralises most payloads</td></tr>
+  <tr><td><b>Illegal / abusive content</b></td><td>Async, before or shortly after publishing</td><td>Hash-matching against known-bad databases (e.g. PhotoDNA-style perceptual hashes) and ML classifiers; violations are blocked and reported</td></tr>
+  <tr><td><b>Quota / abuse</b></td><td>At URL request</td><td>Per-user rate limits, account-age and reputation checks against spam bots</td></tr>
+</table></div>
+<p>Objects stay in a <strong>quarantined staging prefix</strong> that no CDN can read until validation passes; then they are promoted (copied or referenced) into the permanent media location.</p>
+
+<h2>9. Deduplication via content hash</h2>
+<p>Identical files are common: the same meme reposted, the same video re-uploaded after a failed attempt, an app retry that re-sends everything. <strong>Content-addressed storage</strong> uses a cryptographic hash (SHA-256) of the bytes as identity:</p>
+<pre><code>POST /uploads {sha256: "9f86d0...", size: 1843221, ...}
+server: blob = blob_index.get("9f86d0...")
+        if blob exists and blob.size == size:
+            # skip the byte upload entirely
+            create post referencing blob_id; refcount += 1
+            return {upload_needed: false, post_id}
+        else:
+            return pre-signed URL for key "blobs/9f86d0..."</code></pre>
+<ul>
+  <li><strong>Saves</strong> upload time, bandwidth and storage; the post metadata just points to an existing blob.</li>
+  <li><strong>Reference counting</strong>: a blob may be shared by many posts; delete it only when the last reference goes (and respect legal holds).</li>
+  <li><strong>Verify, don't trust</strong>: if the client claims a hash, the server must still verify the bytes it receives hash to that value, or an attacker could "claim" someone else's blob.</li>
+  <li><strong>Privacy side channel</strong>: global cross-user dedup can leak whether a file already exists ("upload is instant → someone has this file"). Mitigations: per-user dedup only, or always require a real upload for small files.</li>
+  <li><strong>Limits</strong>: exact hashes break with a single changed byte (a re-encode or crop). Near-duplicate detection uses <em>perceptual hashes</em> — useful for moderation and ranking, not storage dedup.</li>
+  <li>Retries within one upload are better handled by the <strong>idempotency key</strong> (section 11) than by hashing.</li>
+</ul>
+
+<h2>10. The post state machine</h2>
+<p>Because publishing spans several asynchronous steps, a post is modelled as an explicit <strong>state machine</strong>. Every component checks and advances the state; nothing else decides whether followers can see a post.</p>
+<div class="diagram">
+<svg viewBox="0 0 840 290" width="840" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-mu-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g text-anchor="middle" font-weight="600">
+    <rect x="20" y="70" width="140" height="50" rx="25" fill="#e1f5fe" stroke="#0277bd"/><text x="90" y="100">UPLOADING</text>
+    <rect x="250" y="70" width="150" height="50" rx="25" fill="#f3e5f5" stroke="#6a1b9a"/><text x="325" y="100">PROCESSING</text>
+    <rect x="490" y="70" width="150" height="50" rx="25" fill="#e8f5e9" stroke="#2e7d32"/><text x="565" y="100">PUBLISHED</text>
+    <rect x="700" y="70" width="120" height="50" rx="25" fill="#eceff1" stroke="#455a64"/><text x="760" y="100">DELETED</text>
+    <rect x="250" y="200" width="150" height="50" rx="25" fill="#ffebee" stroke="#c62828"/><text x="325" y="230">FAILED</text>
+    <rect x="20" y="200" width="140" height="50" rx="25" fill="#eceff1" stroke="#455a64"/><text x="90" y="230">ABANDONED</text>
+  </g>
+  <g stroke="#555" stroke-width="1.4" fill="none" marker-end="url(#ar-mu-2)">
+    <path d="M160,95 L248,95"/>
+    <path d="M400,95 L488,95"/>
+    <path d="M640,95 L698,95"/>
+    <path d="M325,120 L325,198"/>
+    <path d="M90,120 L90,198"/>
+    <path d="M250,215 C200,170 180,140 150,122"/>
+  </g>
+  <g font-size="11" fill="#333" text-anchor="middle">
+    <text x="204" y="48">complete +</text><text x="204" y="62">verified</text>
+    <text x="444" y="48">renditions ready</text><text x="444" y="62">+ checks pass</text>
+    <text x="669" y="62">user / mod</text>
+  </g>
+  <g font-size="11" fill="#333">
+    <text x="332" y="160">transcode error,</text><text x="332" y="175">invalid media</text>
+    <text x="84" y="150" text-anchor="end">no completion</text><text x="84" y="165" text-anchor="end">within 24 h</text>
+    <text x="195" y="150">client retries</text>
+  </g>
+</svg>
+<div class="caption">Post lifecycle. Only PUBLISHED posts are visible to followers; transitions are guarded so they can't go backwards or happen twice.</div>
+</div>
+<div class="table-wrap"><table>
+  <tr><th>State</th><th>Meaning</th><th>Who moves it on</th></tr>
+  <tr><td><code>UPLOADING</code></td><td>Session created, bytes arriving; invisible</td><td>Upload service on verified completion → PROCESSING; sweeper after timeout → ABANDONED</td></tr>
+  <tr><td><code>PROCESSING</code></td><td>Bytes stored; renditions and checks running; visible only to the author</td><td>Media/moderation results → PUBLISHED or FAILED</td></tr>
+  <tr><td><code>PUBLISHED</code></td><td>Visible according to audience; <code>PostCreated</code> emitted</td><td>User delete or moderation → DELETED/REMOVED</td></tr>
+  <tr><td><code>FAILED</code></td><td>Unrecoverable processing error or rejected content</td><td>Client may retry (re-upload)</td></tr>
+</table></div>
+<p>Transitions are <strong>conditional updates</strong> (compare-and-set), so duplicate or out-of-order events can't corrupt state:</p>
+<pre><code>UPDATE posts SET status = 'PUBLISHED', published_at = now()
+WHERE post_id = 42 AND status = 'PROCESSING';
+-- 1 row updated → we won: insert PostCreated into outbox in the same transaction
+-- 0 rows updated → already published (duplicate MediaReady) or deleted: do nothing</code></pre>
+<p>A watchdog also alerts on posts stuck in <code>PROCESSING</code> longer than expected, and re-drives them.</p>
+
+<h2>11. Idempotency on retries</h2>
+<p>Mobile clients retry constantly: timeouts, app restarts, flaky radios. The dangerous case: the server <em>did</em> create the post, but the response was lost. Without protection, the retry creates a <strong>duplicate post</strong>. The fix is an <strong>idempotency key</strong>: a UUID the client generates once per user action ("share this post") and sends with every retry of that action.</p>
+<pre><code>def create_upload(user_id, idem_key, req):
+    existing = idem_store.get((user_id, idem_key))
+    if existing:
+        return existing.response                  # replay the original answer
+    with db.transaction():
+        # unique constraint on (user_id, idem_key) protects against two concurrent first attempts
+        post_id = id_gen.next()
+        db.insert_post(post_id, user_id, status="UPLOADING", idem_key=idem_key)
+        resp = {"post_id": post_id, "upload_id": ..., "urls": sign_urls(post_id)}
+        idem_store.put((user_id, idem_key), resp, ttl=24h)
+    return resp</code></pre>
+<div class="table-wrap"><table>
+  <tr><th>Scenario</th><th>Without idempotency key</th><th>With it</th></tr>
+  <tr><td>Response to <code>POST /uploads</code> lost, app retries</td><td>Two post rows, two sessions</td><td>Same post_id and session returned</td></tr>
+  <tr><td><code>/complete</code> times out, app retries</td><td>Two MediaUploaded events, double processing</td><td>Second call sees PROCESSING and returns the same result</td></tr>
+  <tr><td>User double-taps Share</td><td>Duplicate post in followers' feeds</td><td>Same key → one post</td></tr>
+  <tr><td>Part upload retried</td><td>—</td><td>Naturally idempotent: re-PUT of part N overwrites part N</td></tr>
+</table></div>
+<p>Downstream consumers are idempotent too (dedupe on event ID, conditional state transitions), because Kafka delivery is at-least-once. See <a href="api-design.html">API design</a> and <a href="resilience-patterns.html">resilience patterns</a>.</p>
+
+<h2>12. Cleaning up orphaned blobs</h2>
+<p>Direct-to-storage uploads inevitably leave <strong>orphans</strong>: bytes in object storage with no published post pointing at them. Sources include users who cancel after the early upload started, apps killed mid-upload, multipart uploads never completed, posts that FAILED, and deleted posts. At hundreds of millions of uploads a day, even a 2% orphan rate is petabytes per year of paid-for garbage.</p>
+<div class="table-wrap"><table>
+  <tr><th>Mechanism</th><th>What it catches</th><th>Example</th></tr>
+  <tr><td><b>Lifecycle rule: abort incomplete multipart</b></td><td>Parts of uploads never completed (invisible in normal listings, but billed)</td><td><code>AbortIncompleteMultipartUpload: DaysAfterInitiation = 2</code></td></tr>
+  <tr><td><b>Lifecycle expiry on staging prefix</b></td><td>Anything left in <code>staging/</code> that was never promoted</td><td>Expire <code>staging/*</code> after 3 days</td></tr>
+  <tr><td><b>Session sweeper</b></td><td>Posts stuck in UPLOADING past the session expiry</td><td>Every 10 min: mark ABANDONED, delete their objects</td></tr>
+  <tr><td><b>Reconciliation job</b></td><td>Anything the above missed (bugs, crashes between steps)</td><td>Daily: diff the storage inventory against metadata; delete unreferenced blobs older than a grace period</td></tr>
+  <tr><td><b>Soft-delete then purge</b></td><td>User-deleted posts</td><td>Mark deleted (hidden immediately); purge renditions after a recovery window, honouring legal holds; CDN purge</td></tr>
+</table></div>
+<pre><code>{ "Rules": [
+  { "ID": "abort-stale-multipart", "Filter": { "Prefix": "" }, "Status": "Enabled",
+    "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 2 } },
+  { "ID": "expire-staging", "Filter": { "Prefix": "staging/" }, "Status": "Enabled",
+    "Expiration": { "Days": 3 } } ] }</code></pre>
+<div class="callout danger"><span class="callout-title">🚨 The race to avoid</span>
+A garbage collector must never delete a blob that a <em>just-committing</em> post is about to reference. Always apply a <strong>grace period</strong> (only delete orphans older than, say, 48 hours, longer than any session can live), and prefer "mark, then sweep later" over immediate deletes. Deleting user content is irreversible; leaking a little storage for a day is cheap.</div>
+
+<h2>13. Carousels: multiple media per post</h2>
+<p>A carousel post contains several photos and/or videos (Instagram raised the limit from 10 to 20 items in 2024). Model it as one post with an ordered list of media:</p>
+<pre><code>posts       (post_id PK, author_id, caption, status, media_count, created_at, ...)
+post_media  (post_id, position, media_id, media_type, width, height, status)  PK (post_id, position)
+media       (media_id PK, blob_key, sha256, renditions{...}, duration_ms, status)</code></pre>
+<ol class="steps">
+  <li>The client requests one upload session per item (or a single batch call returning N pre-signed URL sets) — all under the post's idempotency key.</li>
+  <li>Items upload <strong>in parallel</strong> (bounded concurrency, e.g. 2–3 at a time on mobile), each with its own resumable session.</li>
+  <li><code>/complete</code> sends the ordered list of media IDs plus caption; the post enters PROCESSING.</li>
+  <li>Each item is processed independently; the post becomes PUBLISHED only when <strong>all</strong> items are ready (a per-post counter or a check of all <code>post_media.status</code> values, done with a conditional update so exactly one worker flips it).</li>
+  <li>If one item fails, the post is not published half-complete; the author is asked to retry or remove that item.</li>
+</ol>
+<p>Carousels multiply upload volume (average items per post &gt; 1), and the feed must render the first item fast while lazily loading the rest — so the first item's renditions are prioritised in processing and <a href="cdn.html">prefetching</a>.</p>
+
+<h2>14. Reels and large videos</h2>
+<ul>
+  <li><strong>Size</strong>: a few minutes of 1080p video is tens to hundreds of MB even after on-device compression. Always multipart + resumable, with background transfer.</li>
+  <li><strong>Upload close to the user</strong>: large providers terminate uploads at a nearby edge PoP and forward over their private backbone (the same idea as S3 Transfer Acceleration), cutting round-trip time on each chunk.</li>
+  <li><strong>Process while uploading</strong>: Facebook's published <em>Streaming Video Engine</em> (SOSP 2017) splits video into segments as they arrive and transcodes them in parallel, so processing overlaps the upload instead of starting after it — dramatically reducing time-to-publish.</li>
+  <li><strong>Progressive availability</strong>: publish once a baseline rendition (e.g. 480p) and the first segments exist; higher-quality renditions for <a href="media-processing.html">adaptive bitrate streaming</a> are added later.</li>
+  <li><strong>Extra metadata</strong>: cover frame, audio track/music licensing, duration, aspect ratio, captions — all part of the PROCESSING step.</li>
+  <li><strong>Priority queues</strong>: short photo jobs shouldn't wait behind long transcodes; separate worker pools/queues per media type.</li>
+</ul>
+
+<h2>15. Generating the post ID</h2>
+<p>The Upload service needs the post's ID at step 2 — before any bytes arrive — because the ID becomes part of the object key, the idempotency record, and later every event. Requirements: globally unique across all shards, generated without a central bottleneck, and roughly <strong>time-sortable</strong> so feeds and profile grids can sort by ID.</p>
+<p>Instagram's publicly described scheme (2012 engineering blog) packs a 64-bit ID as:</p>
+<pre class="ascii">
+ | 41 bits: milliseconds since custom epoch | 13 bits: logical shard ID | 10 bits: per-shard sequence |
+   ~69 years of timestamps                    8,192 logical shards         1,024 IDs / ms / shard
+</pre>
+<p>It was generated inside each PostgreSQL logical shard by a PL/pgSQL function, so the ID also tells you which shard holds the row. See <a href="id-generation.html">Unique ID generation</a> for Snowflake, UUIDs and trade-offs.</p>
+
+<h2>16. Publishing <code>PostCreated</code> reliably</h2>
+<p>Everything downstream — follower feeds, search, notifications, analytics — hinges on the <code>PostCreated</code> event. If the post commits but the event is lost, followers never see it; if the event goes out but the commit fails, consumers process a ghost post. So the event is written with the <strong>transactional outbox</strong> pattern (explained fully in <a href="microservices.html">Microservices</a>): the state change to PUBLISHED and the outbox insert happen in <em>one</em> local transaction, and a relay (poller or CDC) publishes outbox rows to <a href="message-queues.html">Kafka</a>.</p>
+<pre><code>{
+  "event_id":   "evt-01HF7Q...",          // consumers dedupe on this
+  "type":       "PostCreated",
+  "post_id":    3141592653589793238,
+  "author_id":  7,
+  "created_at": "2026-10-23T09:16:02Z",
+  "media":      [{"media_id": 991, "type": "photo"}, {"media_id": 992, "type": "video"}],
+  "audience":   "followers",              // or close_friends, public...
+  "caption_lang": "en",
+  "schema_version": 3
+}</code></pre>
+<div class="flow">
+  <div class="fnode svc">Upload service<small>PUBLISHED + outbox</small></div><div class="farrow">→<small>relay</small></div>
+  <div class="fnode async">Kafka<small>post-events, key=author_id</small></div><div class="farrow">→</div>
+  <div class="fnode async">Fan-out workers<small>timelines</small></div><div class="farrow">+</div>
+  <div class="fnode async">Search indexer</div><div class="farrow">+</div>
+  <div class="fnode async">Notifications<small>"X posted"</small></div>
+</div>
+<p>Consumers must tolerate duplicates (at-least-once) and the event carries enough data (author, audience, media types) that most consumers needn't call back to the Upload service.</p>
+
+<h2>17. Estimating upload volume</h2>
+<p>Assumptions (not official figures): 500M users post feed media or stories on a given day; <strong>150M feed/Reels media items</strong> (carousels included) and <strong>400M story items</strong> per day; after client compression photos average <strong>1 MB</strong> and videos <strong>15 MB</strong>; 30% of items are video.</p>
+<pre><code>Items/day         = 150M + 400M                 = 550M
+Average upload QPS = 550M / 86,400 s            ≈ 6,400 uploads/s   (peak ×3 ≈ 19,000/s)
+Avg item size     = 0.7 × 1 MB + 0.3 × 15 MB    = 5.2 MB
+Ingest/day        = 550M × 5.2 MB               ≈ 2.9 PB/day
+Ingest bandwidth  = 2.9 PB / 86,400 s           ≈ 33 GB/s ≈ 265 Gbps average (~800 Gbps peak)
+Control-plane API = ~2–3 calls per item         ≈ 15k–60k req/s peak — tiny vs the byte stream
+Renditions        ≈ +50–100% storage on top of originals, then × replication/erasure coding</code></pre>
+<p>The control plane is a modest web service; the data plane is a firehose that only object storage and the network edge should touch. That asymmetry is the whole argument for pre-signed direct uploads. Redo this with your own numbers using <a href="capacity-estimation.html">Back-of-the-envelope estimation</a>.</p>
+
+<h2>18. How Instagram uses the Upload service</h2>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+The diagram's <strong>Upload Service (posts/reels, pre-signed URLs)</strong> is the control plane described above; <strong>Object Storage</strong> receives the bytes; the <strong>Post metadata store</strong> (Cassandra/sharded PostgreSQL by user) holds the post row and state; <strong>Kafka</strong> carries <code>PostCreated</code> to fan-out, search, notifications and analytics; <strong>Media Processing Workers</strong> write renditions back to object storage, which the <a href="cdn.html">CDN</a> serves. Instagram's app has long started uploading before the user taps Share, resizes media on device, and uses resumable uploads for video (Meta's public Graph API exposes a resumable upload flow for Reels). In practice much of this logic lives inside Instagram's large Django web tier as an "upload domain", calling Meta's shared storage and video-processing infrastructure.</div>
+<ul>
+  <li><strong>Stories</strong> use the same path with a different post type and TTL — see <a href="stories.html">Stories</a>.</li>
+  <li><strong>DM media</strong> uses the same direct-upload idea, with access restricted to the thread's participants.</li>
+  <li><strong>Profile photos</strong> are small, but still go through validation and renditions.</li>
+</ul>
+
+<h2>19. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Direct pre-signed uploads give you</h4><ul>
+    <li>App servers freed from byte shovelling; stateless, cheap control plane</li>
+    <li>Half the bandwidth; object storage scales ingest for you</li>
+    <li>Resumable, parallel transfers for mobile</li>
+    <li>Fine-grained, time-limited permissions without sharing credentials</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs</h4><ul>
+    <li>Multi-step protocol: more client logic and more states</li>
+    <li>Validation happens <em>after</em> bytes land, so staging + quarantine are needed</li>
+    <li>Orphaned objects need lifecycle rules and sweepers</li>
+    <li>Harder to enforce exact limits than with an inline proxy</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Letting the client choose the object key</strong> → overwriting other users' media.</li>
+  <li><strong>Long-lived upload URLs</strong> or logging them in full → anyone can upload into your bucket.</li>
+  <li><strong>Trusting <code>Content-Type</code> or file extension</strong> instead of decoding the file.</li>
+  <li><strong>No idempotency key</strong> → duplicate posts on retries and double-taps.</li>
+  <li><strong>"Write DB then publish to Kafka"</strong> without an outbox → posts that never reach followers.</li>
+  <li><strong>Forgetting incomplete multipart uploads</strong> → invisible, billed storage growing forever.</li>
+  <li><strong>Publishing before processing finishes</strong> → followers see broken images.</li>
+</ul>
+
+<h2>20. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>Use it for</th></tr>
+  <tr><td>Amazon S3 pre-signed URLs / POST policies, multipart upload</td><td>Direct uploads with expiry, size and content-type constraints; large objects</td></tr>
+  <tr><td>Google Cloud Storage signed URLs + resumable uploads; Azure Blob SAS tokens</td><td>Equivalent features on other clouds</td></tr>
+  <tr><td>tus protocol (tusd, Uppy)</td><td>Open, standard resumable upload protocol and clients</td></tr>
+  <tr><td>S3 Transfer Acceleration / CDN upload endpoints</td><td>Terminating uploads near the user and using the provider's backbone</td></tr>
+  <tr><td>S3 Event Notifications → SQS/Lambda, S3 Inventory</td><td>"Object arrived" safety net; reconciliation of orphans</td></tr>
+  <tr><td>ClamAV, cloud malware scanning; PhotoDNA-style hash matching</td><td>Malware and known-abuse detection on staged uploads</td></tr>
+  <tr><td>libvips, ImageMagick, FFmpeg</td><td>Validation by decoding; resizing and transcoding</td></tr>
+  <tr><td>Debezium / outbox relays + Kafka</td><td>Reliable <code>PostCreated</code> publication</td></tr>
+</table></div>
+
+<h2>21. Interview corner</h2>
+<details class="qa"><summary>Design the API for posting a photo on Instagram.</summary>
+<p>Two-phase API. <code>POST /uploads</code> with an idempotency key, media type, size and SHA-256 returns <code>{post_id, upload_id, presigned_urls[], expires_at}</code> and creates a post in UPLOADING. The client PUTs bytes directly to object storage (multipart/resumable). <code>POST /uploads/{id}/complete</code> with part ETags, caption, location, audience: the server verifies the object (size, checksum), moves the post to PROCESSING and writes a MediaUploaded event via the outbox, returning <code>202</code>. Media workers create renditions; on success a conditional update sets PUBLISHED and emits PostCreated. The client polls or gets a push when published; the author sees it immediately via optimistic UI.</p></details>
+<details class="qa"><summary>Why use pre-signed URLs instead of uploading through your API servers?</summary>
+<p>Uploads are slow, large and I/O-bound. Proxying them ties up app workers for the whole transfer, doubles bandwidth (client→app→S3), hits LB timeouts and body limits, and couples upload spikes to the API fleet. Pre-signed URLs keep authorisation in our service (short expiry, server-chosen key, signed content type/size) while object storage — designed for massive parallel ingest — receives the bytes directly. The API only handles tiny control requests.</p></details>
+<details class="qa"><summary>A user uploads a 300 MB video on a train with patchy coverage. How do you make it succeed?</summary>
+<p>On-device transcode to a sane bitrate first. Create a resumable upload session (persisted on device with the file path and idempotency key). Upload in chunks (adaptive 1–16 MB) with per-chunk checksums using OS background transfer. On reconnect, query the server for the committed offset and continue from there. The session lives for e.g. 24 h; the final object is verified against the whole-file hash. Server-side, segments can be processed as they arrive (streaming processing) so publishing follows shortly after the last chunk.</p></details>
+<details class="qa"><summary>The client's "complete" request timed out and it retried. How do you avoid a duplicate post?</summary>
+<p>Every request in the flow carries the idempotency key generated once per Share action; the server stores (user_id, key) → response with a unique constraint, so a retry replays the original result. The completion step is a conditional state transition (UPLOADING → PROCESSING only if still UPLOADING), so a second call sees PROCESSING and returns the same post. Downstream, the PUBLISHED transition is also conditional and consumers dedupe on event_id.</p></details>
+<details class="qa"><summary>How do you make sure a newly published post reliably reaches followers' feeds?</summary>
+<p>The PUBLISHED transition and the PostCreated outbox insert are one local transaction. A relay publishes outbox rows to Kafka (at-least-once, keyed for ordering). Fan-out workers consume PostCreated and write the post ID into followers' Redis timelines (push), skipping celebrities whose posts are pulled at read time; ZADD is idempotent so redelivery is harmless. Consumer lag is monitored; if workers fall behind they catch up from the retained log.</p></details>
+<details class="qa"><summary>How do you prevent storage from filling with abandoned uploads?</summary>
+<p>Land uploads in a staging prefix with a lifecycle expiry and an AbortIncompleteMultipartUpload rule; a sweeper marks posts stuck in UPLOADING past their session expiry as ABANDONED and deletes their objects; a daily reconciliation diffs storage inventory against metadata and deletes unreferenced objects older than a grace period; deleted posts are soft-deleted then purged after a recovery window. Grace periods prevent racing with in-flight commits.</p></details>
+<details class="qa"><summary>One item in a 10-item carousel fails to transcode. What happens?</summary>
+<p>The post stays in PROCESSING until every item is ready and is never shown half-complete. The failed item is retried automatically (transient errors); if it fails permanently, the post goes to FAILED for that item and the author is prompted to retry the upload or remove the item, then the post is re-evaluated. Exactly one worker flips the post to PUBLISHED via a conditional update when the last item becomes ready.</p></details>
+
+<h2>22. Check your understanding</h2>
+<details class="quiz"><summary>A 200 MB video is uploaded in 8 MB parts. How many parts, and how much is re-sent if the connection drops halfway through part 13?</summary>
+<p><code>200 / 8 = 25</code> parts. Parts 1–12 are already committed, so only part 13 (at most 8 MB) is re-sent — versus up to 200 MB without chunking.</p></details>
+<details class="quiz"><summary>Why must the server choose the object key rather than the client?</summary>
+<p>If the client chose the key, it could request a URL for another user's object path and overwrite their media. Server-chosen keys (derived from post/media IDs) plus a signature bound to that key make each URL usable only for its own object.</p></details>
+<details class="quiz"><summary>The app compresses photos to 1080 px before uploading. Why does the server still decode and re-encode them?</summary>
+<p>Client output can't be trusted: old app versions, bugs or malicious clients may send oversized, malformed or exploit-carrying files. Decoding validates the real format and dimensions, and re-encoding produces the platform's standard renditions and neutralises most embedded payloads.</p></details>
+<details class="quiz"><summary>Two <code>MediaReady</code> events for the same post arrive (at-least-once delivery). What prevents two <code>PostCreated</code> events?</summary>
+<p>The transition is a conditional update — <code>UPDATE … SET status='PUBLISHED' WHERE post_id=? AND status='PROCESSING'</code>. Only the first succeeds (1 row updated) and inserts PostCreated into the outbox in the same transaction; the second updates 0 rows and does nothing.</p></details>
+<details class="quiz"><summary>Using the volume assumptions above, roughly how many uploads per second must the system handle at a 3× peak, and why is the Upload service itself not the bottleneck?</summary>
+<p>550M/day ÷ 86,400 ≈ 6,400/s average, ≈ 19,000/s at peak. The Upload service handles only small control requests (2–3 per item), while the ~33 GB/s average byte stream goes directly to object storage via pre-signed URLs.</p></details>
+<details class="quiz"><summary>Why can global, cross-user dedup by content hash be a privacy problem, and what's a mitigation?</summary>
+<p>If uploading a file is "instant" when someone else already uploaded identical bytes, an attacker can probe whether a specific file exists on the platform. Mitigations: dedup only within one user's uploads, always require real bytes for small files, or verify possession by requiring the upload anyway and deduping only at the storage layer.</p></details>
+<details class="quiz"><summary>Scenario: a garbage collector deletes every blob in <code>media/</code> without a matching post row. What can go wrong?</summary>
+<p>It can race with uploads whose bytes are already promoted but whose metadata transaction hasn't committed yet (or is being retried), permanently deleting a user's just-published media. Only delete orphans older than a safe grace period, and prefer mark-then-sweep.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Separate the <strong>control plane</strong> (auth, IDs, metadata, state) from the <strong>data plane</strong> (bytes): clients upload directly to object storage with short-lived, server-scoped <strong>pre-signed URLs</strong>.</li>
+    <li>Use <strong>multipart</strong> for big files and <strong>resumable sessions with offsets</strong> for mobile networks; do client-side resize/compression and start uploading early.</li>
+    <li>Model posts as a <strong>state machine</strong> (UPLOADING → PROCESSING → PUBLISHED/FAILED) with conditional transitions, and make every step <strong>idempotent</strong> via an idempotency key.</li>
+    <li>Validate by <strong>decoding</strong>, quarantine in staging, scan for malware/abuse, and dedupe by <strong>content hash</strong> carefully.</li>
+    <li>Plan for <strong>orphans</strong> (lifecycle rules, sweepers, reconciliation) and publish <code>PostCreated</code> via a <strong>transactional outbox</strong>.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="object-storage.html">Object Storage</a> — where the bytes land; durability, lifecycle rules</li>
+  <li><a href="media-processing.html">Media Processing</a> — what happens after upload: renditions, transcoding, moderation</li>
+  <li><a href="id-generation.html">Unique ID Generation</a> — Instagram's 64-bit post IDs</li>
+  <li><a href="microservices.html">Microservices</a> — sagas and the transactional outbox in depth</li>
+  <li><a href="api-design.html">API Design</a> — idempotency keys and two-phase APIs</li>
+  <li><a href="message-queues.html">Message Queues &amp; Kafka</a> — how PostCreated reaches consumers</li>
+  <li><a href="news-feed.html">News Feed</a> — the biggest consumer of PostCreated</li>
+  <li><a href="cdn.html">CDN</a> — how the processed media is served back to viewers</li>
+  <li><a href="security.html">Security</a> — signed URLs, malware scanning and abuse prevention</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

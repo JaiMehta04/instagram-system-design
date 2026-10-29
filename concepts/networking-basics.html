@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Networking Basics: IP, TCP, HTTP &amp; TLS — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="networking-basics">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>Every Instagram request is an <strong>HTTP</strong> message, encrypted by <strong>TLS</strong>, carried by <strong>TCP</strong> (or <strong>QUIC</strong> over UDP), inside <strong>IP</strong> packets that routers forward hop by hop across the internet.</li>
+    <li><strong>Latency is dominated by round trips</strong>, and round trips are limited by the speed of light (~1 ms of RTT per 100 km of fibre). A cold HTTPS request from Mumbai to a US data center can cost well over a second before any optimisation.</li>
+    <li>Setting up a connection costs round trips: TCP handshake (1 RTT) + TLS 1.2 (2 RTT) or TLS 1.3 (1 RTT). <strong>QUIC/HTTP/3</strong> merges them into 1 RTT, or 0 RTT on resumption.</li>
+    <li><strong>HTTP/1.1</strong> = one request at a time per connection (head-of-line blocking); <strong>HTTP/2</strong> = many multiplexed streams over one TCP connection; <strong>HTTP/3</strong> = streams over QUIC, with no TCP-level blocking and <strong>connection migration</strong> — ideal for phones.</li>
+    <li>The big wins: <strong>reuse connections</strong>, <strong>terminate TLS near the user</strong> (edge PoPs), use <strong>TLS 1.3 / QUIC</strong>, and send fewer, larger requests.</li>
+    <li>Proxies sit in the middle: <strong>forward proxies</strong> act for clients, <strong>reverse proxies</strong> (load balancers, gateways, CDNs) act for servers. Real-time features need <strong>long polling, SSE or WebSockets</strong>.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why should a system designer care about protocols?</h2>
+<p>When you tap the Instagram icon in Mumbai, the app must fetch your feed from servers that may be thousands of kilometres away. That one tap turns into a DNS lookup, a TCP connection, a TLS handshake, an HTTP request, and then dozens of image downloads — each a conversation made of packets bouncing across undersea cables, routers, carrier networks and load balancers.</p>
+<p>System design decisions that look "high level" are really networking decisions in disguise:</p>
+<ul>
+  <li><strong>Why have a CDN and edge PoPs?</strong> Because round trips across oceans are slow and handshakes need several of them.</li>
+  <li><strong>Why does the load balancer terminate TLS?</strong> Because TLS is CPU-heavy and certificates need central management.</li>
+  <li><strong>Why do DMs use WebSockets, not plain HTTP?</strong> Because HTTP is request/response and the server can't otherwise speak first.</li>
+  <li><strong>Why did Meta invest heavily in QUIC?</strong> Because phones switch networks and lose packets, and TCP handles both badly.</li>
+</ul>
+<p>You don't need to be a network engineer to design systems, but you do need a solid mental model of what a request costs. This lesson gives you that model and the vocabulary interviewers expect.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  Sending a request is like mailing a letter through a very bureaucratic postal system. You write the letter (<strong>HTTP</strong>), lock it in a tamper-proof box only the recipient can open (<strong>TLS</strong>), hand it to a courier service that numbers every page, confirms delivery and resends lost pages (<strong>TCP</strong>), who puts it in an envelope with the destination building's street address (<strong>IP</strong>) and the apartment number (<strong>port</strong>), and the envelope then travels truck by truck (<strong>links</strong>) through sorting centres (<strong>routers</strong>). Before the first letter, the courier insists on a phone call to agree on terms (<strong>handshake</strong>) — and if the recipient lives overseas, every call takes a long time.
+</div>
+
+<h2>2. Layers: the simplified OSI and TCP/IP models</h2>
+<p>Networking is organised in <strong>layers</strong>. Each layer solves one problem and relies on the layer below, so HTTP doesn't need to know whether it's travelling over Wi-Fi or 5G. The academic <strong>OSI model</strong> has 7 layers; the practical <strong>TCP/IP model</strong> used on the internet collapses them into 4–5. You'll hear engineers say "L4" and "L7" constantly — those numbers come from OSI.</p>
+
+<div class="table-wrap"><table>
+  <tr><th>OSI layer</th><th>TCP/IP layer</th><th>Job</th><th>Examples</th><th>Unit / addressing</th></tr>
+  <tr><td>L7 Application<br>(L6 Presentation, L5 Session folded in)</td><td>Application</td><td>What the program means: requests, responses, encryption and encoding</td><td>HTTP, gRPC, DNS, WebSocket, TLS*</td><td>Messages; URLs, hostnames</td></tr>
+  <tr><td>L4 Transport</td><td>Transport</td><td>Process-to-process delivery, reliability, ordering, congestion control</td><td>TCP, UDP, QUIC (over UDP)</td><td>Segments / datagrams; <strong>ports</strong></td></tr>
+  <tr><td>L3 Network</td><td>Internet</td><td>Host-to-host delivery across many networks; routing</td><td>IPv4, IPv6, ICMP, BGP (routing protocol)</td><td>Packets; <strong>IP addresses</strong></td></tr>
+  <tr><td>L2 Data link</td><td rowspan="2">Link</td><td>Delivery to the next hop on the same local network</td><td>Ethernet, Wi-Fi (802.11), LTE/5G radio</td><td>Frames; MAC addresses</td></tr>
+  <tr><td>L1 Physical</td><td>Bits as light, electricity or radio waves</td><td>Fibre, copper, radio</td><td>Bits</td></tr>
+</table></div>
+<p><small>*TLS sits between transport and application; people variously call it L5/L6 or "part of L7". In QUIC it is built into the transport itself.</small></p>
+<p>Why it matters for design: an <strong>L4 load balancer</strong> sees only IPs and ports (fast, protocol-agnostic), while an <strong>L7 load balancer</strong> parses HTTP and can route by URL path, header or cookie (smarter, more expensive). See <a href="load-balancer.html">Load balancing</a>.</p>
+
+<h3>2.1 Encapsulation</h3>
+<p>As data goes down the stack, each layer wraps it with its own header — like nested envelopes. The receiver unwraps them in reverse order.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 260" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <rect x="10" y="10" width="800" height="240" rx="8" fill="#eceff1" stroke="#455a64"/>
+  <text x="25" y="32" font-weight="600">L2 Link frame — Wi-Fi / Ethernet / LTE header (next-hop MAC)</text>
+  <rect x="30" y="45" width="760" height="190" rx="8" fill="#fff3e0" stroke="#ef6c00"/>
+  <text x="45" y="67" font-weight="600">L3 IP packet — header: source IP 49.36.x.x → destination IP 157.240.x.x, TTL</text>
+  <rect x="50" y="80" width="720" height="145" rx="8" fill="#e8f5e9" stroke="#2e7d32"/>
+  <text x="65" y="102" font-weight="600">L4 TCP segment — header: ports 51234 → 443, sequence no., ACK no., window</text>
+  <rect x="70" y="115" width="680" height="100" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/>
+  <text x="85" y="137" font-weight="600">TLS record — encrypted + authenticated (AES-GCM / ChaCha20)</text>
+  <rect x="90" y="150" width="640" height="55" rx="8" fill="#e1f5fe" stroke="#0277bd"/>
+  <text x="105" y="172" font-weight="600">L7 HTTP: GET /api/v1/feed/timeline/  Host: i.instagram.com</text>
+  <text x="105" y="192" font-size="11">Authorization: Bearer …   Accept-Encoding: gzip   (body: none)</text>
+</svg>
+<div class="caption">Encapsulation: the HTTP request is encrypted by TLS, numbered by TCP, addressed by IP and finally framed for the physical link. Each router only looks at the IP header; only the destination (or a proxy that terminates TLS) can read the HTTP.</div>
+</div>
+
+<h2>3. IP addresses, ports and NAT</h2>
+<h3>3.1 IP addresses</h3>
+<p>An <strong>IP address</strong> identifies a network interface on the internet, like a building's street address. <strong>IPv4</strong> addresses are 32 bits, written as four numbers (<code>157.240.22.174</code>) — about 4.3 billion total, which ran out long ago. <strong>IPv6</strong> addresses are 128 bits (<code>2a03:2880:f12f:83:face:b00c:0:25de</code> — yes, Meta embeds "face:b00c" in some of its IPv6 addresses), enough for every device many times over. Large mobile carriers increasingly run IPv6-first networks, and big services serve both.</p>
+<p>Some IPv4 ranges are <strong>private</strong> (<code>10.0.0.0/8</code>, <code>172.16.0.0/12</code>, <code>192.168.0.0/16</code>): usable inside a home, office or data center but not routable on the public internet. The <code>/8</code> notation (<strong>CIDR</strong>) says how many leading bits are the network prefix — <code>/8</code> means the first 8 bits are fixed, leaving 24 bits (16.7M addresses) for hosts.</p>
+<p>Routers forward packets based on the destination address using routing tables. Between organisations (called <em>autonomous systems</em>), routes are exchanged with <strong>BGP</strong> (Border Gateway Protocol): each network announces "I can reach these address prefixes". If a network stops announcing its prefixes, the rest of the internet literally forgets how to reach it — which is exactly what happened in Facebook's October 2021 outage (see <a href="dns.html">DNS</a>).</p>
+
+<h3>3.2 Ports</h3>
+<p>One machine runs many programs, so an IP address alone isn't enough. A <strong>port</strong> (a 16-bit number, 0–65535) identifies the program/socket — the apartment number in the building. Well-known server ports: <code>443</code> HTTPS (and HTTP/3 over UDP 443), <code>80</code> HTTP, <code>53</code> DNS, <code>22</code> SSH, <code>5432</code> PostgreSQL, <code>6379</code> Redis, <code>9092</code> Kafka. Clients use a random <strong>ephemeral port</strong> (e.g. 51234) for each outgoing connection.</p>
+<p>A TCP connection is uniquely identified by its <strong>5-tuple</strong>: (protocol, source IP, source port, destination IP, destination port). Load balancers hash this tuple to keep all packets of one connection on the same backend.</p>
+
+<h3>3.3 NAT (Network Address Translation)</h3>
+<p>Because IPv4 addresses are scarce, your home router gives devices private addresses (<code>192.168.1.23</code>) and <strong>translates</strong> them to its single public address on the way out, remembering the mapping in a table so replies can be sent back to the right device. Mobile carriers do the same at enormous scale — <strong>carrier-grade NAT (CGNAT)</strong> — so thousands of phones may share one public IPv4 address.</p>
+<pre class="ascii">
+ Phone 10.20.3.7:51234 ──┐                         ┌──&gt; 157.240.x.x:443 (Instagram edge)
+ Phone 10.20.9.1:40001 ──┼─&gt; Carrier NAT 49.36.1.5 ─┤   sees both as 49.36.1.5 (ports 61001, 61002)
+ Phone 10.20.4.4:33333 ──┘   table:                 └──&gt; ...
+                             10.20.3.7:51234 ⇄ 49.36.1.5:61001
+                             10.20.9.1:40001 ⇄ 49.36.1.5:61002   (entries expire when idle!)
+</pre>
+<p>Design consequences:</p>
+<ul>
+  <li><strong>Idle connections die silently.</strong> NAT tables drop idle entries (sometimes after only 30 seconds to a few minutes on mobile). Long-lived connections like DM WebSockets or MQTT must send small <strong>keep-alive heartbeats</strong>, or the NAT forgets them and the server's next message vanishes.</li>
+  <li><strong>IP-based rate limiting is crude.</strong> Thousands of legitimate users can share one carrier IP; limiting per IP would punish all of them. Rate limit per user/token where possible (see <a href="rate-limiting.html">Rate limiting</a>).</li>
+  <li><strong>Servers can't initiate connections to phones.</strong> The phone has no public address; the server can only talk back over a connection the phone opened — which is why push uses APNs/FCM or a client-opened persistent connection.</li>
+</ul>
+
+<h2>4. TCP vs UDP</h2>
+<p>The transport layer offers two classic choices:</p>
+<ul>
+  <li><strong>TCP (Transmission Control Protocol)</strong> gives a reliable, ordered <em>byte stream</em>: what you send arrives complete, in order, without duplicates — or the connection reports an error. It achieves this with handshakes, sequence numbers, acknowledgements and retransmissions, and it slows down when the network is congested.</li>
+  <li><strong>UDP (User Datagram Protocol)</strong> sends individual <em>datagrams</em> with almost nothing added: no connection, no delivery guarantee, no ordering, no congestion control. It's a thin layer over IP that adds ports and a checksum. Applications that need reliability build their own on top (as QUIC does).</li>
+</ul>
+<div class="table-wrap"><table>
+  <tr><th></th><th>TCP</th><th>UDP</th></tr>
+  <tr><td><b>Connection</b></td><td>Connection-oriented (handshake first)</td><td>Connectionless — just send</td></tr>
+  <tr><td><b>Reliability</b></td><td>Guaranteed delivery via ACKs and retransmission</td><td>Best effort; packets may be lost</td></tr>
+  <tr><td><b>Ordering</b></td><td>Strictly in order</td><td>None — may arrive out of order or duplicated</td></tr>
+  <tr><td><b>Congestion / flow control</b></td><td>Built in</td><td>None (app must be polite itself)</td></tr>
+  <tr><td><b>Header size</b></td><td>20–60 bytes</td><td>8 bytes</td></tr>
+  <tr><td><b>Setup latency</b></td><td>1 RTT before data</td><td>0 RTT</td></tr>
+  <tr><td><b>Head-of-line blocking</b></td><td>Yes — one lost packet stalls everything behind it</td><td>No (each datagram independent)</td></tr>
+  <tr><td><b>Typical uses</b></td><td>HTTP/1.1 &amp; HTTP/2, databases, Kafka, SSH, email</td><td>DNS queries, VoIP/video calls, gaming, QUIC/HTTP/3</td></tr>
+</table></div>
+<p>Rule of thumb: if losing or reordering data is unacceptable and you don't want to build reliability yourself, use TCP. If timeliness beats completeness (a video call would rather skip a late frame than wait), or you want to implement a smarter transport in user space (QUIC), use UDP.</p>
+
+<h2>5. How TCP works</h2>
+<h3>5.1 The three-way handshake</h3>
+<p>Before any data flows, client and server agree to talk and exchange starting <strong>sequence numbers</strong> (counters used to number every byte so the receiver can reorder and detect gaps):</p>
+<pre class="ascii">
+ Client (phone)                                         Server (edge LB)
+     |  SYN  seq=x            "I want to talk; my bytes start at x"   |
+     |-----------------------------------------------------------&gt;  |
+     |  SYN-ACK  seq=y, ack=x+1   "OK; mine start at y; got your x"   |
+     |  &lt;----------------------------------------------------------- |
+     |  ACK  ack=y+1   (can already carry the first request bytes)    |
+     |-----------------------------------------------------------&gt;  |
+     |&lt;================= 1 full RTT before the request goes ========&gt;|
+</pre>
+<p>The client can send data together with the final ACK, so the handshake costs exactly <strong>one round trip</strong> before the request leaves. Closing a connection uses a FIN/ACK exchange; an abrupt close uses a RST packet. (<em>TCP Fast Open</em> can send data in the SYN on repeat connections, but middlebox problems limited its adoption — one of the motivations for QUIC.)</p>
+
+<h3>5.2 Reliability: sequence numbers, ACKs and retransmission</h3>
+<ul>
+  <li>Every byte has a sequence number. The receiver sends <strong>ACKs</strong> ("I've received everything up to byte 14,600").</li>
+  <li>If the sender doesn't get an ACK within a <strong>retransmission timeout (RTO)</strong> — derived from measured RTT — or sees three duplicate ACKs (a strong hint a packet was lost), it resends.</li>
+  <li>The receiver reassembles bytes in order and hands the application a clean stream. A gap means later bytes wait in a buffer until the missing packet arrives: this is <strong>TCP head-of-line blocking</strong>.</li>
+  <li><strong>Flow control</strong>: the receiver advertises a <em>receive window</em> ("I have buffer space for 64 KB more") so a fast sender can't overwhelm a slow receiver.</li>
+</ul>
+
+<h3>5.3 Congestion control: the intuition</h3>
+<p>The network itself has limited capacity. If every sender blasted at full speed, router queues would overflow and everyone's packets would be dropped (<em>congestion collapse</em>). TCP therefore keeps a <strong>congestion window (cwnd)</strong> — how many unacknowledged bytes it may have "in flight":</p>
+<ol class="steps">
+  <li><strong>Slow start</strong>: a new connection starts small — typically 10 segments (≈14&nbsp;KB) — and <em>doubles</em> cwnd every RTT while ACKs keep coming back: 14&nbsp;KB → 28 → 56 → 112…</li>
+  <li><strong>Congestion avoidance</strong>: after a threshold, grow more gently (roughly +1 segment per RTT).</li>
+  <li><strong>On loss</strong>: assume congestion and cut cwnd (classic algorithms halve it — "additive increase, multiplicative decrease", AIMD). Modern Linux defaults to <strong>CUBIC</strong>; Google's <strong>BBR</strong> instead estimates bottleneck bandwidth and RTT directly and copes better with random (non-congestion) loss common on wireless links.</li>
+</ol>
+<p>The consequence for designers: <strong>a new connection is slow even on a fat pipe</strong>. Downloading a 100&nbsp;KB feed response on a fresh connection needs several RTTs of slow start (14 + 28 + 56 = 98&nbsp;KB after 3 RTTs). On a reused, "warm" connection whose cwnd has already grown, the same response may arrive in one RTT. That's another reason to reuse connections and to place servers close to users.</p>
+<pre><code>bytes delivered after k RTTs of slow start ≈ initcwnd × (2^k − 1)
+initcwnd = 14 KB:  k=1 → 14 KB, k=2 → 42 KB, k=3 → 98 KB, k=4 → 210 KB
+→ a 200 KB image on a brand-new connection needs ~4 RTTs of transfer time.
+   Mumbai ⇄ local PoP (20 ms RTT): ~80 ms.  Mumbai ⇄ US (220 ms RTT): ~880 ms.</code></pre>
+
+<h2>6. TLS: encryption and its handshake cost</h2>
+<p><strong>TLS (Transport Layer Security)</strong> — the "S" in HTTPS — gives three guarantees: <strong>confidentiality</strong> (nobody on the path can read the data), <strong>integrity</strong> (nobody can modify it undetected) and <strong>authentication</strong> (you're really talking to <code>instagram.com</code>, not an impostor on the café Wi-Fi).</p>
+<h3>6.1 The building blocks</h3>
+<ul>
+  <li><strong>Certificates</strong>: the server presents a certificate binding its hostname to a public key, signed by a <strong>Certificate Authority (CA)</strong> the device already trusts. The client verifies the chain (leaf → intermediate → root) and the hostname.</li>
+  <li><strong>Key exchange</strong>: client and server use (elliptic-curve) Diffie–Hellman to agree on a shared secret over the open network without ever sending it. With ephemeral keys this gives <em>forward secrecy</em>: stealing the server's private key later doesn't decrypt old recorded traffic.</li>
+  <li><strong>Symmetric encryption</strong>: the actual data is encrypted with fast ciphers (AES-GCM, ChaCha20-Poly1305) using keys derived from that secret. Asymmetric crypto is only used in the handshake because it's expensive.</li>
+  <li><strong>SNI (Server Name Indication)</strong>: the client says which hostname it wants in the first message, so one IP/load balancer can serve many certificates (<code>i.instagram.com</code>, <code>www.instagram.com</code>, CDN hosts).</li>
+</ul>
+
+<h3>6.2 TLS 1.2 vs TLS 1.3 handshakes</h3>
+<pre class="ascii">
+ TLS 1.2 (after TCP handshake)                    TLS 1.3 (after TCP handshake)
+ Client                     Server                Client                     Server
+   | ClientHello -------------&gt; |                   | ClientHello + key share -&gt; |
+   | &lt;- ServerHello, Cert,       |                   | &lt;- ServerHello + key share,|
+   |    ServerKeyExchange, Done  |   RTT 1           |    Cert, Finished          |  RTT 1
+   | ClientKeyExchange,          |                   | Finished + HTTP request -&gt; |
+   | ChangeCipherSpec, Finished-&gt;|                   | &lt;------- HTTP response ---- |  RTT 2
+   | &lt;- ChangeCipherSpec,Finished|   RTT 2           |
+   | HTTP request --------------&gt;|                   |  Resumed with PSK + 0-RTT:
+   | &lt;------------ HTTP response |   RTT 3           |  ClientHello + early data (request) -&gt;
+                                                     |  &lt;- response               |  RTT 1 (total)
+</pre>
+<div class="table-wrap"><table>
+  <tr><th>Setup</th><th>Handshake RTTs before request</th><th>Cold request total (incl. request RTT)</th><th>Notes</th></tr>
+  <tr><td>TCP + TLS 1.2</td><td>1 (TCP) + 2 (TLS) = 3</td><td>4 RTT</td><td>Legacy; still common on old devices</td></tr>
+  <tr><td>TCP + TLS 1.2 with session resumption</td><td>1 + 1 = 2</td><td>3 RTT</td><td>Session IDs / tickets skip the certificate step</td></tr>
+  <tr><td>TCP + TLS 1.3</td><td>1 + 1 = 2</td><td>3 RTT</td><td>Key share sent in the first message</td></tr>
+  <tr><td>TCP + TLS 1.3 0-RTT</td><td>1 + 0 = 1</td><td>2 RTT</td><td>Request rides with ClientHello on resumption</td></tr>
+  <tr><td>QUIC (HTTP/3), first visit</td><td>1 (transport + crypto combined)</td><td>2 RTT</td><td>TLS 1.3 built into QUIC</td></tr>
+  <tr><td>QUIC 0-RTT resumption</td><td>0</td><td>1 RTT</td><td>Request in the very first packet</td></tr>
+</table></div>
+<div class="callout warn"><span class="callout-title">⚠️ 0-RTT and replay attacks</span>
+0-RTT "early data" is sent before the handshake proves the client is live, so an attacker who records it can <strong>replay</strong> it. Servers should only accept 0-RTT for <strong>idempotent, safe</strong> requests (e.g. <code>GET</code> feed), never for "post this comment" or "transfer money". This is another place where idempotency (see <a href="api-design.html">API design</a>) matters.</div>
+<p><strong>Where TLS ends</strong> is a design decision. Instagram-style systems terminate TLS at the edge — the CDN PoP or the edge <a href="load-balancer.html">load balancer</a> — close to the user, so the expensive handshake round trips are short. Traffic from the edge to the data center travels over long-lived, pre-warmed, re-encrypted connections. Inside the data center, service-to-service calls are increasingly encrypted too (mutual TLS) — see <a href="security.html">Security</a>.</p>
+
+<h2>7. HTTP: the language of the web and of APIs</h2>
+<p><strong>HTTP (HyperText Transfer Protocol)</strong> is a request/response protocol: the client sends a request, the server sends exactly one response. Every Instagram API call — load feed, like, follow, get an upload URL — is an HTTP request (REST/GraphQL-style, see <a href="api-design.html">API design</a>), and every image download from the CDN is an HTTP <code>GET</code>.</p>
+
+<h3>7.1 Anatomy of a request and response</h3>
+<pre><code>POST /api/v1/media/3141592653/like/ HTTP/1.1         ← request line: METHOD  PATH  VERSION
+Host: i.instagram.com                                ← headers: metadata about the request
+User-Agent: Instagram 300.0.0.0 Android (33/13; …)
+Authorization: Bearer eyJhbGciOi…                    ← who you are (see Authentication lesson)
+Content-Type: application/json
+Content-Length: 46
+Idempotency-Key: 7f3e2a10-…                          ← makes retries safe
+Accept-Encoding: gzip, br
+                                                     ← blank line ends the headers
+{"container_module":"feed_timeline","radio":"wifi"}  ← body (optional)
+
+HTTP/1.1 200 OK                                      ← status line: VERSION  CODE  REASON
+Content-Type: application/json
+Content-Encoding: gzip
+Cache-Control: private, no-store                     ← personalised: never cache in shared caches
+X-Request-Id: 9b1c…                                  ← for tracing (see Observability)
+
+{"status":"ok","like_count":57,"has_liked":true}</code></pre>
+<p>Parts to know: the <strong>method</strong> (what to do), the <strong>path</strong> (which resource), <strong>headers</strong> (metadata — auth, content type, caching, compression), and the optional <strong>body</strong>. Responses carry a <strong>status code</strong>, headers and body. In HTTP/2 and HTTP/3 the same concepts exist, but the request line becomes "pseudo-headers" (<code>:method</code>, <code>:path</code>, <code>:authority</code>) in a compressed binary encoding.</p>
+
+<h3>7.2 Methods</h3>
+<div class="table-wrap"><table>
+  <tr><th>Method</th><th>Meaning</th><th>Safe? (no side effects)</th><th>Idempotent? (repeat = same effect)</th><th>Instagram example</th></tr>
+  <tr><td><code>GET</code></td><td>Read a resource</td><td>✅</td><td>✅</td><td>Load feed page, fetch a profile, download an image</td></tr>
+  <tr><td><code>HEAD</code></td><td>Like GET but headers only</td><td>✅</td><td>✅</td><td>Check whether a media object exists / its size</td></tr>
+  <tr><td><code>POST</code></td><td>Create / perform an action</td><td>❌</td><td>❌ (unless you add an idempotency key)</td><td>Create a post, add a comment</td></tr>
+  <tr><td><code>PUT</code></td><td>Create or replace at a known URL</td><td>❌</td><td>✅</td><td>Upload a chunk to a pre-signed URL; set "I like this"</td></tr>
+  <tr><td><code>PATCH</code></td><td>Partially update</td><td>❌</td><td>Not necessarily</td><td>Edit bio or caption</td></tr>
+  <tr><td><code>DELETE</code></td><td>Remove</td><td>❌</td><td>✅</td><td>Delete a comment, unfollow</td></tr>
+  <tr><td><code>OPTIONS</code></td><td>Ask what's allowed</td><td>✅</td><td>✅</td><td>Browser CORS pre-flight for the web app</td></tr>
+</table></div>
+<p>Idempotency matters because networks fail: if a response is lost, the client doesn't know whether the server acted. Retrying an idempotent request is always safe; retrying a non-idempotent one needs an idempotency key the server deduplicates. See <a href="resilience-patterns.html">Resilience patterns</a>.</p>
+
+<h3>7.3 Status codes</h3>
+<div class="table-wrap"><table>
+  <tr><th>Code</th><th>Meaning</th><th>When you'll see it in Instagram's design</th><th>Retry?</th></tr>
+  <tr><td><b>200 OK</b></td><td>Success with body</td><td>Feed page returned</td><td>—</td></tr>
+  <tr><td><b>201 Created</b></td><td>Resource created</td><td>New post or comment created</td><td>—</td></tr>
+  <tr><td><b>204 No Content</b></td><td>Success, no body</td><td>Unfollow done</td><td>—</td></tr>
+  <tr><td><b>206 Partial Content</b></td><td>Range of bytes returned</td><td>Video player fetching byte ranges from the CDN</td><td>—</td></tr>
+  <tr><td><b>301 / 302 / 307 / 308</b></td><td>Redirect (permanent / temporary)</td><td><code>http://</code> → <code>https://</code>; short links</td><td>Follow</td></tr>
+  <tr><td><b>304 Not Modified</b></td><td>Your cached copy is still valid</td><td>ETag revalidation by the app or CDN</td><td>—</td></tr>
+  <tr><td><b>400 Bad Request</b></td><td>Malformed request</td><td>Missing field, invalid JSON</td><td>❌ fix the request</td></tr>
+  <tr><td><b>401 Unauthorized</b></td><td>Not authenticated</td><td>Expired access token → refresh it, then retry</td><td>After re-auth</td></tr>
+  <tr><td><b>403 Forbidden</b></td><td>Authenticated but not allowed</td><td>Viewing a private account you don't follow; blocked user</td><td>❌</td></tr>
+  <tr><td><b>404 Not Found</b></td><td>No such resource</td><td>Deleted post</td><td>❌</td></tr>
+  <tr><td><b>409 Conflict</b></td><td>State conflict</td><td>Username already taken</td><td>❌</td></tr>
+  <tr><td><b>413 Payload Too Large</b></td><td>Body too big</td><td>Video exceeds upload size limit</td><td>❌</td></tr>
+  <tr><td><b>429 Too Many Requests</b></td><td>Rate limited</td><td>Too many follows/likes per hour (see <a href="rate-limiting.html">Rate limiting</a>)</td><td>✅ after <code>Retry-After</code></td></tr>
+  <tr><td><b>500 Internal Server Error</b></td><td>Bug / unhandled failure</td><td>Service exception</td><td>✅ with backoff (if idempotent)</td></tr>
+  <tr><td><b>502 Bad Gateway</b></td><td>Proxy got a bad response from upstream</td><td>LB/gateway couldn't reach a healthy service</td><td>✅ with backoff</td></tr>
+  <tr><td><b>503 Service Unavailable</b></td><td>Overloaded or down</td><td>Load shedding during a spike</td><td>✅ with backoff</td></tr>
+  <tr><td><b>504 Gateway Timeout</b></td><td>Upstream didn't answer in time</td><td>Feed service exceeded the gateway's timeout</td><td>✅ with backoff (if idempotent)</td></tr>
+</table></div>
+<p>Memory aid: <strong>2xx</strong> = success, <strong>3xx</strong> = go elsewhere / use your cache, <strong>4xx</strong> = <em>you</em> (the client) did something wrong, <strong>5xx</strong> = <em>we</em> (the server) did.</p>
+
+<h2>8. HTTP/1.1: keep-alive and head-of-line blocking</h2>
+<p><strong>HTTP/1.0</strong> opened a new TCP connection for every request — a handshake (and later a TLS handshake) per image. <strong>HTTP/1.1</strong> (1997) made connections <strong>persistent by default (keep-alive)</strong>: after a response, the connection stays open for the next request, saving the handshake round trips and keeping TCP's congestion window warm.</p>
+<p>But HTTP/1.1 is still <strong>one request at a time per connection</strong>: the response to request #1 must be fully received before #2's response can start. (HTTP pipelining tried to let clients send several requests without waiting, but responses still had to come back in order, and buggy proxies made it unusable — browsers disabled it.) If response #1 is slow — a big image or a slow database query — everything queued behind it waits. This is <strong>application-level head-of-line (HOL) blocking</strong>.</p>
+<p>Workarounds became folklore:</p>
+<ul>
+  <li><strong>Multiple connections</strong>: browsers open up to ~6 connections per hostname in parallel — six times the handshakes and six congestion windows competing.</li>
+  <li><strong>Domain sharding</strong>: spread assets over <code>img1.example.com</code>, <code>img2…</code> to get 6 connections each. More DNS lookups, more handshakes.</li>
+  <li><strong>Spriting and bundling</strong>: glue many small images or scripts into one file to reduce request count.</li>
+</ul>
+<p>All of these are hacks around a protocol limitation — and they actively hurt under HTTP/2.</p>
+
+<h2>9. HTTP/2: multiplexing over one connection</h2>
+<p><strong>HTTP/2</strong> (2015) keeps HTTP's semantics (methods, headers, status codes) but changes how they travel:</p>
+<ul>
+  <li><strong>Binary framing</strong>: messages are split into small frames, each labelled with a <strong>stream ID</strong>.</li>
+  <li><strong>Multiplexing</strong>: many requests and responses (streams) are interleaved on <em>one</em> TCP connection. The 30 thumbnails of a profile grid can all be in flight at once; a slow response no longer blocks the others at the HTTP layer.</li>
+  <li><strong>Header compression (HPACK)</strong>: headers such as cookies, user-agent and auth tokens repeat on every request (often 500–1,000+ bytes). HPACK keeps a table of previously sent headers on both sides and sends small indexes instead — commonly shrinking headers by 80–90%. On a slow uplink, that's a real saving.</li>
+  <li><strong>Prioritisation</strong>: clients can hint which streams matter more (the on-screen image before a prefetch).</li>
+  <li><strong>Server push</strong>: the server could send resources before they were requested. It proved hard to use well and major browsers have since removed support — mention it only as history.</li>
+</ul>
+<p>The remaining problem: HTTP/2 still runs over <strong>TCP</strong>, which delivers one ordered byte stream. If a single packet is lost, TCP holds back <em>all</em> later bytes — belonging to all streams — until the retransmission arrives. On a lossy mobile network, HTTP/2's one-connection design can actually suffer more than HTTP/1.1's six connections. This is <strong>transport-level head-of-line blocking</strong>, and it's what HTTP/3 fixes.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 300" width="820" xmlns="http://www.w3.org/2000/svg" font-size="12">
+  <defs><marker id="ar-net-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-size="13" font-weight="600">
+    <text x="15" y="62">HTTP/1.1</text><text x="15" y="78" font-size="11" font-weight="400">one conn, in order</text>
+    <text x="15" y="152">HTTP/2 over TCP</text><text x="15" y="168" font-size="11" font-weight="400">multiplexed, 1 TCP stream</text>
+    <text x="15" y="242">HTTP/3 over QUIC</text><text x="15" y="258" font-size="11" font-weight="400">independent streams</text>
+  </g>
+  <g text-anchor="middle" stroke-width="1.2">
+    <!-- row 1 -->
+    <rect x="180" y="45" width="36" height="34" fill="#e1f5fe" stroke="#0277bd"/><text x="198" y="67">A1</text>
+    <rect x="224" y="45" width="36" height="34" fill="#e1f5fe" stroke="#0277bd"/><text x="242" y="67">A2</text>
+    <rect x="268" y="45" width="36" height="34" fill="#e1f5fe" stroke="#0277bd"/><text x="286" y="67">A3</text>
+    <rect x="312" y="45" width="36" height="34" fill="#e8f5e9" stroke="#2e7d32"/><text x="330" y="67">B1</text>
+    <rect x="356" y="45" width="36" height="34" fill="#e8f5e9" stroke="#2e7d32"/><text x="374" y="67">B2</text>
+    <rect x="400" y="45" width="36" height="34" fill="#e8f5e9" stroke="#2e7d32"/><text x="418" y="67">B3</text>
+    <rect x="444" y="45" width="36" height="34" fill="#f3e5f5" stroke="#6a1b9a"/><text x="462" y="67">C1</text>
+    <rect x="488" y="45" width="36" height="34" fill="#f3e5f5" stroke="#6a1b9a"/><text x="506" y="67">C2</text>
+    <rect x="532" y="45" width="36" height="34" fill="#f3e5f5" stroke="#6a1b9a"/><text x="550" y="67">C3</text>
+    <!-- row 2 -->
+    <rect x="180" y="135" width="36" height="34" fill="#e1f5fe" stroke="#0277bd"/><text x="198" y="157">A1</text>
+    <rect x="224" y="135" width="36" height="34" fill="#e8f5e9" stroke="#2e7d32"/><text x="242" y="157">B1</text>
+    <rect x="268" y="135" width="36" height="34" fill="#f3e5f5" stroke="#6a1b9a"/><text x="286" y="157">C1</text>
+    <rect x="312" y="135" width="36" height="34" fill="#e1f5fe" stroke="#0277bd"/><text x="330" y="157">A2</text>
+    <rect x="356" y="135" width="36" height="34" fill="#ffebee" stroke="#c62828" stroke-dasharray="4 3"/><text x="374" y="157" fill="#c62828">B2 ✖</text>
+    <rect x="400" y="135" width="36" height="34" fill="#f3e5f5" stroke="#6a1b9a" opacity="0.35"/><text x="418" y="157" opacity="0.5">C2</text>
+    <rect x="444" y="135" width="36" height="34" fill="#e1f5fe" stroke="#0277bd" opacity="0.35"/><text x="462" y="157" opacity="0.5">A3</text>
+    <rect x="488" y="135" width="36" height="34" fill="#e8f5e9" stroke="#2e7d32"/><text x="506" y="157">B2↻</text>
+    <rect x="532" y="135" width="36" height="34" fill="#f3e5f5" stroke="#6a1b9a"/><text x="550" y="157">C3</text>
+    <!-- row 3 -->
+    <rect x="180" y="225" width="36" height="34" fill="#e1f5fe" stroke="#0277bd"/><text x="198" y="247">A1</text>
+    <rect x="224" y="225" width="36" height="34" fill="#e8f5e9" stroke="#2e7d32"/><text x="242" y="247">B1</text>
+    <rect x="268" y="225" width="36" height="34" fill="#f3e5f5" stroke="#6a1b9a"/><text x="286" y="247">C1</text>
+    <rect x="312" y="225" width="36" height="34" fill="#e1f5fe" stroke="#0277bd"/><text x="330" y="247">A2</text>
+    <rect x="356" y="225" width="36" height="34" fill="#ffebee" stroke="#c62828" stroke-dasharray="4 3"/><text x="374" y="247" fill="#c62828">B2 ✖</text>
+    <rect x="400" y="225" width="36" height="34" fill="#f3e5f5" stroke="#6a1b9a"/><text x="418" y="247">C2</text>
+    <rect x="444" y="225" width="36" height="34" fill="#e1f5fe" stroke="#0277bd"/><text x="462" y="247">A3</text>
+    <rect x="488" y="225" width="36" height="34" fill="#e8f5e9" stroke="#2e7d32"/><text x="506" y="247">B2↻</text>
+    <rect x="532" y="225" width="36" height="34" fill="#f3e5f5" stroke="#6a1b9a"/><text x="550" y="247">C3</text>
+  </g>
+  <path d="M400,128 L480,128" stroke="#c62828" stroke-width="1.5" fill="none"/>
+  <g font-size="12" fill="#333">
+    <text x="590" y="58">B and C wait until all</text><text x="590" y="74">of A is delivered</text>
+    <text x="590" y="148">C2, A3 arrived but are held</text><text x="590" y="164">until B2 is resent (TCP HOL)</text>
+    <text x="590" y="238">C2, A3 delivered at once;</text><text x="590" y="254">only stream B waits for B2</text>
+  </g>
+  <path d="M180,285 L568,285" stroke="#555" stroke-width="1.5" marker-end="url(#ar-net-1)"/>
+  <text x="374" y="280" text-anchor="middle" font-size="11" fill="#555">time / packets on the wire →</text>
+</svg>
+<div class="caption">Three requests A, B, C (e.g. three feed images). HTTP/1.1 serialises them; HTTP/2 interleaves them but one lost TCP packet (B2) stalls every stream; HTTP/3 over QUIC only stalls the stream that lost data.</div>
+</div>
+
+<h2>10. HTTP/3 and QUIC: built for mobile</h2>
+<p><strong>QUIC</strong> is a transport protocol originally developed at Google and standardised by the IETF in 2021 (RFC 9000); <strong>HTTP/3</strong> is HTTP mapped onto QUIC. QUIC runs over <strong>UDP</strong> — not because it wants to be unreliable, but because UDP passes through existing routers, NATs and firewalls, letting QUIC implement its own reliable transport in <em>user space</em> instead of inside the OS kernel. That means it can evolve with an app update rather than waiting years for operating systems to change.</p>
+<h3>10.1 What QUIC changes</h3>
+<ul>
+  <li><strong>Combined handshake</strong>: transport setup and TLS 1.3 happen together — <strong>1 RTT</strong> for a new connection instead of 2–3 for TCP + TLS.</li>
+  <li><strong>0-RTT resumption</strong>: returning clients can send the request in the first packet (with the replay caveats above).</li>
+  <li><strong>Independent streams</strong>: reliability and ordering are per stream, so a lost packet only stalls the stream it belongs to — no transport-level head-of-line blocking.</li>
+  <li><strong>Connection migration</strong>: TCP connections are identified by the 5-tuple, so when your phone moves from Wi-Fi to 4G (new IP address), every TCP connection breaks and must re-handshake. QUIC identifies connections by a <strong>connection ID</strong> instead, so the same connection continues across the network switch — a video keeps playing as you walk out of your house.</li>
+  <li><strong>Always encrypted</strong>, including most transport headers, which also stops middleboxes from ossifying the protocol.</li>
+  <li><strong>Better loss recovery</strong>: unambiguous packet numbers and richer ACKs make retransmission decisions more accurate; congestion control is pluggable (e.g. BBR).</li>
+</ul>
+<p>Costs: QUIC uses more CPU per byte than kernel TCP (encryption of every packet, user-space processing), some corporate networks block UDP 443 (so clients must fall back to TCP — typically racing both, "happy eyeballs" style, or remembering what worked), and L4 load balancers must route by connection ID rather than the 5-tuple to support migration.</p>
+
+<div class="table-wrap"><table>
+  <tr><th></th><th>HTTP/1.1</th><th>HTTP/2</th><th>HTTP/3</th></tr>
+  <tr><td><b>Transport</b></td><td>TCP</td><td>TCP</td><td>QUIC over UDP</td></tr>
+  <tr><td><b>Format</b></td><td>Text</td><td>Binary frames</td><td>Binary frames</td></tr>
+  <tr><td><b>Concurrency per connection</b></td><td>1 request at a time</td><td>Many multiplexed streams</td><td>Many independent streams</td></tr>
+  <tr><td><b>Head-of-line blocking</b></td><td>HTTP-level and TCP-level</td><td>TCP-level only</td><td>None across streams</td></tr>
+  <tr><td><b>Header compression</b></td><td>None</td><td>HPACK</td><td>QPACK</td></tr>
+  <tr><td><b>New connection setup (with TLS)</b></td><td>2–3 RTT</td><td>2–3 RTT</td><td>1 RTT (0 on resumption)</td></tr>
+  <tr><td><b>Survives network change</b></td><td>No</td><td>No</td><td>Yes (connection migration)</td></tr>
+  <tr><td><b>Typical connections per host</b></td><td>~6</td><td>1</td><td>1</td></tr>
+</table></div>
+
+<div class="callout instagram"><span class="callout-title">📸 Meta and QUIC</span>
+Meta has publicly described moving the bulk of its app traffic — Facebook and Instagram API requests and media — to QUIC/HTTP/3, using its open-source QUIC implementation <strong>mvfst</strong> together with its open-source HTTP framework <strong>Proxygen</strong> at the edge. Its engineering posts reported meaningful reductions in request errors, tail latency and video stalls, with the biggest gains on the slowest, lossiest networks — precisely the mobile users in emerging markets that matter most for growth.</div>
+
+<h2>11. Latency math: what a request really costs</h2>
+<h3>11.1 The physics</h3>
+<p>Light in optical fibre travels at about <strong>200,000 km/s</strong> (two-thirds of its speed in vacuum). So:</p>
+<pre><code>one-way delay ≈ 5 µs per km   →   1 ms per 200 km
+round trip (RTT) ≈ 1 ms per 100 km of distance   (theoretical floor)
+
+Mumbai → US East (Virginia): ~13,000 km great-circle
+  floor RTT = 2 × 13,000 km / 200,000 km/s = 130 ms
+  real cables detour (via Europe or Asia-Pacific), plus router hops and queues
+  → assume a measured RTT of ~220 ms</code></pre>
+<p>No amount of engineering beats the speed of light. You can only (1) <strong>reduce the number of round trips</strong> or (2) <strong>reduce the distance</strong> each round trip travels, by moving servers (or at least the connection endpoint) closer to the user.</p>
+
+<h3>11.2 Worked example: the first request from Mumbai to a US data center</h3>
+<p>Assume a user in Mumbai on a good fibre/Wi-Fi connection opens the app and fetches a 60&nbsp;KB (compressed) feed response. Assume: the DNS answer is cached at a nearby ISP resolver (20&nbsp;ms), RTT to the US data center is 220&nbsp;ms, RTT to an Instagram edge PoP in Mumbai is 15&nbsp;ms, the server takes 50&nbsp;ms to build the response, and TCP's initial window is ~14&nbsp;KB (so 60&nbsp;KB needs the first window plus 2 more RTTs of slow start: 14 + 28 + 56 ≥ 60).</p>
+<div class="table-wrap"><table>
+  <tr><th>Step</th><th>A: TCP + TLS 1.2, direct to US</th><th>B: TCP + TLS 1.3, direct</th><th>C: QUIC (1-RTT), direct</th><th>D: QUIC 0-RTT resumption, direct</th><th>E: TLS 1.3 terminated at Mumbai edge, warm edge→US link</th></tr>
+  <tr><td>DNS lookup</td><td>20</td><td>20</td><td>20</td><td>20</td><td>20</td></tr>
+  <tr><td>TCP handshake</td><td>220</td><td>220</td><td rowspan="2">220 (combined)</td><td rowspan="2">0</td><td>15</td></tr>
+  <tr><td>TLS handshake</td><td>440 (2 RTT)</td><td>220 (1 RTT)</td><td>15</td></tr>
+  <tr><td>Request → response first bytes</td><td>220 + 50</td><td>220 + 50</td><td>220 + 50</td><td>220 + 50</td><td>15 + 220 + 50</td></tr>
+  <tr><td>Rest of response (slow start: 2 more RTT)</td><td>440</td><td>440</td><td>440</td><td>440</td><td>30 (2 × 15; edge→US link already warm)</td></tr>
+  <tr><td><b>Total (ms)</b></td><td><b>≈ 1,390</b></td><td><b>≈ 1,170</b></td><td><b>≈ 950</b></td><td><b>≈ 730</b></td><td><b>≈ 365</b></td></tr>
+</table></div>
+<p>Lessons from the numbers:</p>
+<ul>
+  <li>In case A, the server's own 50&nbsp;ms is under 4% of the total. <strong>Round trips, not server time, dominate</strong> a cold request over long distances.</li>
+  <li>Protocol upgrades (A → B → C → D) cut 200–650&nbsp;ms by removing round trips.</li>
+  <li><strong>Terminating connections near the user</strong> (E) is the biggest single win: the handshakes and slow-start ramp happen over a 15&nbsp;ms path, and only one round trip crosses the ocean — over a long-lived, pre-warmed connection the edge keeps open to the data center. This is why Meta, Google and CDNs run edge PoPs (Meta's edge runs Proxygen) even for <em>uncacheable</em> API traffic. See <a href="cdn.html">CDN</a>.</li>
+  <li>On a <strong>reused warm connection</strong>, a follow-up request directly to the US costs only ~220 + 50 = 270&nbsp;ms — so connection reuse matters as much as anything (see <a href="clients.html">Clients</a>).</li>
+  <li>On 4G, add the radio's own latency (assume +30–80&nbsp;ms <em>per round trip</em>), which multiplies across every RTT above — another reason to minimise round trips.</li>
+  <li>To get below ~100&nbsp;ms you need the <em>data</em> close to the user too: cached media at the CDN, or a regional data center serving India (see <a href="multi-region.html">Multi-region</a>).</li>
+</ul>
+
+<h3>11.3 Latency vs bandwidth</h3>
+<p>Bandwidth is how wide the pipe is; latency is how long it is. For the small requests that dominate API traffic (a few KB), <strong>latency dominates</strong>: doubling bandwidth from 50 to 100&nbsp;Mbps changes almost nothing for a 5&nbsp;KB request, while halving the RTT nearly halves its time. For big transfers (a 50&nbsp;MB video upload), bandwidth dominates. The <strong>bandwidth-delay product</strong> (bandwidth × RTT) tells you how many bytes must be in flight to fill the pipe: 100&nbsp;Mbps × 0.22&nbsp;s ≈ 2.75&nbsp;MB — far more than a fresh connection's 14&nbsp;KB window, which is why long-distance transfers take many RTTs to reach full speed.</p>
+
+<h2>12. Forward proxies vs reverse proxies</h2>
+<p>A <strong>proxy</strong> is an intermediary that receives a request and makes it again on someone's behalf. The key question is: <em>on whose behalf?</em></p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 245" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-net-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <rect x="10" y="12" width="505" height="100" rx="10" fill="none" stroke="#0277bd" stroke-dasharray="6 4"/>
+  <text x="20" y="28" font-size="11" fill="#0277bd">client's side (e.g. company network)</text>
+  <rect x="25" y="40" width="170" height="56" rx="8" fill="#e1f5fe" stroke="#0277bd"/>
+  <text x="110" y="64" text-anchor="middle" font-weight="600">💻 Office laptops</text>
+  <text x="110" y="82" text-anchor="middle" font-size="11">known, trusted clients</text>
+  <rect x="300" y="40" width="200" height="56" rx="8" fill="#fff3e0" stroke="#ef6c00"/>
+  <text x="400" y="64" text-anchor="middle" font-weight="600">Forward proxy</text>
+  <text x="400" y="82" text-anchor="middle" font-size="11">acts for the clients</text>
+  <rect x="610" y="40" width="195" height="56" rx="8" fill="#eceff1" stroke="#455a64"/>
+  <text x="707" y="64" text-anchor="middle" font-weight="600">🌐 Any website</text>
+  <text x="707" y="82" text-anchor="middle" font-size="11">sees only the proxy's IP</text>
+  <rect x="290" y="132" width="525" height="100" rx="10" fill="none" stroke="#2e7d32" stroke-dasharray="6 4"/>
+  <text x="300" y="148" font-size="11" fill="#2e7d32">server's side (e.g. Instagram's network)</text>
+  <rect x="25" y="160" width="170" height="56" rx="8" fill="#e1f5fe" stroke="#0277bd"/>
+  <text x="110" y="184" text-anchor="middle" font-weight="600">📱 Any client</text>
+  <text x="110" y="202" text-anchor="middle" font-size="11">anyone on the internet</text>
+  <rect x="300" y="160" width="200" height="56" rx="8" fill="#fff3e0" stroke="#ef6c00"/>
+  <text x="400" y="184" text-anchor="middle" font-weight="600">Reverse proxy</text>
+  <text x="400" y="202" text-anchor="middle" font-size="11">LB · API gateway · CDN</text>
+  <rect x="610" y="160" width="195" height="56" rx="8" fill="#e8f5e9" stroke="#2e7d32"/>
+  <text x="707" y="184" text-anchor="middle" font-weight="600">App servers</text>
+  <text x="707" y="202" text-anchor="middle" font-size="11">hidden, private IPs</text>
+  <g stroke="#555" stroke-width="1.5" marker-end="url(#ar-net-2)" fill="none">
+    <path d="M195,68 L298,68"/><path d="M500,68 L608,68"/>
+    <path d="M195,188 L298,188"/><path d="M500,188 L608,188"/>
+  </g>
+</svg>
+<div class="caption">Same mechanics, opposite loyalties: a forward proxy hides and controls clients; a reverse proxy hides and protects servers.</div>
+</div>
+
+<div class="table-wrap"><table>
+  <tr><th></th><th>Forward proxy</th><th>Reverse proxy</th></tr>
+  <tr><td><b>Acts on behalf of</b></td><td>Clients</td><td>Servers</td></tr>
+  <tr><td><b>Who configures it</b></td><td>The client side (browser/OS settings, corporate network)</td><td>The service owner (DNS points at it)</td></tr>
+  <tr><td><b>Client knows it's there?</b></td><td>Usually yes</td><td>No — it looks like the real server</td></tr>
+  <tr><td><b>Typical uses</b></td><td>Corporate filtering and logging, caching for an office, anonymity/VPN-like egress, bypassing geo-restrictions</td><td>Load balancing, TLS termination, caching, compression, auth, rate limiting, DDoS protection, routing to microservices</td></tr>
+  <tr><td><b>Examples</b></td><td>Squid, corporate secure web gateways</td><td>NGINX, HAProxy, Envoy, Proxygen, CDNs, AWS ALB, API gateways</td></tr>
+</table></div>
+<p>In Instagram's diagram, <strong>every box between the client and the services is a reverse proxy</strong>: the CDN edge, the <a href="load-balancer.html">load balancer</a> and the <a href="api-gateway.html">API gateway</a>. Each terminates a connection from the previous hop and opens (or reuses) one to the next. A practical consequence: the backend sees the <em>proxy's</em> IP, not the user's, so proxies add headers like <code>X-Forwarded-For</code> (or the standard <code>Forwarded</code>) carrying the original client IP — needed for rate limiting, abuse detection and geo features. Only trust those headers when set by your own proxies.</p>
+<p>Forward proxies matter to Instagram mainly as a fact of life: users behind corporate proxies and middleboxes, which may block UDP (forcing a QUIC → TCP fallback) or interfere with long-lived connections.</p>
+
+<h2>13. Real-time on the web: long polling, SSE and WebSockets</h2>
+<p>HTTP's request/response model has a limitation: <strong>the server can only answer, never speak first</strong>. Features like DMs, typing indicators, live comments and "new posts" banners need the server to push data when something happens. Three techniques build that on top of HTTP-era infrastructure:</p>
+<ul>
+  <li><strong>Long polling</strong>: the client sends a request; the server <em>holds</em> it open until there is news (or ~30–60 s pass), then responds; the client immediately sends the next request. Works everywhere, but each message costs a full request/response, and there's a gap while reconnecting.</li>
+  <li><strong>Server-Sent Events (SSE)</strong>: one long-lived HTTP response that the server keeps streaming events into (<code>Content-Type: text/event-stream</code>). Simple, works through most proxies, auto-reconnects in browsers — but one-directional (server → client). Popular for live feeds, notifications and streaming AI responses.</li>
+  <li><strong>WebSockets</strong>: start as an HTTP request with an <code>Upgrade: websocket</code> header; the server replies <code>101 Switching Protocols</code>, and the same TCP connection becomes a <strong>full-duplex</strong> message channel. Either side can send small framed messages at any time with a few bytes of overhead.</li>
+</ul>
+<pre><code>GET /chat HTTP/1.1
+Host: edge-chat.instagram.example
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+… from here on: binary/text frames in both directions …</code></pre>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Short polling</th><th>Long polling</th><th>SSE</th><th>WebSocket</th></tr>
+  <tr><td><b>Direction</b></td><td>Client pulls</td><td>Client pulls, server delays answer</td><td>Server → client</td><td>Both ways</td></tr>
+  <tr><td><b>Latency</b></td><td>Up to the poll interval</td><td>Near real-time</td><td>Real-time</td><td>Real-time</td></tr>
+  <tr><td><b>Overhead per message</b></td><td>Full HTTP request, mostly empty</td><td>Full HTTP request</td><td>Small</td><td>Very small (2–14 byte frame header)</td></tr>
+  <tr><td><b>Server cost</b></td><td>Many wasted requests</td><td>One held request per client</td><td>One open connection per client</td><td>One open connection per client</td></tr>
+  <tr><td><b>Good for</b></td><td>Rare updates, prototypes</td><td>Fallback when sockets are blocked</td><td>Live counters, feeds, notifications on web</td><td>Chat, typing indicators, presence, games</td></tr>
+</table></div>
+<p>Persistent connections shift the scaling problem: instead of many short requests, servers must hold <strong>millions of mostly idle connections</strong>, send heartbeats to keep NAT mappings alive, and route a message to whichever server holds the recipient's connection. That's the core of <a href="direct-messaging.html">Direct messaging</a>; protocol selection is compared in <a href="api-design.html">API design</a>, and load-balancing long-lived connections is covered in <a href="load-balancer.html">Load balancing</a>. On mobile, Meta has publicly described using <strong>MQTT</strong> — a lightweight publish/subscribe protocol designed for unreliable networks — over persistent connections for its messaging features.</p>
+
+<h2>14. How Instagram uses all of this</h2>
+<p>Put the pieces together for one feed load and one image, following the arrows of the main diagram:</p>
+<div class="flow">
+  <div class="fnode client">📱 App<small>Mumbai, 4G</small></div><div class="farrow">→<small>UDP 443 (QUIC)</small></div>
+  <div class="fnode edge">Edge PoP<small>L4 LB + Proxygen, TLS ends</small></div><div class="farrow">→<small>warm, encrypted backbone</small></div>
+  <div class="fnode edge">DC load balancer<small>L4 → L7</small></div><div class="farrow">→<small>HTTP/2 or gRPC</small></div>
+  <div class="fnode svc">API Gateway → Feed<small>JSON with media URLs</small></div>
+</div>
+<ol>
+  <li><strong>DNS</strong> resolves the API hostname to a nearby edge PoP's (often anycast) address — see <a href="dns.html">DNS</a>.</li>
+  <li>The app opens <strong>one QUIC connection</strong> (falling back to TCP + TLS 1.3 if UDP is blocked) and keeps it alive for the whole session; all API calls are multiplexed over it.</li>
+  <li>The <strong>edge PoP</strong> terminates QUIC/TLS a few milliseconds from the user, then forwards the request over long-lived connections on Meta's private backbone to a data center region — so only one long round trip is paid per request.</li>
+  <li>Inside the data center, the <a href="load-balancer.html">load balancer</a> tiers and the <a href="api-gateway.html">API gateway</a> route to the Feed service; internal calls use HTTP/2-based RPC with pooled connections.</li>
+  <li>The JSON response contains <strong>CDN URLs</strong>; the app fetches images and video segments over a separate, also-reused connection to the CDN hostname — usually served straight from the PoP's cache. See <a href="cdn.html">CDN</a>.</li>
+  <li>For DMs and live updates, the app keeps a separate <strong>persistent connection</strong> (MQTT-style) with periodic heartbeats; in the background, notifications arrive through APNs/FCM.</li>
+</ol>
+<div class="callout instagram"><span class="callout-title">📸 Instagram specifics (public information)</span>
+<ul>
+  <li>Meta's edge runs <strong>Proxygen</strong> (its open-source C++ HTTP framework, used as the L7 reverse proxy) behind <strong>Katran</strong> (its open-source XDP/eBPF-based L4 load balancer), and serves HTTP/3 via <strong>mvfst</strong>.</li>
+  <li>Meta has publicly reported that the majority of its mobile app traffic, including Instagram, runs over QUIC, with the largest improvements for users on poor networks.</li>
+  <li>TLS is terminated at the edge with modern TLS 1.3; the apps also use session resumption so returning users skip full handshakes. (Meta previously built its own 0-RTT protocol, "Zero", before TLS 1.3 standardised the idea.)</li>
+  <li>API traffic and media traffic use <strong>different hostnames</strong> (an API host vs <code>scontent-*.cdninstagram.com</code>-style CDN hosts), so each path can be routed, cached and scaled independently.</li>
+</ul></div>
+<h3>Rough numbers</h3>
+<pre><code>Assume 500M DAU × 50 API requests/day = 25 billion requests/day ≈ 290K QPS average (~600K peak)
+If each request opened a NEW connection with TCP + TLS 1.2 (3 extra RTTs at ~100 ms average RTT):
+   wasted user time = 25B × 300 ms ≈ 7.5 billion seconds/day ≈ 240 user-years per day
+   plus ~290K TLS handshakes/s of server CPU
+With one long-lived QUIC connection per session (~10 sessions/user/day):
+   handshakes drop to 5B/day ≈ 58K/s, most of them 0-RTT resumptions.</code></pre>
+
+<h2>15. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Modern choices (HTTP/2–3, TLS 1.3, edge termination)</h4><ul>
+    <li>Far fewer round trips per request</li>
+    <li>One connection per host; less handshake CPU</li>
+    <li>Better behaviour on lossy, changing mobile networks (QUIC)</li>
+    <li>Header compression saves uplink bytes</li>
+    <li>Encryption everywhere without a big latency penalty</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs and caveats</h4><ul>
+    <li>QUIC costs more CPU per byte and some networks block UDP → need TCP fallback</li>
+    <li>0-RTT data is replayable → only for idempotent requests</li>
+    <li>One multiplexed TCP connection suffers badly from packet loss (HTTP/2)</li>
+    <li>Long-lived connections complicate load balancing and deploys</li>
+    <li>Edge PoPs and backbones are expensive to build and operate</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Ignoring round trips</strong>: optimising server time from 50 to 30&nbsp;ms while the client pays 1,000&nbsp;ms of handshakes.</li>
+  <li><strong>Creating a new HTTP client per request</strong> in app or service code, defeating connection pooling.</li>
+  <li><strong>Keeping HTTP/1.1-era hacks</strong> (domain sharding, sprites) after moving to HTTP/2 — they add connections and DNS lookups and break multiplexing benefits.</li>
+  <li><strong>Retrying non-idempotent requests</strong> blindly after a timeout (duplicate comments, double posts).</li>
+  <li><strong>No heartbeats on long-lived connections</strong>: NATs and load balancers silently drop idle connections; messages vanish.</li>
+  <li><strong>Trusting <code>X-Forwarded-For</code> from the internet</strong>: anyone can set it; only accept it from your own proxies.</li>
+  <li><strong>Treating 4xx as retryable</strong> (hammering the server with the same invalid request) or 5xx/429 as permanent.</li>
+  <li><strong>Huge cookies/headers</strong> sent on every request — even compressed, they cost bytes on the first request of every connection.</li>
+</ul>
+
+<h2>16. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>What it is</th><th>When you'd use / meet it</th></tr>
+  <tr><td>NGINX, HAProxy, Envoy</td><td>Reverse proxies / L7 load balancers supporting HTTP/1.1, HTTP/2 (and HTTP/3 in newer versions)</td><td>Edge and service proxies, TLS termination</td></tr>
+  <tr><td>Proxygen (Meta), mvfst (Meta)</td><td>Meta's open-source HTTP library/proxy and QUIC implementation</td><td>Meta's edge and apps; reference for large-scale HTTP/3</td></tr>
+  <tr><td>quiche (Cloudflare), MsQuic (Microsoft), Cronet (Chromium)</td><td>Other QUIC/HTTP/3 implementations; Cronet brings Chrome's network stack to Android/iOS apps</td><td>Adding HTTP/3 to servers or mobile apps</td></tr>
+  <tr><td>OpenSSL, BoringSSL, rustls</td><td>TLS libraries</td><td>Anything that terminates or originates TLS</td></tr>
+  <tr><td>Let's Encrypt / ACME, cloud certificate managers</td><td>Automated certificate issuance and renewal</td><td>Avoiding expired-certificate outages</td></tr>
+  <tr><td>gRPC (over HTTP/2)</td><td>RPC framework with Protobuf, streaming, deadlines</td><td>Service-to-service calls inside the data center</td></tr>
+  <tr><td>Socket.IO, MQTT brokers, WebSocket gateways</td><td>Real-time persistent connection frameworks</td><td>Chat, presence, live updates</td></tr>
+  <tr><td>curl, Wireshark, tcpdump, Chrome DevTools, mtr</td><td>Debugging tools: inspect requests, packets, timing and routes</td><td>Diagnosing latency, handshake and protocol issues</td></tr>
+</table></div>
+
+<h2>17. Interview corner</h2>
+<details class="qa"><summary>Walk me through what happens when the Instagram app requests the feed.</summary>
+<p>The app resolves the API hostname via DNS (likely cached; otherwise the recursive resolver walks root → TLD → authoritative and returns a nearby edge IP). It opens a connection — ideally reusing an existing one; otherwise a QUIC 1-RTT handshake (or TCP SYN/SYN-ACK/ACK plus a TLS 1.3 handshake) with the nearest edge PoP, which presents a certificate for the hostname. It sends an HTTP <code>GET</code> with an auth token. The edge terminates TLS and forwards the request over a warm backbone connection to a data center, through L4 and L7 load balancers to the API gateway, which authenticates, rate-limits and routes to the Feed service. The JSON response flows back with CDN URLs for media, which the app then fetches from the CDN over another reused connection.</p></details>
+<details class="qa"><summary>TCP or UDP for a new real-time video-call feature? For DMs?</summary>
+<p>Video calls: UDP-based (RTP/WebRTC or QUIC datagrams) — a late frame is useless, so you'd rather drop it than stall everything waiting for a retransmission; the app handles loss with codecs and FEC. DMs: every message must arrive, in order, exactly once from the user's perspective, so a reliable transport — TCP (WebSocket/MQTT) or QUIC streams — plus app-level acknowledgements and IDs for deduplication.</p></details>
+<details class="qa"><summary>What is head-of-line blocking, and how do HTTP/2 and HTTP/3 address it?</summary>
+<p>HOL blocking is when one slow or lost item delays everything queued behind it. HTTP/1.1 has it at the application level (one response at a time per connection). HTTP/2 multiplexes streams, fixing the HTTP-level problem, but TCP still delivers one ordered byte stream, so a single lost packet stalls all streams. HTTP/3 runs streams over QUIC, which handles ordering per stream; a lost packet only delays the stream it belonged to.</p></details>
+<details class="qa"><summary>Why is QUIC especially good for mobile apps like Instagram?</summary>
+<p>Four reasons: (1) fewer round trips — 1-RTT setup and 0-RTT resumption, which matters on high-RTT mobile links; (2) no transport HOL blocking, which matters on lossy radio links; (3) connection migration via connection IDs, so switching Wi-Fi ⇄ cellular doesn't kill in-flight requests and video; (4) it lives in user space, so the app and server can ship improved congestion control and loss recovery without waiting for OS updates. Costs: more CPU and the need for a TCP fallback when UDP is blocked.</p></details>
+<details class="qa"><summary>A user in India sees 1.5 s feed loads while server-side latency is 60 ms. Explain and fix.</summary>
+<p>The gap is network round trips: DNS, TCP, TLS (2 RTT on TLS 1.2), the request, and slow start for the response — each ~220 ms to a US data center. Fixes: terminate connections at an Indian edge PoP so handshakes happen over ~15 ms; keep warm edge→DC connections; upgrade to TLS 1.3 and QUIC with 0-RTT resumption; reuse one connection per session and pre-connect at launch; reduce response size and the number of sequential calls; eventually serve data from a closer region. The worked example in this lesson shows a drop from ~1,390 ms to ~365 ms just from edge termination and modern protocols.</p></details>
+<details class="qa"><summary>What's the difference between a forward and a reverse proxy? Which ones appear in Instagram's architecture?</summary>
+<p>A forward proxy acts for clients (they configure it; destinations see the proxy) — e.g. corporate web filters. A reverse proxy acts for servers (clients think it's the server) and provides load balancing, TLS termination, caching, routing, auth and protection. Instagram's CDN edges, load balancers and API gateway are all reverse proxies. They pass the original client IP via <code>X-Forwarded-For</code>/<code>Forwarded</code> headers.</p></details>
+<details class="qa"><summary>Which HTTP status codes should a client retry, and how?</summary>
+<p>Retry transient failures: network errors, timeouts, 429 (respecting <code>Retry-After</code>), 502, 503, 504 and usually 500 — with exponential backoff and jitter, a retry budget, and only for idempotent requests or ones carrying an idempotency key. Don't retry 400, 403, 404, 409, 413 — the same request will fail the same way. 401 means refresh the token, then retry once.</p></details>
+
+<h2>18. Check your understanding</h2>
+<details class="quiz"><summary>Roughly what is the minimum possible RTT between two cities 6,000 km apart, connected by fibre?</summary>
+<p>RTT ≈ 2 × 6,000 km ÷ 200,000 km/s = <strong>60 ms</strong>. Real paths are longer and add router delays, so expect noticeably more (perhaps 80–100 ms).</p></details>
+<details class="quiz"><summary>With a 100 ms RTT, how long before the first response byte arrives on a brand-new TCP + TLS 1.2 connection, versus TLS 1.3, versus QUIC 0-RTT (ignore DNS and server time)?</summary>
+<p>TLS 1.2: TCP 1 + TLS 2 + request 1 = 4 RTT = <strong>400 ms</strong>. TLS 1.3: 1 + 1 + 1 = <strong>300 ms</strong>. QUIC 0-RTT: the request goes in the first flight = 1 RTT = <strong>100 ms</strong>.</p></details>
+<details class="quiz"><summary>Your phone walks from home Wi-Fi onto 4G in the middle of a Reel download. What happens with HTTP/2 over TCP, and with HTTP/3?</summary>
+<p>The phone's IP address changes. TCP connections are bound to the 5-tuple, so they break: the app must detect the failure (often after a timeout), reconnect with a full handshake, and re-request — causing a stall. QUIC identifies the connection by a connection ID, so it <strong>migrates</strong> to the new path after a quick path validation and the download continues.</p></details>
+<details class="quiz"><summary>Why might HTTP/2 perform <em>worse</em> than HTTP/1.1 on a network with 3% packet loss?</summary>
+<p>HTTP/2 puts all requests on one TCP connection; each lost packet stalls every stream until it's retransmitted, and the single connection's congestion window is cut on each loss. HTTP/1.1's six independent connections each stall only their own request, and losses are spread across six congestion windows.</p></details>
+<details class="quiz"><summary>A fresh TCP connection has an initial window of ~14 KB that doubles every RTT. About how many RTTs does it take to deliver a 400 KB image?</summary>
+<p>Cumulative: 14, 42, 98, 210, 434 KB → about <strong>5 RTTs</strong>. On a 20 ms path to a nearby PoP that's ~100 ms; on a 220 ms path to another continent it's ~1.1 s. This is why media is served from nearby CDN edges and connections are reused (their windows are already large).</p></details>
+<details class="quiz"><summary>Thousands of users of a mobile carrier all appear to your servers from the same IP. Why, and what does that mean for rate limiting?</summary>
+<p>Carrier-grade NAT maps many private device addresses to one public IPv4 address (distinguished by port). A strict per-IP rate limit would block thousands of innocent users when one misbehaves. Rate limit by authenticated user/token or device instead, and use per-IP limits only as a loose, high threshold for unauthenticated endpoints.</p></details>
+<details class="quiz"><summary>Your DM WebSocket connections keep "silently" dying after a few idle minutes on mobile. What's the likely cause and fix?</summary>
+<p>NAT devices and intermediate load balancers drop idle mappings/connections after a timeout, without telling either end. Send application-level heartbeats (ping/pong) more often than the shortest idle timeout (e.g. every 30–60 s, tuned to balance battery), detect missing pongs to reconnect quickly, and resynchronise missed messages on reconnect.</p></details>
+<details class="quiz"><summary>Is it safe to accept "POST /comments" as TLS 1.3 0-RTT early data? Why or why not?</summary>
+<p>No. 0-RTT data can be captured and replayed by an attacker, causing the comment to be posted twice (or more). Only accept safe, idempotent requests (like <code>GET</code> feed) as early data, or require an idempotency key that makes replays harmless.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Requests are layered: <strong>HTTP inside TLS inside TCP/QUIC inside IP</strong>; L4 devices see ports and IPs, L7 devices see HTTP.</li>
+    <li><strong>Round trips × distance</strong> dominate latency; ~1 ms RTT per 100 km is a hard floor.</li>
+    <li>Connection setup is expensive: TCP (1 RTT) + TLS 1.2 (2) or 1.3 (1); <strong>QUIC does 1, or 0 on resumption</strong>. Reuse connections and keep them warm.</li>
+    <li>HTTP/1.1 → HTTP/2 → HTTP/3 progressively remove head-of-line blocking; QUIC's <strong>connection migration</strong> is ideal for phones.</li>
+    <li><strong>Terminate TLS near the user</strong> and carry traffic over warm backbone connections — the biggest single latency win for global apps.</li>
+    <li>Reverse proxies (CDN, LB, gateway) front every server; real-time features need <strong>long polling, SSE or WebSockets</strong> with heartbeats.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="dns.html">DNS</a> — the lookup that precedes every new connection, and the 2021 BGP/DNS outage</li>
+  <li><a href="cdn.html">CDN</a> — edge PoPs that shorten round trips for media and terminate TLS</li>
+  <li><a href="load-balancer.html">Load balancing</a> — L4 vs L7, TLS termination and long-lived connections</li>
+  <li><a href="api-gateway.html">API gateway</a> — the reverse proxy that authenticates and routes API calls</li>
+  <li><a href="clients.html">Clients</a> — connection reuse, batching and retries on the device</li>
+  <li><a href="api-design.html">API design</a> — REST vs gRPC vs GraphQL vs WebSockets, idempotency keys</li>
+  <li><a href="direct-messaging.html">Direct messaging</a> — WebSockets/MQTT at scale</li>
+  <li><a href="security.html">Security</a> — TLS everywhere, mTLS and DDoS protection</li>
+  <li><a href="resilience-patterns.html">Resilience patterns</a> — timeouts, retries and backoff</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

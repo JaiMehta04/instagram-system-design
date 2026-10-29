@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Database Indexing &amp; Storage Engines — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="indexing">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>An <strong>index</strong> is a separate, sorted (or hashed) data structure that lets the database jump straight to matching rows instead of scanning the whole table — like the index at the back of a book.</li>
+    <li><strong>B+trees</strong> (PostgreSQL, MySQL) give O(log n) lookups and ordered range scans with only 3–4 page reads even for billions of rows; <strong>hash indexes</strong> give O(1) equality lookups but no ranges.</li>
+    <li><strong>LSM-trees</strong> (Cassandra, RocksDB) buffer writes in memory and flush sorted immutable files (SSTables), trading read and compaction work for very high write throughput; <strong>Bloom filters</strong> skip files that can't contain a key.</li>
+    <li>Design indexes from queries: <strong>composite indexes</strong> obey the <strong>leftmost-prefix rule</strong>, <strong>covering indexes</strong> avoid touching the table, <strong>partial indexes</strong> index only the rows you query, and <strong>selectivity</strong> decides whether an index is even worth using.</li>
+    <li>Every index <strong>slows writes and costs storage</strong>. Verify with <code>EXPLAIN</code>. Instagram's profile grid relies on an index like <code>(user_id, created_at DESC)</code>; likes on <code>(post_id, user_id)</code>.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why do queries get slow as Instagram grows?</h2>
+<p>Open any Instagram profile and the app shows the 12 most recent posts in a grid. The query behind it looks innocent:</p>
+<pre><code>SELECT id, created_at FROM posts
+ WHERE user_id = 42
+ ORDER BY created_at DESC
+ LIMIT 12;</code></pre>
+<p>With 1,000 posts in the table this takes microseconds no matter how it's executed. Now assume the table holds <strong>100 million posts</strong> of about 200 bytes each — 20 GB. Without an index the database has exactly one strategy: read <em>every</em> row, keep those with <code>user_id = 42</code>, sort them and return 12. Even at a generous 500 MB/s of sequential disk throughput that's <strong>~40 seconds</strong> of I/O for a single profile view, and every concurrent profile view competes for the same disk. Instagram serves hundreds of thousands of such reads per second. Without indexes, the product simply cannot exist.</p>
+<p>With the right index the same query reads about <strong>4–5 small pages (~40 KB)</strong> and finishes in well under a millisecond. That gap — 40 s versus 0.1 ms, a factor of roughly 400,000 — is why indexing is one of the highest-leverage skills in system design.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy: the index at the back of a book</span>
+  To find every page that mentions "replication" in a 900-page textbook you could read all 900 pages (a <strong>full table scan</strong>). Or you could flip to the index at the back, which lists terms <strong>in alphabetical order</strong> with page numbers: find "replication" in seconds (because it's sorted, you can jump to the R section), then go directly to pages 212, 340 and 517. The book index is a <em>separate, sorted structure that points into the main content</em> — exactly what a database index is. It also shows the costs: the index takes extra pages, and every time the author adds a paragraph the index must be updated too.
+</div>
+
+<h2>2. The cost of a full table scan</h2>
+<p>Databases store rows in fixed-size <strong>pages</strong> (8 KB in PostgreSQL, 16 KB in MySQL InnoDB). Reading a page from disk is the unit of cost. A <strong>full table scan</strong> (PostgreSQL calls it a <em>Seq Scan</em>) reads every page of the table:</p>
+<pre><code>rows per page   = 8 KB / 200 B          ≈ 40
+pages           = 100,000,000 / 40      = 2,500,000 pages (≈ 20 GB)
+scan time (SSD) = 20 GB / 500 MB/s      ≈ 40 s
+scan time (RAM) = 20 GB / ~5 GB/s       ≈ 4 s   (even fully cached it's far too slow)</code></pre>
+<p>The cost is <strong>O(n)</strong>: it grows linearly with table size, so a query that was fine at launch gets 10× slower each time the table grows 10×. Full scans also evict useful pages from the buffer cache, hurting every other query.</p>
+<p>Full scans are not always bad. They are the <em>right</em> choice when you need a large fraction of the table anyway (analytics, "count all posts per country"), because reading pages sequentially is much faster than jumping around randomly via an index. The optimizer weighs this trade-off using <strong>selectivity</strong> (Section 8).</p>
+
+<h2>3. B-trees and B+trees: the default index</h2>
+
+<h3>3.1 Structure</h3>
+<p>A <strong>B-tree</strong> is a balanced search tree designed for disks: each node is one page and holds <em>many</em> sorted keys (hundreds), so the tree is very wide and very shallow. Almost every relational database actually uses the <strong>B+tree</strong> variant:</p>
+<ul>
+  <li><strong>Internal nodes</strong> contain only keys and child pointers — "keys below 2000 go left, 2000–5999 middle, 6000+ right". They act as signposts.</li>
+  <li><strong>Leaf nodes</strong> contain all the keys, in sorted order, each with its payload: either a pointer to the row (PostgreSQL's tuple ID) or the row itself (InnoDB's clustered index).</li>
+  <li><strong>Leaves are linked</strong> to their neighbours, so once you've found the start of a range you just walk sideways — that's how <code>ORDER BY … LIMIT</code> and <code>BETWEEN</code> become cheap.</li>
+  <li><strong>All leaves are at the same depth</strong> (the tree is <em>balanced</em>), so every lookup costs the same number of page reads.</li>
+</ul>
+<p>The number of children per node is the <strong>fan-out</strong>. With 8 KB pages and ~16-byte entries (8-byte key + pointer), an internal node holds roughly 400–500 entries.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 300" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-idx-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <text x="20" y="30" font-size="12" fill="#555">root (level 1)</text>
+  <text x="20" y="92" font-size="12" fill="#555">internal (level 2)</text>
+  <text x="20" y="287" font-size="12" fill="#555">leaves (level 3)</text>
+  <rect x="330" y="15" width="160" height="36" rx="6" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2.5"/>
+  <text x="410" y="38" text-anchor="middle" font-family="monospace">2000 | 6000</text>
+  <g fill="#e8f5e9" stroke="#2e7d32">
+    <rect x="60" y="100" width="150" height="36" rx="6"/>
+    <rect x="610" y="100" width="150" height="36" rx="6"/>
+  </g>
+  <rect x="335" y="100" width="150" height="36" rx="6" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2.5"/>
+  <g text-anchor="middle" font-family="monospace">
+    <text x="135" y="123">700 | 1400</text>
+    <text x="410" y="123">3000 | 4500</text>
+    <text x="685" y="123">7000 | 8500</text>
+  </g>
+  <g fill="#fff8e1" stroke="#f9a825">
+    <rect x="20" y="215" width="125" height="50" rx="6"/>
+    <rect x="165" y="215" width="140" height="50" rx="6"/>
+    <rect x="495" y="215" width="140" height="50" rx="6"/>
+    <rect x="660" y="215" width="140" height="50" rx="6"/>
+  </g>
+  <rect x="330" y="215" width="140" height="50" rx="6" fill="#fff3e0" stroke="#ef6c00" stroke-width="2.5"/>
+  <g text-anchor="middle" font-family="monospace" font-size="12">
+    <text x="82" y="237">1400 … 1999</text>
+    <text x="235" y="237">2000 … 2999</text>
+    <text x="400" y="237">3000 … 4499</text>
+    <text x="565" y="237">4500 … 5999</text>
+    <text x="730" y="237">6000 … 6999</text>
+  </g>
+  <g text-anchor="middle" font-size="11" fill="#555">
+    <text x="82" y="255">→ row pointers</text>
+    <text x="235" y="255">→ row pointers</text>
+    <text x="400" y="255">key 3742 ✔</text>
+    <text x="565" y="255">→ row pointers</text>
+    <text x="730" y="255">→ row pointers</text>
+  </g>
+  <g stroke="#555" stroke-width="1.3" fill="none" marker-end="url(#ar-idx-1)">
+    <path d="M360,51 L150,98"/>
+    <path d="M460,51 L670,98"/>
+    <path d="M370,136 L250,213"/>
+    <path d="M450,136 L560,213"/>
+    <path d="M100,136 L85,213"/>
+    <path d="M650,136 L725,213"/>
+  </g>
+  <g stroke="#ef6c00" stroke-width="2.5" fill="none" marker-end="url(#ar-idx-1)">
+    <path d="M410,51 L410,98"/>
+    <path d="M410,136 L400,213"/>
+  </g>
+  <g stroke="#0277bd" stroke-width="1.3" fill="none" marker-end="url(#ar-idx-1)">
+    <path d="M145,282 L163,282"/><path d="M305,282 L328,282"/><path d="M470,282 L493,282"/><path d="M635,282 L658,282"/>
+  </g>
+  <text x="815" y="292" font-size="11" fill="#0277bd" text-anchor="end">leaves linked → range scans</text>
+  <text x="595" y="78" font-size="11.5" fill="#ef6c00">① 2000 ≤ 3742 &lt; 6000</text>
+  <text x="515" y="172" font-size="11.5" fill="#ef6c00">② 3000 ≤ 3742 &lt; 4500</text>
+</svg>
+<div class="caption">A (tiny) B+tree. Looking up key 3742 reads one node per level — root → middle internal node → leaf (orange path). Real nodes hold hundreds of keys, so three or four levels cover billions of rows. Leaves are linked, so a range scan continues sideways without going back up the tree.</div>
+</div>
+
+<h3>3.2 Lookup is O(log n) — and log base 500 is tiny</h3>
+<ol class="steps">
+  <li>Read the <strong>root</strong> page (almost always cached in RAM). Binary-search its keys to pick the child.</li>
+  <li>Read that <strong>internal</strong> page, binary-search again, pick the next child.</li>
+  <li>Reach the <strong>leaf</strong>; find the key; follow the pointer to the row (one more page read, unless the index covers the query).</li>
+</ol>
+<p>The height of the tree is about <strong>log<sub>fan-out</sub>(n)</strong>. With fan-out 500:</p>
+<div class="table-wrap"><table>
+  <tr><th>Levels</th><th>Max keys addressable (500<sup>levels</sup>)</th><th>Example table</th></tr>
+  <tr><td>2</td><td>250,000</td><td>Hashtags in a small app</td></tr>
+  <tr><td>3</td><td>125,000,000</td><td>Posts of a mid-sized shard</td></tr>
+  <tr><td>4</td><td>62,500,000,000</td><td>Every like ever made on one large table</td></tr>
+</table></div>
+<p>So looking up one row among <strong>100 million</strong> costs 3 index page reads + 1 table page read. Because the root and internal levels are small (level 2 of a 100M-row index is only ~200 pages ≈ 1.6 MB) they stay in memory, so in practice it's often <strong>one or two actual disk reads</strong>. Compare 2,500,000 page reads for the full scan.</p>
+
+<h3>3.3 Inserts, page splits and fill factor</h3>
+<p>To insert a key, the database finds the correct leaf and adds the key in sorted position. If the leaf is full, it <strong>splits</strong> into two half-full pages and pushes a separator key up into the parent (which may split in turn; if the root splits, the tree grows one level taller — that's how B-trees stay balanced). Consequences worth knowing:</p>
+<ul>
+  <li><strong>Random keys cause random I/O and fragmentation.</strong> Inserting random UUIDs touches a random leaf every time and leaves pages half full. Inserting <em>monotonically increasing</em> keys (auto-increment, time-sortable IDs like <a href="id-generation.html">Instagram's 64-bit IDs</a>) always appends to the rightmost leaf — cache-friendly and compact. (The flip side: in a distributed system, sequential keys can create a write hotspot on one node; see <a href="sharding.html">Sharding</a>.)</li>
+  <li><strong>Updates are in place.</strong> Changing a 100-byte value rewrites the whole 8 KB page (plus a WAL record). That is B-tree <em>write amplification</em>.</li>
+  <li><strong>Fill factor</strong> leaves free space in pages so future inserts/updates don't immediately split them.</li>
+</ul>
+
+<h2>4. Hash indexes</h2>
+<p>A <strong>hash index</strong> applies a hash function to the key and stores the entry in the corresponding bucket — a hash table on disk (or in memory). Lookups by exact key are O(1) on average.</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>B+tree index</th><th>Hash index</th></tr>
+  <tr><td><b>Equality (<code>= ?</code>)</b></td><td>O(log n) — ~3–4 page reads</td><td>O(1) — ~1–2 page reads</td></tr>
+  <tr><td><b>Range (<code>&gt;</code>, <code>BETWEEN</code>, prefix <code>LIKE 'ab%'</code>)</b></td><td>✅ Yes</td><td>❌ No — hashing destroys order</td></tr>
+  <tr><td><b><code>ORDER BY</code> without sorting</b></td><td>✅ Yes</td><td>❌ No</td></tr>
+  <tr><td><b>Composite / prefix use</b></td><td>✅ Leftmost prefix usable</td><td>❌ Must supply the whole key</td></tr>
+  <tr><td><b>Typical home</b></td><td>Default index in every RDBMS</td><td>In-memory stores (Redis, Memcached), Bitcask, PostgreSQL <code>USING hash</code>, MySQL MEMORY engine, hash joins</td></tr>
+</table></div>
+<p>Because B+trees are nearly as fast for equality and far more flexible, relational databases default to them. Hash indexing shines in <strong>key-value stores</strong>: Redis is essentially an in-memory hash table, and Bitcask (Riak's engine) keeps an in-memory hash map from key to file offset on disk. Hashing is also how distributed systems decide <em>which node</em> owns a key — see <a href="consistent-hashing.html">Consistent Hashing</a>.</p>
+
+<h2>5. LSM-trees: the write-optimised storage engine</h2>
+<p>B-trees update pages <em>in place</em>, which means random writes. For workloads with enormous write rates — Instagram's likes, feed entries, activity and messages — a different design wins: the <strong>Log-Structured Merge-tree (LSM-tree)</strong>, used by Cassandra, ScyllaDB, HBase, Bigtable, RocksDB, LevelDB and (under the hood) many others. The core idea: <strong>never modify data on disk; only append sorted files and merge them later in the background.</strong></p>
+
+<h3>5.1 The write path</h3>
+<ol class="steps">
+  <li><strong>WAL (commit log).</strong> The write is appended to a sequential log on disk for durability. Appends are the fastest possible disk operation.</li>
+  <li><strong>Memtable.</strong> The write is inserted into an in-memory sorted structure (typically a skip list or balanced tree). The client gets "OK" now — no data file has been touched.</li>
+  <li><strong>Flush.</strong> When the memtable reaches a threshold (e.g. 64–256 MB) it's frozen and written to disk in one sequential pass as an <strong>SSTable</strong> (Sorted String Table): an immutable file of key-sorted entries plus a small index and a Bloom filter. The WAL segment covering it can then be discarded.</li>
+  <li><strong>Compaction.</strong> Background threads merge SSTables (a merge-sort of already-sorted files), keeping only the newest version of each key and dropping deleted data, so the number of files a read must check stays bounded.</li>
+</ol>
+
+<h3>5.2 The read path</h3>
+<p>A key might be in the memtable or in any SSTable, and newer data shadows older data. So a read checks: memtable → then SSTables from <strong>newest to oldest</strong>, stopping at the first hit. To avoid opening files that can't contain the key, each SSTable has a <strong>Bloom filter</strong> in memory, plus a sparse index (every N-th key with its file offset) to jump close to the key within a file.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 310" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-idx-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <rect x="20" y="55" width="120" height="44" rx="8" fill="#e1f5fe" stroke="#0277bd"/>
+  <text x="80" y="82" text-anchor="middle" font-weight="600">write(k, v)</text>
+  <rect x="200" y="15" width="190" height="56" rx="8" fill="#e8f5e9" stroke="#2e7d32"/>
+  <text x="295" y="38" text-anchor="middle" font-weight="600">Memtable (RAM)</text>
+  <text x="295" y="57" text-anchor="middle" font-size="11.5">sorted skip list</text>
+  <rect x="200" y="90" width="190" height="50" rx="8" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="295" y="111" text-anchor="middle" font-weight="600">WAL / commit log</text>
+  <text x="295" y="128" text-anchor="middle" font-size="11.5">append-only, on disk</text>
+  <text x="455" y="22" font-size="12" fill="#555">L0: flushed SSTables (may overlap)</text>
+  <g fill="#fff8e1" stroke="#f9a825">
+    <rect x="455" y="30" width="100" height="36" rx="6"/><rect x="570" y="30" width="100" height="36" rx="6"/><rect x="685" y="30" width="100" height="36" rx="6"/>
+  </g>
+  <g text-anchor="middle" font-size="12"><text x="505" y="53">SST 9 (new)</text><text x="620" y="53">SST 8</text><text x="735" y="53">SST 7</text></g>
+  <text x="455" y="112" font-size="12" fill="#555">L1: non-overlapping key ranges (~10× L0)</text>
+  <g fill="#fff8e1" stroke="#f9a825">
+    <rect x="455" y="120" width="76" height="36" rx="6"/><rect x="541" y="120" width="76" height="36" rx="6"/><rect x="627" y="120" width="76" height="36" rx="6"/><rect x="713" y="120" width="76" height="36" rx="6"/>
+  </g>
+  <g text-anchor="middle" font-size="12"><text x="493" y="143">a – f</text><text x="579" y="143">g – m</text><text x="665" y="143">n – s</text><text x="751" y="143">t – z</text></g>
+  <text x="455" y="200" font-size="12" fill="#555">L2: ~10× L1, also non-overlapping</text>
+  <rect x="455" y="208" width="334" height="36" rx="6" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="622" y="231" text-anchor="middle" font-size="12">many SSTables, each a sorted key range</text>
+  <g stroke="#555" stroke-width="1.4" fill="none" marker-end="url(#ar-idx-2)">
+    <path d="M140,70 L198,45"/>
+    <path d="M140,85 L198,110"/>
+    <path d="M390,43 L453,48"/>
+  </g>
+  <g stroke="#6a1b9a" stroke-width="1.4" fill="none" stroke-dasharray="5 3" marker-end="url(#ar-idx-2)">
+    <path d="M760,66 L760,118"/>
+    <path d="M760,156 L760,206"/>
+  </g>
+  <text x="160" y="52" font-size="11" fill="#555">②</text>
+  <text x="160" y="112" font-size="11" fill="#555">①</text>
+  <text x="400" y="36" font-size="11" fill="#555">③ flush</text>
+  <text x="752" y="94" font-size="11" fill="#6a1b9a" text-anchor="end">④ compaction</text>
+  <text x="752" y="184" font-size="11" fill="#6a1b9a" text-anchor="end">④ compaction</text>
+  <rect x="20" y="180" width="400" height="110" rx="8" fill="#eceff1" stroke="#455a64"/>
+  <text x="35" y="203" font-weight="600">read(k):</text>
+  <text x="35" y="225" font-size="12">1. check memtable → found? return</text>
+  <text x="35" y="245" font-size="12">2. for each SSTable, newest → oldest:</text>
+  <text x="50" y="264" font-size="12">Bloom filter says "definitely not"? skip file</text>
+  <text x="50" y="282" font-size="12">else sparse index → read one block</text>
+</svg>
+<div class="caption">LSM-tree write path (① append to WAL, ② insert into memtable, ③ flush to an immutable SSTable, ④ background compaction into larger levels) and read path (memtable first, then SSTables newest→oldest, skipping files via Bloom filters).</div>
+</div>
+
+<h3>5.3 Deletes and updates</h3>
+<p>Because files are immutable, an update is just a newer write of the same key, and a delete is a special write called a <strong>tombstone</strong> ("key k deleted at time t"). Reads see the newest entry, so the tombstone hides older values. Compaction eventually discards both the tombstone and the shadowed data (in Cassandra, only after <code>gc_grace_seconds</code>, so replicas that missed the delete can't "resurrect" the data). Lots of tombstones in a range make reads slow — a well-known Cassandra pitfall.</p>
+
+<h3>5.4 Bloom filters</h3>
+<p>A <strong>Bloom filter</strong> is a compact probabilistic set: a bit array of <em>m</em> bits plus <em>k</em> hash functions. To add a key, set the <em>k</em> bits it hashes to. To test a key, check those <em>k</em> bits: if any is 0, the key is <strong>definitely not</strong> present; if all are 1, it's <strong>probably</strong> present. There are <strong>no false negatives</strong>, only occasional false positives.</p>
+<pre><code>false-positive rate  p ≈ (1 − e^(−k·n/m))^k        n = keys, m = bits, k = hash functions
+optimal k            k = (m/n) · ln 2
+
+Example: 10 bits per key (m/n = 10), k = 7  →  p ≈ 0.8 %
+         an SSTable with 10 M keys needs 100 M bits ≈ 12 MB of RAM for its filter</code></pre>
+<p>Effect: a read for a key that exists in only one of 20 SSTables opens ~1 file instead of 20. Cassandra lets you tune <code>bloom_filter_fp_chance</code> per table (more memory, fewer wasted disk reads).</p>
+
+<h3>5.5 Compaction strategies</h3>
+<div class="table-wrap"><table>
+  <tr><th>Strategy</th><th>How it works</th><th>Strengths</th><th>Weaknesses</th><th>Use for</th></tr>
+  <tr><td><b>Size-tiered (STCS)</b></td><td>When ~4 SSTables of similar size exist, merge them into one bigger file.</td><td>Low write amplification; great for write-heavy loads.</td><td>A key can live in many files → more read amplification; temporary 2× disk space during big merges.</td><td>Write-heavy, rarely-read data (Cassandra's default).</td></tr>
+  <tr><td><b>Leveled (LCS)</b></td><td>Levels L1, L2, … each ~10× larger; within a level files don't overlap, so a key is in at most one file per level.</td><td>Predictable reads (≈ one file per level), low space overhead (~10%).</td><td>Higher write amplification (data rewritten each time it moves down a level).</td><td>Read-heavy or update-heavy tables (RocksDB's default style).</td></tr>
+  <tr><td><b>Time-window (TWCS)</b></td><td>Groups SSTables by time window (e.g. 1 day); compacts only within a window; whole windows expire at once.</td><td>Ideal for TTL'd, time-series data: expired windows are dropped as whole files, no tombstone scanning.</td><td>Bad if old data gets updated (mixes windows).</td><td>Stories (24 h TTL), activity feeds, metrics.</td></tr>
+</table></div>
+
+<h3>5.6 B-tree vs LSM-tree</h3>
+<p>Three "amplification" metrics frame the comparison:</p>
+<ul>
+  <li><strong>Write amplification</strong> = bytes written to disk ÷ bytes written by the application. A B-tree rewrites an 8 KB page (plus WAL) to change a 100-byte row; an LSM writes the row to the WAL, then to an SSTable, then again at every compaction (often 10–30× with leveled compaction).</li>
+  <li><strong>Read amplification</strong> = disk reads per query. A B-tree is ~1 path (3–4 pages, mostly cached). An LSM may check the memtable plus several SSTables (mitigated by Bloom filters).</li>
+  <li><strong>Space amplification</strong> = disk used ÷ live data size. B-trees waste free space inside half-full pages; LSMs hold obsolete versions and tombstones until compaction.</li>
+</ul>
+<div class="table-wrap"><table>
+  <tr><th></th><th>B+tree (PostgreSQL, MySQL InnoDB)</th><th>LSM-tree (Cassandra, RocksDB, HBase)</th></tr>
+  <tr><td><b>Write pattern</b></td><td>Random in-place page updates</td><td>Sequential appends + background merges</td></tr>
+  <tr><td><b>Write throughput</b></td><td>Good; degrades with many indexes / random keys</td><td>Excellent — often several × higher on the same hardware</td></tr>
+  <tr><td><b>Point reads</b></td><td>Fast and predictable (one tree path)</td><td>Good with Bloom filters; may touch several files</td></tr>
+  <tr><td><b>Range scans</b></td><td>Excellent (linked leaves)</td><td>Good (merge across files), costlier with many SSTables</td></tr>
+  <tr><td><b>Write amplification</b></td><td>Page-granular (8–16 KB per small change) + WAL</td><td>Compaction-driven (≈ 10–30× leveled, lower size-tiered)</td></tr>
+  <tr><td><b>Read amplification</b></td><td>Low</td><td>Higher; depends on compaction strategy</td></tr>
+  <tr><td><b>Space amplification</b></td><td>Fragmentation, page slack</td><td>Old versions/tombstones until compacted; low with leveled</td></tr>
+  <tr><td><b>Latency predictability</b></td><td>Stable</td><td>Compaction can cause latency spikes if it falls behind</td></tr>
+  <tr><td><b>Transactions / locking</b></td><td>Natural fit (each key in one place)</td><td>Harder; usually single-key/partition atomicity</td></tr>
+  <tr><td><b>Best for</b></td><td>OLTP with mixed reads/writes, rich secondary indexes</td><td>Write-heavy, append-mostly, time-ordered data at massive scale</td></tr>
+</table></div>
+<div class="callout tip"><span class="callout-title">💡 Rule of thumb</span>
+"B-trees are read-optimised, LSM-trees are write-optimised" is a fine first answer. A great answer adds: LSMs win when writes dominate and keys are accessed by primary key/partition; B-trees win when you need many secondary indexes, transactions and predictable read latency. That's exactly the split between Instagram's <a href="databases.html">PostgreSQL and Cassandra</a> workloads.</div>
+
+<h2>6. Clustered vs non-clustered indexes</h2>
+<p>Where does the actual row live?</p>
+<ul>
+  <li><strong>Clustered index</strong> — the table <em>is</em> the index: rows are stored inside the B+tree leaves, physically ordered by the clustering key. A table can have only one. MySQL InnoDB always clusters by the primary key; SQL Server lets you choose; Cassandra's clustering columns order rows within each partition.</li>
+  <li><strong>Non-clustered (secondary) index</strong> — a separate structure whose leaves hold the indexed key plus a <em>pointer</em> to the row. In InnoDB that pointer is the primary key (so a secondary lookup is two tree traversals); in PostgreSQL every index is non-clustered and points to a physical location (<code>ctid</code>, page + slot) in an unordered <strong>heap</strong> file.</li>
+</ul>
+<pre class="ascii">
+ MySQL InnoDB (clustered by PRIMARY KEY id)          PostgreSQL (heap + indexes)
+
+ secondary idx (username)     PK B+tree (id)         idx (username)        heap file (unordered)
+ +----------------------+     +-----------------+    +-----------------+   +---------------------+
+ | "alice"  → id 42     | --&gt; | id 42 | FULL ROW|    | "alice" → (7,3) |--&gt;| page 7, slot 3: row |
+ | "bob"    → id 17     |     | id 43 | FULL ROW|    | "bob"   → (2,9) |   | page 2, slot 9: row |
+ +----------------------+     +-----------------+    +-----------------+   +---------------------+
+ lookup by username = 2 tree walks                    lookup = 1 tree walk + 1 heap page read
+ lookup by id       = 1 tree walk (row is right there) range by PK may hit many scattered heap pages
+</pre>
+<p>Why it matters:</p>
+<ul>
+  <li><strong>Range scans on the clustering key are very fast</strong> — consecutive keys sit on the same pages. If the posts table is clustered on <code>(user_id, id)</code>, a user's posts are physically adjacent: the profile grid reads one or two pages.</li>
+  <li><strong>Choose a narrow, stable, increasing clustering key.</strong> In InnoDB every secondary index stores the PK, so a fat PK (e.g. a 36-character UUID string) bloats every index; random PKs cause page splits.</li>
+  <li>PostgreSQL can physically reorder a table once with <code>CLUSTER</code>, but doesn't maintain the order on later writes; covering indexes (below) are the usual way to get the same benefit.</li>
+</ul>
+
+<h2>7. Kinds of indexes you'll design</h2>
+
+<h3>7.1 Primary index</h3>
+<p>The index on the primary key — unique and non-null, created automatically. Every table should have one; in InnoDB it's the clustered index. Prefer compact integer keys; Instagram's 64-bit time-sortable IDs are a good example: 8 bytes, unique across shards, and naturally ordered by creation time.</p>
+
+<h3>7.2 Secondary index</h3>
+<p>Any additional index on non-PK columns, to support other access paths — e.g. <code>UNIQUE INDEX ON users (email)</code> for login by email. Secondary indexes may be unique (also enforce a constraint) or non-unique. In a sharded system, a secondary index on a column that isn't the shard key is a hard problem (local vs global indexes — see <a href="sharding.html">Sharding</a>).</p>
+
+<h3>7.3 Composite (multi-column) index and the leftmost-prefix rule</h3>
+<p>A composite index on <code>(a, b, c)</code> sorts entries by <code>a</code>, then by <code>b</code> within equal <code>a</code>, then by <code>c</code> — like a phone book sorted by (last name, first name). You can efficiently find "all Smiths" or "Smith, John", but not "everyone named John" — they're scattered across the whole book. That's the <strong>leftmost-prefix rule</strong>: an index can be used for a contiguous prefix of its columns, starting from the left.</p>
+<p>For <code>CREATE INDEX posts_user_recent ON posts (user_id, created_at DESC)</code>:</p>
+<div class="table-wrap"><table>
+  <tr><th>Query</th><th>Uses the index?</th><th>Why</th></tr>
+  <tr><td><code>WHERE user_id = 42</code></td><td>✅ Yes</td><td>Leftmost column.</td></tr>
+  <tr><td><code>WHERE user_id = 42 ORDER BY created_at DESC LIMIT 12</code></td><td>✅ Yes, and no sort step</td><td>Entries for user 42 are already in created_at DESC order — read the first 12 and stop.</td></tr>
+  <tr><td><code>WHERE user_id = 42 AND created_at &gt; '2026-01-01'</code></td><td>✅ Yes</td><td>Equality on the first column, range on the second.</td></tr>
+  <tr><td><code>WHERE created_at &gt; '2026-01-01'</code></td><td>❌ Not efficiently</td><td>Skips the leftmost column; matching entries are spread under every user_id. (Some engines can do a "skip scan" when the first column has few distinct values.)</td></tr>
+  <tr><td><code>WHERE user_id IN (1, 2, 3) ORDER BY created_at DESC</code></td><td>⚠️ Partly</td><td>Three index ranges are found, but they must be merged/sorted — fine for 3 users, painful for 3,000 (that's why the feed isn't built this way).</td></tr>
+</table></div>
+<p><strong>Column order rules of thumb:</strong> put columns used with <strong>equality</strong> first, then the column used for a <strong>range or ORDER BY</strong> last; a range on column <em>b</em> stops the index from helping with column <em>c</em> after it. Among equality columns, the order matters less for a single query but should be chosen so the prefix serves other queries too.</p>
+
+<h3>7.4 Covering index (index-only scan)</h3>
+<p>If an index contains <strong>every column a query needs</strong>, the database answers from the index alone and never touches the table — an <em>index-only scan</em>. That saves one random page read per row.</p>
+<pre><code>-- The grid needs id, created_at and the thumbnail key. Add the extra column as payload:
+CREATE INDEX posts_grid_covering
+    ON posts (user_id, created_at DESC)
+    INCLUDE (id, thumb_key);          -- PostgreSQL 11+ / SQL Server syntax; in MySQL append the columns</code></pre>
+<p>Covering indexes are bigger, so add them only for hot queries. In PostgreSQL an index-only scan also needs the table's visibility map to be up to date (maintained by <code>VACUUM</code>).</p>
+
+<h3>7.5 Partial (filtered) index</h3>
+<p>A <strong>partial index</strong> indexes only rows matching a predicate. It's smaller, faster to update and more likely to stay in memory.</p>
+<pre><code>-- 3% of posts are soft-deleted and never shown; don't index them at all
+CREATE INDEX posts_live_by_user ON posts (user_id, created_at DESC)
+ WHERE deleted_at IS NULL;
+
+-- Only a small fraction of comments are flagged for moderation review
+CREATE INDEX comments_pending_review ON comments (created_at)
+ WHERE status = 'pending_review';</code></pre>
+<p>The query must include a compatible predicate (<code>AND deleted_at IS NULL</code>) for the planner to use it. Instagram's engineering blog has publicly recommended partial indexes as one of its PostgreSQL scaling tips.</p>
+
+<h3>7.6 Expression (functional) index</h3>
+<p>Index the result of an expression, e.g. case-insensitive usernames: <code>CREATE UNIQUE INDEX users_username_ci ON users (lower(username));</code> then query with <code>WHERE lower(username) = lower($1)</code>. Without it, wrapping a column in a function prevents the normal index from being used.</p>
+
+<h2>8. Cardinality and selectivity: is the index even worth it?</h2>
+<ul>
+  <li><strong>Cardinality</strong> of a column = number of <em>distinct</em> values. <code>users.id</code>: 2 billion (high). <code>users.is_private</code>: 2 (low). <code>posts.country</code>: ~200.</li>
+  <li><strong>Selectivity</strong> of a predicate = fraction of rows it matches (lower fraction = <em>more selective</em> = better for an index). <code>id = 42</code> matches 1 row in 2 billion; <code>is_private = false</code> might match 70% of rows.</li>
+</ul>
+<p>Using an index costs roughly one random page read per matching row (unless the matching rows are physically adjacent or the index covers the query). A sequential scan costs one cheap sequential read per page. So if a predicate matches a big fraction of rows, the planner correctly <strong>ignores the index</strong> and scans. The crossover is often somewhere around a few percent to ~10–20% of rows, depending on row width, caching and storage type.</p>
+<pre><code>Table: 100 M posts, 2.5 M pages.
+Predicate A: user_id = 42        → ~300 rows (0.0003 %)  → index: ~300 page reads  ✅
+Predicate B: media_type = 'photo'→ ~70 M rows (70 %)     → index: ~70 M random reads ❌  seq scan: 2.5 M pages ✅
+Predicate C: is_private = true AND created_at &gt; now() - interval '1 hour'
+             → combine: index on created_at (selective) + filter on is_private</code></pre>
+<p>Planners estimate selectivity from <strong>statistics</strong> (histograms, most-common values, distinct counts) gathered by <code>ANALYZE</code>. Stale statistics → bad estimates → bad plans; a classic production incident is a plan flip after a large data load. Low-cardinality columns can still be useful <em>inside</em> a composite index or as a <strong>partial-index</strong> predicate (e.g. <code>WHERE status = 'pending'</code> when pending rows are rare).</p>
+
+<h2>9. The write cost of indexes</h2>
+<p>Indexes are not free. Every <code>INSERT</code> must add an entry to <strong>every</strong> index on the table; every <code>DELETE</code> must remove them; an <code>UPDATE</code> must modify every index whose columns changed (and in PostgreSQL, a non-HOT update touches all indexes). Each of those is a B-tree descent and possibly a page split, plus WAL records and replication traffic.</p>
+<pre><code>Assume the likes table receives 58,000 inserts/s on average (see the databases lesson).
+  PK (post_id, user_id)               → 1 index write
+  + index (user_id, created_at)       → 1 more
+  + index (created_at) "for analytics"→ 1 more
+  = 174,000 B-tree insertions/s, each a potential random page write, plus 3× the WAL volume.
+
+Drop the analytics index (run analytics on the data warehouse instead) → 116,000/s: one third less write I/O.</code></pre>
+<p>Costs of each additional index:</p>
+<ul>
+  <li><strong>Write latency and throughput</strong> — more random I/O and WAL per write; more lock/latch contention on hot index pages (e.g. the rightmost leaf of a timestamp index).</li>
+  <li><strong>Storage and memory</strong> — indexes compete with table data for the buffer cache. It's common for a table's indexes to be larger than the table itself.</li>
+  <li><strong>Replication lag</strong> — more WAL to ship and replay on <a href="replication.html">replicas</a>.</li>
+  <li><strong>Maintenance</strong> — bloat, rebuilds, vacuum time. Creating an index on a live table locks writes unless you use <code>CREATE INDEX CONCURRENTLY</code> (PostgreSQL) or an online DDL tool.</li>
+</ul>
+<p>So: index what your <em>real</em> queries need, monitor index usage (<code>pg_stat_user_indexes.idx_scan</code>), and drop indexes that nobody uses. For bulk loads, it's often faster to drop indexes, load, and rebuild.</p>
+
+<h2>10. Reading EXPLAIN plans</h2>
+<p><code>EXPLAIN</code> shows the plan the optimizer chose; <code>EXPLAIN ANALYZE</code> also runs the query and reports real row counts and timings. This is how you <em>prove</em> an index is used. (Example outputs below are PostgreSQL-style, simplified, with parallelism disabled for clarity.)</p>
+
+<h3>10.1 Before: no suitable index</h3>
+<pre><code>EXPLAIN ANALYZE
+SELECT id, created_at FROM posts WHERE user_id = 42 ORDER BY created_at DESC LIMIT 12;
+
+Limit  (cost=2350412.10..2350412.13 rows=12 width=16) (actual time=8123.4..8123.4 rows=12 loops=1)
+  -&gt;  Sort  (cost=2350412.10..2350412.85 rows=300 width=16) (actual time=8123.4..8123.4 rows=12 loops=1)
+        Sort Key: created_at DESC
+        Sort Method: top-N heapsort  Memory: 25kB
+        -&gt;  Seq Scan on posts  (cost=0.00..2350405.00 rows=300 width=16)
+                                (actual time=0.03..8120.9 rows=287 loops=1)
+              Filter: (user_id = 42)
+              Rows Removed by Filter: 99999713
+Planning Time: 0.1 ms
+Execution Time: 8123.5 ms</code></pre>
+<p>How to read it (bottom-up, innermost first):</p>
+<ul>
+  <li><strong>Seq Scan on posts</strong> — a full table scan. <em>Rows Removed by Filter: 99,999,713</em> is the smoking gun: we read 100M rows to keep 287.</li>
+  <li><strong>cost=start..total</strong> — the planner's estimate in arbitrary units (roughly page reads); <strong>rows</strong> — estimated row count (300) vs <strong>actual rows</strong> (287): the statistics are good.</li>
+  <li><strong>Sort</strong> — an extra step because data wasn't already ordered.</li>
+  <li><strong>Execution Time: 8.1 s</strong>.</li>
+</ul>
+
+<h3>10.2 After: composite index</h3>
+<pre><code>CREATE INDEX CONCURRENTLY posts_user_recent ON posts (user_id, created_at DESC);
+
+Limit  (cost=0.57..48.90 rows=12 width=16) (actual time=0.031..0.058 rows=12 loops=1)
+  -&gt;  Index Scan using posts_user_recent on posts  (cost=0.57..1208.90 rows=300 width=16)
+                                                  (actual time=0.030..0.055 rows=12 loops=1)
+        Index Cond: (user_id = 42)
+Planning Time: 0.2 ms
+Execution Time: 0.08 ms</code></pre>
+<ul>
+  <li><strong>Index Scan … Index Cond</strong> — the B-tree is descended directly to user 42's entries.</li>
+  <li><strong>No Sort node</strong> — the index already returns rows in <code>created_at DESC</code> order, and the <strong>Limit</strong> stops after 12 rows (actual rows=12, not 287).</li>
+  <li><strong>0.08 ms vs 8,123 ms</strong> — ~100,000× faster.</li>
+</ul>
+
+<h3>10.3 Even better: covering index</h3>
+<pre><code>Index Only Scan using posts_grid_covering on posts  (actual time=0.020..0.031 rows=12 loops=1)
+  Index Cond: (user_id = 42)
+  Heap Fetches: 0</code></pre>
+<p><strong>Heap Fetches: 0</strong> means the table was never touched. Other plan nodes to recognise: <em>Bitmap Index Scan / Bitmap Heap Scan</em> (collect many matching row locations, then read table pages in physical order — used for medium selectivity or to combine indexes with AND/OR), <em>Nested Loop / Hash Join / Merge Join</em> (join algorithms), and in MySQL's <code>EXPLAIN</code> the <code>type</code> column (<code>ALL</code> = full scan, <code>ref</code>/<code>range</code> = index) and <code>Extra: Using index</code> (covering) or <code>Using filesort</code> (extra sort).</p>
+<div class="callout warn"><span class="callout-title">⚠️ Things that silently disable an index</span>
+Wrapping the column in a function (<code>WHERE date(created_at) = …</code>), implicit type casts (comparing a <code>bigint</code> column to a string), a leading wildcard (<code>LIKE '%gram'</code>), <code>OR</code> across different columns, or skipping the leftmost column of a composite index. Always check the plan.</div>
+
+<h2>11. Geospatial indexes: "posts near me"</h2>
+<p>Instagram lets users tag a <strong>location</strong> on a post and browse a place's page or a map of nearby places. The query "places within 2 km of (lat, lng)" can't use an ordinary B-tree well: an index on <code>lat</code> finds a horizontal band spanning the globe, and an index on <code>(lat, lng)</code> still only narrows on latitude. Two dimensions need a <strong>spatial index</strong>. Three common approaches:</p>
+
+<h3>11.1 Geohash: turn 2-D into a sortable string</h3>
+<p>A <strong>geohash</strong> recursively halves the world, alternating longitude and latitude: each bit says "left/right half" or "bottom/top half". The interleaved bits are encoded 5 at a time in base-32 characters. Key property: <strong>points that share a prefix are in the same cell</strong>, and longer prefixes mean smaller cells. So a spatial lookup becomes a <strong>prefix search on an ordinary B-tree</strong> (or a key lookup in Redis/Cassandra).</p>
+<pre class="ascii">
+ Bits are interleaved: lng, lat, lng, lat, …     then grouped by 5 → base-32 char
+   lng bit 1: is lng ≥ 0?        → 1
+   lat bit 1: is lat ≥ 0?        → 1
+   lng bit 2: upper half of [0,180)?  …            "t", "td", "tdr", "tdr1", … (each char = 32× smaller cell)
+
+ Neighbour search: the target point P may sit near a cell edge, so query P's cell
+ AND its 8 neighbours (prefix length chosen so a cell ≈ the search radius):
+
+        +--------+--------+--------+
+        | NW     | N      | NE     |
+        +--------+--------+--------+
+        | W      | P's    | E      |      9 prefix lookups, then filter by exact
+        |        | cell • |        |      distance (haversine) on the candidates
+        +--------+--------+--------+
+        | SW     | S      | SE     |
+        +--------+--------+--------+
+</pre>
+<div class="table-wrap"><table>
+  <tr><th>Geohash length</th><th>Approx. cell size (at the equator)</th><th>Good for</th></tr>
+  <tr><td>4</td><td>39 km × 19.5 km</td><td>City-level</td></tr>
+  <tr><td>5</td><td>4.9 km × 4.9 km</td><td>"Nearby" within a few km</td></tr>
+  <tr><td>6</td><td>1.2 km × 0.6 km</td><td>Neighbourhood</td></tr>
+  <tr><td>7</td><td>153 m × 153 m</td><td>Street / venue</td></tr>
+  <tr><td>8</td><td>38 m × 19 m</td><td>Building</td></tr>
+</table></div>
+<p>Caveats: two points a metre apart on either side of a cell boundary can have completely different prefixes (hence the 9-cell query), and cells distort towards the poles. Redis <code>GEOADD</code>/<code>GEOSEARCH</code> is built on geohash-encoded sorted-set scores; Elasticsearch supports <code>geo_point</code> fields with distance queries.</p>
+
+<h3>11.2 Quadtree: adaptive cells</h3>
+<p>A <strong>quadtree</strong> starts with one square covering the map and <strong>splits any cell holding more than K points into four quadrants</strong> (NW, NE, SW, SE), recursively. Dense cities get tiny cells, oceans stay as one big cell — so every leaf holds a similar number of places. To search, descend from the root into the quadrants that intersect the search circle and test the points in those leaves.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 320" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <rect x="20" y="20" width="280" height="280" fill="#fff8e1" stroke="#f9a825" stroke-width="2"/>
+  <g stroke="#f9a825" stroke-width="1.5">
+    <path d="M160,20 V300"/><path d="M20,160 H300"/>
+    <path d="M90,20 V160"/><path d="M20,90 H160"/>
+    <path d="M125,20 V90"/><path d="M90,55 H160"/>
+  </g>
+  <g fill="#c2185b">
+    <circle cx="98" cy="30" r="3"/><circle cx="110" cy="45" r="3"/><circle cx="117" cy="33" r="3"/><circle cx="135" cy="30" r="3"/>
+    <circle cx="150" cy="44" r="3"/><circle cx="142" cy="38" r="3"/><circle cx="130" cy="70" r="3"/><circle cx="145" cy="80" r="3"/>
+    <circle cx="100" cy="66" r="3"/><circle cx="112" cy="80" r="3"/><circle cx="40" cy="40" r="3"/><circle cx="70" cy="60" r="3"/>
+    <circle cx="50" cy="120" r="3"/><circle cx="80" cy="140" r="3"/><circle cx="120" cy="110" r="3"/><circle cx="140" cy="135" r="3"/>
+    <circle cx="220" cy="90" r="3"/><circle cx="250" cy="230" r="3"/><circle cx="60" cy="250" r="3"/><circle cx="190" cy="200" r="3"/>
+  </g>
+  <circle cx="120" cy="45" r="28" fill="none" stroke="#0277bd" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <text x="160" y="316" text-anchor="middle" font-size="11.5" fill="#555">map: dense area (top-left) split deeper</text>
+  <g fill="#e8f5e9" stroke="#2e7d32">
+    <rect x="530" y="20" width="80" height="30" rx="6"/>
+    <rect x="380" y="100" width="60" height="28" rx="6"/><rect x="470" y="100" width="60" height="28" rx="6"/>
+    <rect x="560" y="100" width="60" height="28" rx="6"/><rect x="650" y="100" width="60" height="28" rx="6"/>
+    <rect x="330" y="175" width="50" height="26" rx="6"/><rect x="390" y="175" width="50" height="26" rx="6"/>
+    <rect x="450" y="175" width="50" height="26" rx="6"/><rect x="510" y="175" width="50" height="26" rx="6"/>
+    <rect x="350" y="250" width="44" height="24" rx="6"/><rect x="400" y="250" width="44" height="24" rx="6"/>
+    <rect x="450" y="250" width="44" height="24" rx="6"/><rect x="500" y="250" width="44" height="24" rx="6"/>
+  </g>
+  <g text-anchor="middle" font-size="12">
+    <text x="570" y="40" font-weight="600">root</text>
+    <text x="410" y="119">NW</text><text x="500" y="119">NE</text><text x="590" y="119">SW</text><text x="680" y="119">SE</text>
+    <text x="355" y="193">NW</text><text x="415" y="193">NE</text><text x="475" y="193">SW</text><text x="535" y="193">SE</text>
+    <text x="372" y="267">NW</text><text x="422" y="267">NE</text><text x="472" y="267">SW</text><text x="522" y="267">SE</text>
+  </g>
+  <g stroke="#555" stroke-width="1.2">
+    <path d="M570,50 L410,100"/><path d="M570,50 L500,100"/><path d="M570,50 L590,100"/><path d="M570,50 L680,100"/>
+    <path d="M410,128 L355,175"/><path d="M410,128 L415,175"/><path d="M410,128 L475,175"/><path d="M410,128 L535,175"/>
+    <path d="M415,201 L372,250"/><path d="M415,201 L422,250"/><path d="M415,201 L472,250"/><path d="M415,201 L522,250"/>
+  </g>
+  <text x="600" y="190" font-size="12" fill="#555">rule: split a cell when it</text>
+  <text x="600" y="208" font-size="12" fill="#555">holds more than K points</text>
+  <text x="600" y="262" font-size="12" fill="#555">leaves = cells with ≤ K places</text>
+  <text x="600" y="300" font-size="12" fill="#0277bd">dashed circle = "within 2 km"</text>
+</svg>
+<div class="caption">A quadtree over a map (left) and its tree (right). The dense top-left quadrant is subdivided twice; sparse quadrants stay as single leaves. A radius query (dashed circle) only visits the few leaves it overlaps.</div>
+</div>
+
+<h3>11.3 R-trees, S2 and H3</h3>
+<ul>
+  <li><strong>R-tree</strong> — groups nearby objects into nested bounding rectangles; handles shapes (polygons, lines), not just points. PostGIS uses R-tree-over-GiST indexes: <code>CREATE INDEX ON places USING gist (geom);</code> then <code>WHERE ST_DWithin(geom, ST_MakePoint(lng, lat)::geography, 2000)</code>.</li>
+  <li><strong>S2</strong> (Google) maps the sphere onto a cube and fills it with a Hilbert curve, giving 64-bit cell IDs that preserve locality better than geohash. <strong>H3</strong> (Uber) uses hexagonal cells, whose neighbours are all equidistant — handy for aggregations like "demand per area".</li>
+</ul>
+<div class="table-wrap"><table>
+  <tr><th>Approach</th><th>Storage</th><th>Strengths</th><th>Weaknesses</th></tr>
+  <tr><td><b>Geohash</b></td><td>String/int key in any B-tree or KV store</td><td>Simple, shardable, cacheable, prefix = cell</td><td>Edge effects (need neighbours), fixed grid ignores density</td></tr>
+  <tr><td><b>Quadtree</b></td><td>Usually an in-memory tree in a service</td><td>Adapts to density; good for "k nearest"</td><td>Must be rebuilt/updated; harder to distribute</td></tr>
+  <tr><td><b>R-tree (PostGIS)</b></td><td>Database index</td><td>Arbitrary shapes, exact SQL queries</td><td>Tied to one database node; heavier writes</td></tr>
+  <tr><td><b>S2 / H3</b></td><td>64-bit cell IDs in any store</td><td>Uniform, hierarchical, great for aggregation</td><td>More complex libraries</td></tr>
+</table></div>
+
+<h2>12. Inverted indexes (for search)</h2>
+<p>B-trees find rows by a column's <em>whole value</em> or prefix. They can't answer "captions containing the word <em>sunset</em>" or "usernames similar to <em>selna</em>". For that, search engines build an <strong>inverted index</strong>: a map from each <em>term</em> to the list of documents containing it (a "posting list"), e.g. <code>sunset → [post 17, post 942, post 10,331 …]</code>. Text is first tokenised, lower-cased and stemmed; queries intersect posting lists and rank the results. Instagram's user, hashtag and place search runs on this kind of index in Elasticsearch-style clusters, fed asynchronously from Kafka. The full story — tokenisation, posting lists, TF-IDF/BM25 ranking, typeahead — is in <a href="search.html">Search &amp; Inverted Indexes</a>.</p>
+
+<h2>13. How Instagram uses indexes</h2>
+<p>Map every hot screen to a query, and every query to an index (or, in Cassandra, a primary-key design):</p>
+<div class="table-wrap"><table>
+  <tr><th>Screen / action</th><th>Query</th><th>Index / key</th></tr>
+  <tr><td>Profile grid</td><td>Latest 12 posts of user X, then "load more" before a cursor</td><td><code>(user_id, created_at DESC)</code> — or, since Instagram IDs are time-sortable, <code>(user_id, id DESC)</code>. Partial on <code>deleted_at IS NULL</code>; optionally covering the thumbnail key.</td></tr>
+  <tr><td>Heart icon state in the feed</td><td>"Has viewer V liked any of these 10 posts?"</td><td>Likes primary key <code>(post_id, user_id)</code>: 10 point lookups, each fully specified.</td></tr>
+  <tr><td>"Liked by …" list</td><td>Users who liked post P, newest first</td><td><code>(post_id, user_id)</code> PK for membership; add <code>(post_id, created_at DESC)</code> if order matters.</td></tr>
+  <tr><td>"Posts you've liked"</td><td>Posts liked by user U</td><td>Secondary <code>(user_id, created_at DESC)</code> on likes.</td></tr>
+  <tr><td>Followers / following</td><td>Who follows X? Whom does X follow?</td><td>PK <code>(follower_id, followee_id)</code> + reverse <code>(followee_id, follower_id)</code>.</td></tr>
+  <tr><td>Login / sign-up</td><td>Find user by username or email</td><td>Unique expression index on <code>lower(username)</code>; unique index on <code>email</code>.</td></tr>
+  <tr><td>Comments under a post</td><td>Newest comments on post P</td><td><code>(post_id, created_at DESC)</code> in SQL; in Cassandra, partition <code>post_id</code>, clustering <code>comment_id DESC</code>.</td></tr>
+  <tr><td>Location page / nearby</td><td>Places within 2 km; recent posts at place L</td><td>Geospatial index (geohash/S2/PostGIS) on places; <code>(location_id, created_at DESC)</code> on posts.</td></tr>
+  <tr><td>Search box</td><td>Accounts/hashtags matching "sel…"</td><td>Inverted index + prefix (edge n-gram) index in the search cluster.</td></tr>
+</table></div>
+
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+<ul>
+  <li><strong>PostgreSQL B-tree indexes on the sharded relational core.</strong> Because data is <a href="sharding.html">sharded by user</a>, an index like <code>(user_id, id DESC)</code> lives on the same shard as the user's rows, so the profile grid is a single-shard, single-index-range read. Instagram's 64-bit IDs embed a millisecond timestamp in the high bits, so ordering by ID ≈ ordering by time and the IDs append to the right edge of the B-tree.</li>
+  <li><strong>Public PostgreSQL tips.</strong> An Instagram engineering blog post on scaling PostgreSQL publicly recommended <strong>partial indexes</strong> (index only the rows you actually query) and <strong>functional/expression indexes</strong> (index a computed value, such as a short prefix of a long string, to keep indexes small) — along with connection pooling via PgBouncer.</li>
+  <li><strong>LSM storage for high-write data.</strong> Cassandra (an LSM engine) backs high-write workloads like feeds and activity; its "index" is the primary key — partition key + clustering key. Instagram engineers publicly described <em>Rocksandra</em>, replacing Cassandra's Java storage engine with RocksDB (another LSM engine) to reduce garbage-collection pauses and P99 read latency.</li>
+  <li><strong>Inverted indexes</strong> in the search cluster, fed from Kafka; <strong>Redis sorted sets</strong> act as in-memory ordered indexes for timelines.</li>
+</ul></div>
+
+<h3>Rough numbers (assumptions)</h3>
+<pre><code>Assume one PostgreSQL shard holds 50 M posts.
+Index (user_id BIGINT, created_at TIMESTAMPTZ) ≈ 16 B key + ~8 B pointer + overhead ≈ 32 B/entry
+  → 50 M × 32 B ≈ 1.6 GB  — fits in RAM next to the hot table pages
+Height: 8 KB pages / 32 B ≈ 250 entries per page → 250³ ≈ 15.6 M, 250⁴ ≈ 3.9 B → 4 levels
+Profile grid lookup: ~3 cached internal pages + 1 leaf page (+ 12 heap pages, or 0 if covering)
+At 20,000 profile views/s on this shard: ~20,000–260,000 page touches/s, nearly all from RAM.</code></pre>
+
+<h2>14. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ What indexes buy you</h4><ul>
+    <li>Point lookups and ranges in O(log n) instead of O(n)</li>
+    <li>Pre-sorted results: <code>ORDER BY … LIMIT</code> without sorting</li>
+    <li>Uniqueness enforcement (usernames, one like per user per post)</li>
+    <li>Index-only scans that never touch the table</li>
+    <li>Fast joins (index nested-loop) and foreign-key checks</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ What they cost</h4><ul>
+    <li>Every write updates every index — lower write throughput</li>
+    <li>Disk and RAM, competing with table data for cache</li>
+    <li>More WAL → more replication lag</li>
+    <li>Planner surprises when statistics are stale</li>
+    <li>LSM engines: compaction I/O, tombstones, read amplification</li>
+  </ul></div>
+</div>
+<h4>Common mistakes</h4>
+<ul>
+  <li><strong>Indexing every column "just in case".</strong> Write throughput collapses and most indexes are never used. Index from real query patterns and monitor usage.</li>
+  <li><strong>Wrong composite column order</strong> — <code>(created_at, user_id)</code> for a "by user, newest first" query can't serve it efficiently. Equality columns first, range/sort column last.</li>
+  <li><strong>Redundant indexes</strong> — <code>(user_id)</code> is redundant when <code>(user_id, created_at)</code> exists (leftmost prefix).</li>
+  <li><strong>Indexing low-selectivity columns</strong> alone (<code>is_private</code>, <code>media_type</code>). Use them in a composite or as a partial-index predicate.</li>
+  <li><strong>Functions or casts on indexed columns</strong> in <code>WHERE</code>, and leading-wildcard <code>LIKE '%x'</code>.</li>
+  <li><strong>OFFSET pagination</strong> — <code>OFFSET 100000 LIMIT 12</code> still walks 100,012 index entries. Use <strong>keyset (cursor) pagination</strong>: <code>WHERE user_id = 42 AND id &lt; :last_seen_id ORDER BY id DESC LIMIT 12</code>.</li>
+  <li><strong>Random UUID primary keys</strong> in a clustered B-tree → page splits, fragmentation, cache misses. Prefer time-ordered IDs.</li>
+  <li><strong>Building an index on a hot table without <code>CONCURRENTLY</code></strong> / online DDL → writes blocked for minutes.</li>
+  <li><strong>Never running <code>EXPLAIN ANALYZE</code></strong> — assuming the index is used rather than proving it.</li>
+  <li><strong>Using Cassandra secondary indexes or <code>ALLOW FILTERING</code></strong> for high-cardinality lookups instead of a dedicated query table.</li>
+</ul>
+
+<h2>15. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>Index / engine type</th><th>When to use it</th></tr>
+  <tr><td>PostgreSQL</td><td>B-tree (default), Hash, GIN (inverted: arrays, JSONB, full-text), GiST/SP-GiST (spatial, PostGIS), BRIN (block-range for huge append-only tables)</td><td>General OLTP with rich indexing needs; BRIN for time-ordered logs; GIN for tags/JSON.</td></tr>
+  <tr><td>MySQL InnoDB</td><td>Clustered B+tree on PK; secondary B+trees store the PK</td><td>High-volume OLTP; choose a compact, increasing PK.</td></tr>
+  <tr><td>RocksDB / LevelDB</td><td>Embedded LSM key-value engines</td><td>Building block for databases (MyRocks, CockroachDB's Pebble is similar, Rocksandra, Kafka Streams state).</td></tr>
+  <tr><td>Cassandra / ScyllaDB / HBase</td><td>Distributed LSM; partition + clustering key</td><td>Write-heavy, time-ordered data at scale.</td></tr>
+  <tr><td>MyRocks</td><td>MySQL with RocksDB storage</td><td>Meta built it to cut storage space and write amplification for MySQL at Facebook scale.</td></tr>
+  <tr><td>Redis</td><td>In-memory hash + sorted sets (skip lists) + geo commands</td><td>Hot ordered indexes (timelines, leaderboards), geo radius queries.</td></tr>
+  <tr><td>Elasticsearch / OpenSearch</td><td>Inverted index (Lucene segments — LSM-like), BKD trees for numbers/geo</td><td>Full-text, fuzzy, faceted and geo search.</td></tr>
+  <tr><td>PostGIS, S2, H3</td><td>Spatial indexing / cell systems</td><td>Maps, "near me", geo aggregations.</td></tr>
+</table></div>
+
+<h2>16. Interview corner</h2>
+<details class="qa"><summary>Why are B+trees the default index in relational databases?</summary>
+<p>They're designed for block storage: each node is a page with hundreds of keys, so the tree is only 3–4 levels deep for billions of rows and lookups cost a handful of page reads (the upper levels are cached). Keys are sorted, so they support equality, ranges, prefix matches and <code>ORDER BY</code> without sorting; linked leaves make range scans sequential. They stay balanced automatically via page splits, so performance is predictable. Hash indexes only win for pure equality, which B-trees handle nearly as well.</p></details>
+<details class="qa"><summary>Compare B-trees and LSM-trees. When would you choose each?</summary>
+<p>B-trees update fixed pages in place: one place per key, predictable fast reads, good for transactions and many secondary indexes, but random writes and page-granular write amplification. LSM-trees buffer writes in a memtable, flush sorted immutable SSTables sequentially and compact in the background: very high write throughput and good compression, but reads may check several files (mitigated by Bloom filters), compaction adds write amplification and can cause latency spikes, and deletes become tombstones. Choose B-trees for mixed OLTP (users, accounts); choose LSM for write-heavy append-mostly data keyed by partition (likes, feeds, messages, metrics) — like Instagram's PostgreSQL vs Cassandra split.</p></details>
+<details class="qa"><summary>Design the indexes for an Instagram profile page with infinite scroll.</summary>
+<p>Query: <code>WHERE user_id = ? AND deleted_at IS NULL AND id &lt; :cursor ORDER BY id DESC LIMIT 12</code>. Index: partial composite <code>(user_id, id DESC) WHERE deleted_at IS NULL</code>, optionally <code>INCLUDE (thumb_key)</code> for an index-only scan. Use keyset pagination with the last seen ID as the cursor (time-sortable IDs make this equivalent to time order), never OFFSET. The table is sharded by user_id, so this is a single-shard range read. Cache the first page in Redis for popular profiles.</p></details>
+<details class="qa"><summary>What is the leftmost-prefix rule? Give an example where it bites.</summary>
+<p>A composite index on (a, b, c) is sorted by a, then b, then c, so it can be used for predicates on a; a and b; or a, b and c — a contiguous prefix from the left. It can't efficiently serve a predicate only on b or c. Example: index <code>(user_id, created_at)</code>; an analytics query "all posts in the last hour" (<code>WHERE created_at &gt; …</code>) can't use it and does a full scan. Fix with a separate <code>(created_at)</code> index — or, better at Instagram scale, run that query on the data warehouse rather than adding write cost to the OLTP table.</p></details>
+<details class="qa"><summary>How do Bloom filters help LSM reads, and what's the trade-off?</summary>
+<p>Each SSTable keeps a Bloom filter of its keys in memory. Before reading a file, the engine checks the filter: "definitely not here" means skip the file with zero disk I/O. Only false positives (≈1% at 10 bits/key) cause wasted reads. So a point read touches about one SSTable instead of all of them. The trade-off is memory: about 1.2 bytes per key at 1% FP; lowering the FP rate costs more bits per key. Bloom filters don't help range scans, which must still merge across overlapping files.</p></details>
+<details class="qa"><summary>A query got slow after a big data import even though the index exists. What do you check?</summary>
+<p>Run <code>EXPLAIN ANALYZE</code> and compare estimated vs actual rows. A large mismatch suggests stale statistics → run <code>ANALYZE</code>. Check whether the plan switched to a seq scan because the predicate became less selective, whether the query now has a cast/function preventing index use, whether the index is bloated or invalid (e.g. a failed concurrent build), and whether the working set no longer fits in memory so index lookups now hit disk.</p></details>
+<details class="qa"><summary>How would you implement "find places near me" at scale?</summary>
+<p>Encode each place's coordinates as a geohash (or S2 cell ID) and store <code>(cell_prefix, place_id)</code> in an indexed table or KV store, sharded by cell. For a query, compute the user's cell at a precision roughly matching the radius (length 5–6 for a few km), fetch the cell plus its 8 neighbours, then filter candidates by exact haversine distance and rank by popularity. Dense areas can use longer prefixes or a quadtree in a dedicated service; cache popular cells. PostGIS with a GiST index works well at smaller scale.</p></details>
+
+<h2>17. Check your understanding</h2>
+<details class="quiz"><summary>A B+tree has fan-out 300. Roughly how many levels are needed for 1 billion keys?</summary>
+<p>300² = 90,000; 300³ = 27,000,000; 300⁴ = 8.1 billion ≥ 1 billion → <strong>4 levels</strong>. A lookup reads ~4 index pages, of which the top 2–3 are almost always cached.</p></details>
+<details class="quiz"><summary>Given an index on <code>(post_id, user_id)</code>, which can it serve efficiently: (a) <code>post_id = 9</code>, (b) <code>user_id = 42</code>, (c) <code>post_id = 9 AND user_id = 42</code>, (d) <code>post_id IN (1,2,3) AND user_id = 42</code>?</summary>
+<p><strong>(a), (c) and (d)</strong>. (d) becomes three exact lookups. (b) skips the leftmost column, so it needs a separate index such as <code>(user_id, post_id)</code>.</p></details>
+<details class="quiz"><summary>Why might the planner ignore an index on <code>media_type</code> for <code>WHERE media_type = 'photo'</code>?</summary>
+<p>Low selectivity: if ~70% of rows are photos, using the index means tens of millions of random row fetches, which is slower than one sequential scan. The planner correctly chooses the seq scan. Such a column is only useful inside a composite index or as a partial-index predicate on a rare value.</p></details>
+<details class="quiz"><summary>An LSM store has 12 SSTables and Bloom filters with a 1% false-positive rate. Roughly how many SSTables does a point read for a key that exists only in the oldest SSTable actually read from disk?</summary>
+<p>The 11 newer filters each have a 1% chance of a false positive → ~0.11 wasted reads on average, plus 1 real read of the oldest file: <strong>≈ 1.1 SSTable reads</strong> instead of 12 (plus a memtable check in RAM).</p></details>
+<details class="quiz"><summary>The likes table has a PK and 4 secondary indexes and receives 50,000 inserts/s. How many index insertions per second is that, and what's a cheap way to reduce it?</summary>
+<p>5 indexes × 50,000 = <strong>250,000 index insertions/s</strong> (plus WAL for each). Find indexes with near-zero <code>idx_scan</code> or serving only offline analytics and drop them; move analytics to the warehouse; merge redundant indexes that are prefixes of others.</p></details>
+<details class="quiz"><summary>What's the difference between a covering index and a clustered index?</summary>
+<p>A <strong>clustered</strong> index stores the full rows in its leaves in key order — the table <em>is</em> the index, and there's only one. A <strong>covering</strong> index is any (usually secondary) index that happens to contain all columns a given query needs, so that query can be answered by an index-only scan. Many covering indexes can exist; each is extra storage and write cost.</p></details>
+<details class="quiz"><summary>Why does OFFSET pagination get slower on page 1,000 of a profile, and what's the fix?</summary>
+<p><code>OFFSET 12000 LIMIT 12</code> still has to walk past 12,000 index entries (and possibly fetch their rows) before returning 12. Keyset pagination — <code>WHERE user_id = ? AND id &lt; :last_id ORDER BY id DESC LIMIT 12</code> — jumps straight to the cursor position in the B-tree, so every page costs the same.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>An index is a <strong>separate sorted or hashed structure</strong> that turns O(n) scans into O(log n) or O(1) lookups — at the price of extra writes and storage.</li>
+    <li><strong>B+trees</strong>: wide, shallow, sorted, linked leaves — great reads and ranges. <strong>LSM-trees</strong>: memtable + WAL + SSTables + compaction + Bloom filters — great writes.</li>
+    <li>Design composite indexes with the <strong>leftmost-prefix rule</strong> (equality first, range/sort last); use <strong>covering</strong> and <strong>partial</strong> indexes for hot queries.</li>
+    <li><strong>Selectivity</strong> decides if an index helps; keep statistics fresh and always confirm with <strong>EXPLAIN ANALYZE</strong>.</li>
+    <li>Use <strong>geohash/quadtree/R-tree</strong> for location queries and <strong>inverted indexes</strong> for text search.</li>
+    <li>Instagram: <code>(user_id, id/created_at DESC)</code> for profiles, <code>(post_id, user_id)</code> for likes, LSM-based Cassandra for high-write data.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="databases.html">Databases: SQL vs NoSQL</a> — which engines use B-trees vs LSM-trees and why</li>
+  <li><a href="search.html">Search &amp; Inverted Indexes</a> — full-text indexing in depth</li>
+  <li><a href="sharding.html">Sharding</a> — local vs global secondary indexes across shards</li>
+  <li><a href="id-generation.html">Unique ID Generation</a> — time-sortable IDs that keep B-trees compact</li>
+  <li><a href="replication.html">Replication</a> — why extra index writes increase replica lag</li>
+  <li><a href="likes-comments.html">Likes, Comments &amp; Counters</a> — the access patterns these indexes serve</li>
+  <li><a href="caching.html">Caching</a> — Redis sorted sets as in-memory indexes</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Message Queues, Pub/Sub &amp; Kafka — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="message-queues">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>A <strong>message queue</strong> lets one service hand work or news to others <strong>asynchronously</strong>: the producer writes a message and moves on; consumers process it later at their own pace.</li>
+    <li>This buys <strong>decoupling</strong>, <strong>load levelling</strong> (buffering spikes), <strong>retries</strong>, and cheap <strong>fan-out</strong> to many independent consumers — exactly what happens after an Instagram post is created.</li>
+    <li><strong>Queues</strong> (RabbitMQ, SQS) delete a message once it's processed; <strong>logs</strong> (Kafka) keep an ordered, replayable record that many consumer groups read independently by <strong>offset</strong>.</li>
+    <li>Kafka scales by splitting topics into <strong>partitions</strong>, replicated leader/followers with an <strong>ISR</strong>; ordering is guaranteed <strong>per partition</strong>, so you pick a <strong>partition key</strong> (e.g. <code>post_id</code>) for per-entity order.</li>
+    <li>Real systems deliver <strong>at-least-once</strong>, so consumers must be <strong>idempotent</strong>; use <strong>DLQs</strong> for poison messages, monitor <strong>consumer lag</strong>, use the <strong>transactional outbox / CDC</strong> to publish reliably, and a <strong>schema registry</strong> to evolve events safely.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why go asynchronous?</h2>
+<p>When you tap "Share" on a new Instagram post, a surprising amount of work must happen:</p>
+<ul>
+  <li>the photo must be resized into several renditions and a video transcoded (<a href="media-processing.html">Media Processing</a>),</li>
+  <li>the post ID must be pushed into the timelines of every follower (<a href="news-feed.html">Feed fan-out</a>) — maybe 300 followers, maybe 300 million,</li>
+  <li>hashtags and captions must be added to the <a href="search.html">search index</a>,</li>
+  <li>tagged users must get push notifications (<a href="notifications.html">Notifications</a>),</li>
+  <li>analytics and ML pipelines must record the event (<a href="analytics-ml.html">Analytics &amp; ML</a>).</li>
+</ul>
+<p>If the Upload/Post service called each of these <strong>synchronously</strong>, one after another, the user would wait for the sum of all their latencies (seconds, or minutes for a celebrity fan-out); if any one were down, posting would fail; and every new feature would require changing the Post service. Instead, the Post service writes the post, publishes a single <strong>"post created" event</strong>, and returns "posted!" in milliseconds. Everything else happens asynchronously.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 880 290" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-mq-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <text x="200" y="22" text-anchor="middle" font-weight="700">Synchronous: latencies add up, failures cascade</text>
+  <text x="655" y="22" text-anchor="middle" font-weight="700">Asynchronous: publish once, consumers react</text>
+  <line x1="420" y1="10" x2="420" y2="280" stroke="#ccc" stroke-dasharray="4 4"/>
+  <g font-weight="600">
+    <rect x="20" y="120" width="110" height="46" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="75" y="148" text-anchor="middle">Post service</text>
+    <rect x="200" y="40" width="190" height="34" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="295" y="62" text-anchor="middle">Media processing  3 s</text>
+    <rect x="200" y="84" width="190" height="34" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="295" y="106" text-anchor="middle">Feed fan-out  0.5–60 s</text>
+    <rect x="200" y="128" width="190" height="34" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="295" y="150" text-anchor="middle">Search indexer  80 ms</text>
+    <rect x="200" y="172" width="190" height="34" rx="6" fill="#ffebee" stroke="#c62828"/><text x="295" y="194" text-anchor="middle">Notifications  ✗ down</text>
+    <rect x="200" y="216" width="190" height="34" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="295" y="238" text-anchor="middle">Analytics  40 ms</text>
+  </g>
+  <g stroke="#555" stroke-width="1.3" fill="none" marker-end="url(#ar-mq-1)">
+    <path d="M130,135 L198,57"/><path d="M130,138 L198,101"/><path d="M130,143 L198,145"/><path d="M130,148 L198,189"/><path d="M130,152 L198,233"/>
+  </g>
+  <text x="200" y="272" text-anchor="middle" font-size="12" fill="#c62828">user waits ≈ sum of all calls; one failure fails the post</text>
+  <g font-weight="600">
+    <rect x="435" y="120" width="105" height="46" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="487" y="148" text-anchor="middle">Post service</text>
+    <rect x="575" y="112" width="110" height="62" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="630" y="138" text-anchor="middle">Kafka topic</text><text x="630" y="156" text-anchor="middle" font-weight="400" font-size="11">post.created</text>
+    <rect x="720" y="40" width="150" height="34" rx="6" fill="#f3e5f5" stroke="#6a1b9a"/><text x="795" y="62" text-anchor="middle">Media workers</text>
+    <rect x="720" y="84" width="150" height="34" rx="6" fill="#f3e5f5" stroke="#6a1b9a"/><text x="795" y="106" text-anchor="middle">Fan-out workers</text>
+    <rect x="720" y="128" width="150" height="34" rx="6" fill="#f3e5f5" stroke="#6a1b9a"/><text x="795" y="150" text-anchor="middle">Search indexer</text>
+    <rect x="720" y="172" width="150" height="34" rx="6" fill="#f3e5f5" stroke="#6a1b9a"/><text x="795" y="194" text-anchor="middle">Notification svc</text>
+    <rect x="720" y="216" width="150" height="34" rx="6" fill="#f3e5f5" stroke="#6a1b9a"/><text x="795" y="238" text-anchor="middle">Analytics / ML</text>
+  </g>
+  <g stroke="#555" stroke-width="1.3" fill="none" marker-end="url(#ar-mq-1)">
+    <path d="M540,143 L573,143"/>
+    <path d="M685,130 L718,57"/><path d="M685,137 L718,101"/><path d="M685,143 L718,145"/><path d="M685,150 L718,189"/><path d="M685,157 L718,233"/>
+  </g>
+  <text x="655" y="272" text-anchor="middle" font-size="12" fill="#2e7d32">user waits ≈ 1 DB write + 1 publish (~10–20 ms)</text>
+</svg>
+<div class="caption">Synchronous orchestration couples the user's latency and availability to every downstream system. Publishing one event decouples them.</div>
+</div>
+
+<h3>1.1 What asynchronous messaging buys you</h3>
+<div class="cards">
+  <div class="card"><h4>🔌 Decoupling</h4><p>The producer doesn't know who consumes. Adding a new consumer (say, a spam detector) needs zero changes to the Post service. Teams deploy and scale independently.</p></div>
+  <div class="card"><h4>🌊 Load levelling / buffering</h4><p>Producers can burst at 5× normal rate (New Year's Eve at midnight); the queue absorbs it and consumers drain at a steady rate instead of falling over.</p></div>
+  <div class="card"><h4>🔁 Retries &amp; resilience</h4><p>If the notification service is down for 10 minutes, its messages wait in the queue and are processed when it recovers. Nothing is lost; the user never noticed.</p></div>
+  <div class="card"><h4>📣 Fan-out</h4><p>One event, many independent consumers, each processing at its own speed with its own failure handling.</p></div>
+  <div class="card"><h4>⚡ Faster responses</h4><p>The user-facing request does the minimum (write + publish); slow work moves off the critical path.</p></div>
+  <div class="card"><h4>📜 Replay &amp; audit (logs)</h4><p>With Kafka you can re-read last week's events to rebuild a search index or backfill a new feature.</p></div>
+</div>
+<p>The costs: <strong>eventual consistency</strong> (a follower might see the post a few seconds later; search may lag), more moving parts, harder debugging across services, and new failure modes (duplicates, out-of-order messages, lag). Use async messaging for work that does <em>not</em> need to complete before you answer the user.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  A busy restaurant. The waiter (producer) doesn't walk into the kitchen and stand next to the chef until the dish is ready — they pin an <strong>order ticket</strong> on the rail (the queue) and go serve other tables. Cooks (consumers) take tickets at their own pace; at peak, tickets pile up on the rail rather than waiters crashing into the kitchen. A <strong>point-to-point queue</strong> is the ticket rail: each ticket is cooked by exactly one cook. <strong>Pub/sub</strong> is more like a newspaper: one edition is printed and every subscriber gets their own copy. Kafka is like a newspaper <strong>archive</strong>: every edition is kept, and each reader keeps a bookmark of how far they've read — a new reader can start from last week's edition.
+</div>
+
+<h2>2. Core concepts and messaging models</h2>
+<ul>
+  <li><strong>Message / event</strong> — a small record (bytes, usually JSON/Avro/Protobuf, typically &lt; 1 MB, often ~1 KB) with optional key and headers. A <em>command</em> says "do X" (<code>ResizeImage</code>); an <em>event</em> states a fact "X happened" (<code>PostCreated</code>). Events are preferred for decoupling.</li>
+  <li><strong>Producer</strong> (publisher) writes messages; <strong>consumer</strong> (subscriber) reads them; the <strong>broker</strong> stores and delivers them.</li>
+  <li><strong>Acknowledgement (ack)</strong> — the consumer's signal that a message has been processed and need not be redelivered.</li>
+</ul>
+
+<h3>2.1 Point-to-point queues vs publish/subscribe</h3>
+<div class="diagram">
+<svg viewBox="0 0 880 230" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-mq-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <text x="210" y="22" text-anchor="middle" font-weight="700">Point-to-point (work queue)</text>
+  <text x="660" y="22" text-anchor="middle" font-weight="700">Publish / subscribe</text>
+  <line x1="430" y1="10" x2="430" y2="220" stroke="#ccc" stroke-dasharray="4 4"/>
+  <g font-weight="600">
+    <rect x="15" y="95" width="95" height="44" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="62" y="122" text-anchor="middle">Producer</text>
+    <rect x="145" y="95" width="120" height="44" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="205" y="122" text-anchor="middle">Queue</text>
+    <rect x="305" y="40" width="110" height="36" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="360" y="63" text-anchor="middle">Worker 1</text>
+    <rect x="305" y="99" width="110" height="36" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="360" y="122" text-anchor="middle">Worker 2</text>
+    <rect x="305" y="158" width="110" height="36" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="360" y="181" text-anchor="middle">Worker 3</text>
+    <rect x="445" y="95" width="95" height="44" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="492" y="122" text-anchor="middle">Publisher</text>
+    <rect x="575" y="95" width="110" height="44" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="630" y="122" text-anchor="middle">Topic</text>
+    <rect x="720" y="40" width="150" height="36" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="795" y="63" text-anchor="middle">Search indexer</text>
+    <rect x="720" y="99" width="150" height="36" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="795" y="122" text-anchor="middle">Fan-out service</text>
+    <rect x="720" y="158" width="150" height="36" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="795" y="181" text-anchor="middle">Notifications</text>
+  </g>
+  <g stroke="#555" stroke-width="1.4" fill="none" marker-end="url(#ar-mq-2)">
+    <path d="M110,117 L143,117"/><path d="M265,110 L303,60"/><path d="M265,117 L303,117"/><path d="M265,124 L303,174"/>
+    <path d="M540,117 L573,117"/><path d="M685,110 L718,60"/><path d="M685,117 L718,117"/><path d="M685,124 L718,174"/>
+  </g>
+  <text x="210" y="215" text-anchor="middle" font-size="12" fill="#333">each message goes to ONE worker (competing consumers)</text>
+  <text x="660" y="215" text-anchor="middle" font-size="12" fill="#333">each message goes to EVERY subscriber</text>
+</svg>
+<div class="caption">Queues distribute work; pub/sub broadcasts events. Kafka does both: within one consumer group partitions are divided (queue-like); across groups every group sees everything (pub/sub).</div>
+</div>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Point-to-point queue</th><th>Publish/subscribe</th></tr>
+  <tr><td><b>Delivery</b></td><td>Each message processed by exactly one of the competing consumers</td><td>Each subscriber (or subscriber group) receives a copy</td></tr>
+  <tr><td><b>Purpose</b></td><td>Distribute <em>work</em> (jobs, tasks)</td><td>Broadcast <em>events</em> to independent systems</td></tr>
+  <tr><td><b>Scaling</b></td><td>Add workers to drain faster</td><td>Add subscribers without touching publishers</td></tr>
+  <tr><td><b>Instagram example</b></td><td>"Transcode this video" jobs spread over a GPU worker pool</td><td>"Post created" consumed by search, fan-out, notifications, analytics</td></tr>
+</table></div>
+
+<h2>3. Traditional brokers vs log-based brokers</h2>
+<p>There are two families of messaging systems, and choosing between them is a frequent interview question.</p>
+<ul>
+  <li><strong>Traditional message brokers</strong> (RabbitMQ, ActiveMQ, Amazon SQS) are <em>queues</em>: the broker tracks each message's state, hands it to a consumer, waits for an ack and then <strong>deletes</strong> it. RabbitMQ routes messages through <em>exchanges</em> (direct, topic, fanout) into queues; SQS uses a <em>visibility timeout</em> — a received message is hidden for N seconds and reappears if not deleted in time.</li>
+  <li><strong>Log-based brokers</strong> (Apache Kafka, Amazon Kinesis, Apache Pulsar, Redpanda) are <em>append-only logs</em>: messages are written in order and <strong>retained</strong> for a period regardless of consumption. Each consumer group just remembers an <strong>offset</strong> (position) per partition and moves it forward.</li>
+</ul>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Traditional broker (RabbitMQ, SQS)</th><th>Log-based (Kafka, Kinesis, Pulsar)</th></tr>
+  <tr><td><b>Storage model</b></td><td>Queue; message deleted after ack</td><td>Append-only partitioned log; retained by time/size</td></tr>
+  <tr><td><b>Consumer state</b></td><td>Broker tracks per-message delivery/ack</td><td>Consumer group tracks one offset per partition</td></tr>
+  <tr><td><b>Replay</b></td><td>No (once acked, gone)</td><td>Yes — rewind offsets, reprocess history</td></tr>
+  <tr><td><b>Multiple consumers</b></td><td>Copy into multiple queues (fanout exchange / SNS→SQS)</td><td>Any number of groups read the same log independently</td></tr>
+  <tr><td><b>Ordering</b></td><td>Per queue, weakened by redelivery/competing consumers (SQS standard: best effort; SQS FIFO: per message group)</td><td>Strict within a partition</td></tr>
+  <tr><td><b>Throughput</b></td><td>Tens of thousands msg/s per node (RabbitMQ); SQS scales transparently</td><td>Hundreds of thousands to millions msg/s per cluster via sequential disk I/O and batching</td></tr>
+  <tr><td><b>Per-message features</b></td><td>Rich routing, priorities, per-message TTL, delays, individual acks/requeue</td><td>Minimal; per-message retry/delay must be built (retry topics)</td></tr>
+  <tr><td><b>Parallelism</b></td><td>Add consumers freely</td><td>Bounded by number of partitions per group</td></tr>
+  <tr><td><b>Best for</b></td><td>Task queues, RPC-style jobs, complex routing, low volume with per-message control</td><td>High-volume event streams, multiple subscribers, event sourcing, CDC, analytics pipelines</td></tr>
+</table></div>
+<p>For Instagram's event bus — high volume, many independent consumers, replay to rebuild indexes, analytics — <strong>Kafka</strong> is the natural choice, and that's what our architecture diagram shows. A task-queue system (Celery on RabbitMQ/Redis, or SQS) still fits well for discrete jobs like "send this email".</p>
+
+<h2>4. Kafka internals</h2>
+
+<h3>4.1 Topics, partitions and offsets</h3>
+<p>A <strong>topic</strong> is a named stream of related events, e.g. <code>post.created</code>. A topic is split into <strong>partitions</strong>; each partition is an ordered, append-only log stored on disk. Every message in a partition gets a sequential <strong>offset</strong> (0, 1, 2, …), its permanent address within that partition.</p>
+<pre class="ascii">
+ topic: post.created          (3 partitions; each is an independent ordered log)
+
+ partition 0 | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |  ← producers append here (log end offset = 9)
+                               ↑               ↑
+                     group "search" at 4       group "fanout" at 8
+
+ partition 1 | 0 | 1 | 2 | 3 | 4 | 5 |
+ partition 2 | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+
+ • Order is guaranteed only WITHIN a partition (p0 offset 3 is before p0 offset 4).
+ • Messages are NOT deleted when read; each consumer group keeps its own offset.
+ • Old log segments are deleted by retention (e.g. 7 days) or compacted.
+</pre>
+<p>Why partitions? A single log can only be as fast as one disk and one machine. Partitions let a topic spread across many brokers (more write throughput) and let many consumers read in parallel (one consumer per partition per group). Kafka is fast because each partition is written and read <strong>sequentially</strong> (disks and the OS page cache love sequential I/O), messages are <strong>batched</strong> and <strong>compressed</strong>, and data is sent from page cache to socket with zero-copy (<code>sendfile</code>).</p>
+
+<h3>4.2 Brokers, leaders, followers and the ISR</h3>
+<p>A Kafka <strong>cluster</strong> is a set of servers called <strong>brokers</strong>. Each partition is replicated to <em>replication factor</em> (RF, typically 3) brokers. One replica is the <strong>leader</strong> — all produce and (by default) consume requests go to it — and the others are <strong>followers</strong> that continuously fetch from the leader to stay in sync.</p>
+<div class="diagram">
+<svg viewBox="0 0 880 250" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-mq-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g>
+    <rect x="30" y="30" width="250" height="170" rx="10" fill="#fafafa" stroke="#455a64"/>
+    <rect x="315" y="30" width="250" height="170" rx="10" fill="#fafafa" stroke="#455a64"/>
+    <rect x="600" y="30" width="250" height="170" rx="10" fill="#fafafa" stroke="#455a64"/>
+  </g>
+  <g font-weight="700" text-anchor="middle"><text x="155" y="52">Broker 1</text><text x="440" y="52">Broker 2</text><text x="725" y="52">Broker 3</text></g>
+  <g font-size="12.5">
+    <rect x="50" y="65" width="210" height="34" rx="6" fill="#f3e5f5" stroke="#6a1b9a" stroke-width="2.5"/><text x="60" y="87">P0 — LEADER</text>
+    <rect x="50" y="108" width="210" height="34" rx="6" fill="#fff" stroke="#6a1b9a"/><text x="60" y="130">P1 — follower (in ISR)</text>
+    <rect x="50" y="151" width="210" height="34" rx="6" fill="#fff" stroke="#6a1b9a"/><text x="60" y="173">P2 — follower (in ISR)</text>
+    <rect x="335" y="65" width="210" height="34" rx="6" fill="#fff" stroke="#6a1b9a"/><text x="345" y="87">P0 — follower (in ISR)</text>
+    <rect x="335" y="108" width="210" height="34" rx="6" fill="#f3e5f5" stroke="#6a1b9a" stroke-width="2.5"/><text x="345" y="130">P1 — LEADER</text>
+    <rect x="335" y="151" width="210" height="34" rx="6" fill="#ffebee" stroke="#c62828" stroke-dasharray="4 3"/><text x="345" y="173">P2 — follower (lagging)</text>
+    <rect x="620" y="65" width="210" height="34" rx="6" fill="#fff" stroke="#6a1b9a"/><text x="630" y="87">P0 — follower (in ISR)</text>
+    <rect x="620" y="108" width="210" height="34" rx="6" fill="#fff" stroke="#6a1b9a"/><text x="630" y="130">P1 — follower (in ISR)</text>
+    <rect x="620" y="151" width="210" height="34" rx="6" fill="#f3e5f5" stroke="#6a1b9a" stroke-width="2.5"/><text x="630" y="173">P2 — LEADER</text>
+  </g>
+  <g stroke="#6a1b9a" stroke-width="1.3" fill="none" stroke-dasharray="5 3" marker-end="url(#ar-mq-3)">
+    <path d="M333,82 L262,82"/><path d="M618,82 C560,40 330,40 262,72"/>
+  </g>
+  <text x="440" y="225" text-anchor="middle" font-size="12" fill="#333">Topic with 3 partitions, RF = 3. Leaders are spread across brokers; followers fetch from leaders (dashed: P0 replication).</text>
+  <text x="440" y="243" text-anchor="middle" font-size="12" fill="#333">ISR(P2) = {broker 3, broker 1} — broker 2 fell behind and was removed until it catches up.</text>
+</svg>
+<div class="caption">Partition leadership is balanced across brokers. If broker 1 dies, a controller promotes an in-sync follower of P0 (on broker 2 or 3) to leader.</div>
+</div>
+<ul>
+  <li><strong>ISR (in-sync replicas)</strong> — the set of replicas that are fully caught up with the leader (within <code>replica.lag.time.max.ms</code>, default 30 s). A slow or dead follower is dropped from the ISR and rejoins after catching up.</li>
+  <li><strong>High watermark</strong> — the highest offset replicated to all ISR members. Consumers only see messages up to the high watermark, so they never read data that could be lost in a leader failover.</li>
+  <li><strong>Leader election</strong> — when a leader dies, the cluster <em>controller</em> promotes an ISR member. Modern Kafka manages this metadata with its built-in Raft-based quorum (<strong>KRaft</strong>), which replaced ZooKeeper (ZooKeeper support was removed in Kafka 4.0). <code>unclean.leader.election.enable=false</code> (default) forbids promoting an out-of-sync replica, trading availability for no data loss.</li>
+</ul>
+
+<h3>4.3 acks: how durable is a write?</h3>
+<div class="table-wrap"><table>
+  <tr><th>Producer <code>acks</code></th><th>Leader replies when…</th><th>Latency</th><th>Risk</th></tr>
+  <tr><td><code>acks=0</code></td><td>Never — fire and forget</td><td>Lowest</td><td>Messages lost silently if anything fails</td></tr>
+  <tr><td><code>acks=1</code></td><td>Leader has written it to its log</td><td>Low</td><td>Lost if the leader dies before followers copy it</td></tr>
+  <tr><td><code>acks=all</code> (<code>-1</code>, default since Kafka 3.0)</td><td>All current ISR members have it</td><td>Higher (one replication round trip)</td><td>No loss as long as one ISR member survives</td></tr>
+</table></div>
+<p>Pair <code>acks=all</code> with <code>min.insync.replicas=2</code> and RF = 3: a write succeeds only if at least 2 replicas have it; if the ISR shrinks to 1, producers get errors rather than writing data that only one machine holds. That's the standard "don't lose events" configuration for business events like <code>post.created</code>. For high-volume, loss-tolerant telemetry (impressions), <code>acks=1</code> may be acceptable.</p>
+
+<h3>4.4 Retention and log compaction</h3>
+<ul>
+  <li><strong>Time/size retention</strong> (<code>retention.ms</code>, <code>retention.bytes</code>): partitions are stored as segment files; whole old segments are deleted after, say, 7 days. Consumers can be down for days and still catch up; you can replay history within the window. Tiered storage (Kafka 3.6+) offloads old segments to object storage for long, cheap retention.</li>
+  <li><strong>Log compaction</strong> (<code>cleanup.policy=compact</code>): instead of deleting by age, Kafka keeps <strong>at least the latest message for every key</strong>, discarding older values of the same key in the background. A message with a null value (a <em>tombstone</em>) deletes the key. The topic becomes a durable changelog / snapshot of current state — e.g. <code>user.profile</code> keyed by user_id lets a new service bootstrap a full copy of all profiles by reading the topic from the start.</li>
+</ul>
+<pre class="ascii">
+ Before compaction (key:value)       After compaction
+ 0  u1:{name:"ana"}                   
+ 1  u2:{name:"raj"}                   1  u2:{name:"raj"}
+ 2  u1:{name:"ana_k"}                 
+ 3  u3:{name:"li"}                    
+ 4  u1:{name:"ana.k"}                 4  u1:{name:"ana.k"}
+ 5  u3:null   (tombstone)             5  u3:null   (removed later)
+</pre>
+
+<h2>5. Producers and partition keys</h2>
+<p>The producer decides which partition each message goes to:</p>
+<ul>
+  <li><strong>With a key:</strong> <code>partition = hash(key) mod num_partitions</code> (Kafka's default uses murmur2). Every message with the same key lands in the same partition — therefore <strong>all events for one key are ordered</strong>.</li>
+  <li><strong>Without a key:</strong> the default "sticky" partitioner fills a batch for one partition then switches, spreading load evenly (no ordering guarantees).</li>
+</ul>
+<p><strong>Choosing the key is a design decision:</strong></p>
+<div class="table-wrap"><table>
+  <tr><th>Key choice</th><th>Ordering you get</th><th>Risk</th></tr>
+  <tr><td><code>post_id</code> for like/comment events</td><td>All events about one post in order (like then unlike stays correct)</td><td>A viral post makes one partition hot</td></tr>
+  <tr><td><code>user_id</code> (author) for post events</td><td>A user's posts/deletes in order</td><td>Celebrities create hot partitions (fine for low-rate post events)</td></tr>
+  <tr><td><code>conversation_id</code> for DMs</td><td>Messages within a chat in order</td><td>Large group chats are hot</td></tr>
+  <tr><td>None / random</td><td>No ordering</td><td>Best balance; use when order doesn't matter (impressions)</td></tr>
+</table></div>
+<div class="callout warn"><span class="callout-title">⚠️ Changing partition count breaks key → partition mapping</span>
+Because the mapping is <code>hash mod N</code>, adding partitions to an existing topic sends some keys to different partitions; for a short time, old and new events for the same key live in different partitions and can be processed out of order. Over-provision partitions up front (e.g. 2–3× expected need) and create a new topic for big changes.</div>
+<p>Other producer knobs: <code>linger.ms</code> and <code>batch.size</code> (wait a few ms to send bigger batches → much higher throughput), <code>compression.type</code> (lz4/zstd), and <code>enable.idempotence=true</code> (default since 3.0): the broker de-duplicates producer retries using a producer ID + per-partition sequence numbers, so a network retry doesn't create a duplicate in the log.</p>
+<pre><code>from confluent_kafka import Producer
+p = Producer({"bootstrap.servers": "kafka:9092", "acks": "all",
+              "enable.idempotence": True, "linger.ms": 5, "compression.type": "zstd"})
+
+event = PostCreated(post_id=4185136929178974185, author_id=31341, media_keys=[...])
+p.produce("post.created", key=str(event.author_id), value=event.SerializeToString(),
+          on_delivery=lambda err, msg: err and log.error("publish failed", err))
+p.flush()</code></pre>
+
+<h2>6. Consumer groups, partition assignment and rebalancing</h2>
+<p>A <strong>consumer group</strong> is a set of consumer processes that cooperatively read a topic. Kafka assigns each partition to <strong>exactly one consumer in the group</strong>, so the group processes every message once (queue semantics), while <strong>different groups</strong> each read everything (pub/sub semantics).</p>
+<div class="diagram">
+<svg viewBox="0 0 880 260" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-mq-4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <rect x="320" y="20" width="200" height="220" rx="10" fill="#f3e5f5" stroke="#6a1b9a"/>
+  <text x="420" y="42" text-anchor="middle" font-weight="700">topic: post.created</text>
+  <g font-weight="600" text-anchor="middle">
+    <rect x="345" y="58" width="150" height="34" rx="6" fill="#fff" stroke="#6a1b9a"/><text x="420" y="80">Partition 0</text>
+    <rect x="345" y="104" width="150" height="34" rx="6" fill="#fff" stroke="#6a1b9a"/><text x="420" y="126">Partition 1</text>
+    <rect x="345" y="150" width="150" height="34" rx="6" fill="#fff" stroke="#6a1b9a"/><text x="420" y="172">Partition 2</text>
+    <rect x="345" y="196" width="150" height="34" rx="6" fill="#fff" stroke="#6a1b9a"/><text x="420" y="218">Partition 3</text>
+  </g>
+  <rect x="20" y="40" width="250" height="180" rx="10" fill="none" stroke="#2e7d32" stroke-dasharray="6 4"/>
+  <text x="145" y="62" text-anchor="middle" font-weight="700" fill="#2e7d32">group: search-indexer</text>
+  <g font-weight="600" text-anchor="middle">
+    <rect x="45" y="85" width="200" height="40" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="145" y="110">Consumer A (P0, P1)</text>
+    <rect x="45" y="150" width="200" height="40" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="145" y="175">Consumer B (P2, P3)</text>
+  </g>
+  <rect x="570" y="20" width="290" height="220" rx="10" fill="none" stroke="#2e7d32" stroke-dasharray="6 4"/>
+  <text x="715" y="42" text-anchor="middle" font-weight="700" fill="#2e7d32">group: feed-fanout</text>
+  <g font-weight="600" text-anchor="middle">
+    <rect x="600" y="55" width="230" height="30" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="715" y="75">Worker 1 (P0)</text>
+    <rect x="600" y="93" width="230" height="30" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="715" y="113">Worker 2 (P1)</text>
+    <rect x="600" y="131" width="230" height="30" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="715" y="151">Worker 3 (P2)</text>
+    <rect x="600" y="169" width="230" height="30" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="715" y="189">Worker 4 (P3)</text>
+    <rect x="600" y="205" width="230" height="28" rx="6" fill="#eceff1" stroke="#455a64" stroke-dasharray="4 3"/><text x="715" y="224" font-weight="400">Worker 5 — idle (no partition)</text>
+  </g>
+  <g stroke="#555" stroke-width="1.2" fill="none" marker-end="url(#ar-mq-4)">
+    <path d="M343,75 L247,100"/><path d="M343,121 L247,110"/><path d="M343,167 L247,165"/><path d="M343,213 L247,180"/>
+    <path d="M497,75 L598,70"/><path d="M497,121 L598,108"/><path d="M497,167 L598,146"/><path d="M497,213 L598,184"/>
+  </g>
+</svg>
+<div class="caption">Two groups read the same topic independently. Within a group each partition has one owner, so parallelism is capped at the partition count — the 5th fan-out worker sits idle.</div>
+</div>
+<ul>
+  <li><strong>Parallelism ≤ partitions.</strong> A group can't usefully have more active consumers than partitions. Plan partition counts for <em>peak consumer parallelism</em>, not just producer throughput.</li>
+  <li><strong>Offsets are committed</strong> by the consumer to an internal topic (<code>__consumer_offsets</code>). After a crash or reassignment, the new owner resumes from the last committed offset.</li>
+  <li><strong>Rebalancing</strong> happens when consumers join, leave, crash (miss heartbeats / exceed <code>max.poll.interval.ms</code>) or partitions change. The group coordinator reassigns partitions. Old "eager" rebalancing stopped the whole group ("stop-the-world"); the <strong>cooperative incremental</strong> protocol only moves the partitions that need to move, and <strong>static membership</strong> (<code>group.instance.id</code>) avoids rebalances on quick restarts during deploys. Kafka 4.0's new consumer group protocol moves assignment to the broker for faster, smoother rebalances.</li>
+  <li><strong>Assignment strategies:</strong> range, round-robin, sticky, cooperative-sticky (minimises movement — the usual choice).</li>
+</ul>
+<pre><code>from confluent_kafka import Consumer
+c = Consumer({"bootstrap.servers": "kafka:9092", "group.id": "search-indexer",
+              "enable.auto.commit": False, "auto.offset.reset": "earliest",
+              "partition.assignment.strategy": "cooperative-sticky"})
+c.subscribe(["post.created"])
+while True:
+    msg = c.poll(1.0)
+    if msg is None or msg.error():
+        continue
+    index_post(PostCreated.FromString(msg.value()))   # must be idempotent!
+    c.commit(message=msg, asynchronous=False)           # commit AFTER processing → at-least-once</code></pre>
+
+<h2>7. Delivery semantics</h2>
+<p>Networks drop packets, consumers crash mid-processing, producers retry. What can a messaging system promise about how many times a message is processed?</p>
+<div class="table-wrap"><table>
+  <tr><th>Semantics</th><th>How it arises</th><th>Failure outcome</th><th>Use for</th></tr>
+  <tr><td><b>At-most-once</b></td><td>Consumer commits the offset (or acks) <em>before</em> processing; producer doesn't retry</td><td>Crash after commit, before processing → message <strong>lost</strong></td><td>Metrics/telemetry where loss is acceptable</td></tr>
+  <tr><td><b>At-least-once</b></td><td>Commit/ack <em>after</em> processing; producer retries on timeout</td><td>Crash after processing, before commit → message processed <strong>again</strong></td><td>The default for almost everything — with idempotent consumers</td></tr>
+  <tr><td><b>Exactly-once</b> (effectively-once)</td><td>Idempotent producer + transactions, or at-least-once + idempotent/deduplicating processing</td><td>Each message's <em>effect</em> applied once</td><td>Counters, payments, stream processing where duplicates corrupt results</td></tr>
+</table></div>
+<pre class="ascii">
+ At-least-once duplicate:
+  consumer: poll offset 41 → process (write to Elasticsearch ✔) → CRASH before commit
+  restart:  last committed offset = 40 → poll offset 41 AGAIN → process again
+</pre>
+<p><strong>Kafka's exactly-once semantics (EOS)</strong> combine the idempotent producer (no duplicate writes on retry) with <strong>transactions</strong>: a stream processor reads from input topics, writes to output topics <em>and</em> commits its consumer offsets atomically in one transaction; downstream consumers with <code>isolation.level=read_committed</code> never see aborted writes. This gives exactly-once for <em>Kafka-to-Kafka</em> pipelines (e.g. Kafka Streams, Flink). As soon as a side effect leaves Kafka — sending a push notification, writing to Redis — you're back to at-least-once, and the <strong>consumer must be idempotent</strong>.</p>
+
+<h3>7.1 Idempotent consumers</h3>
+<p>An operation is <strong>idempotent</strong> if doing it twice has the same effect as doing it once. Techniques:</p>
+<ul>
+  <li><strong>Natural idempotence:</strong> upserts keyed by ID (<code>PUT doc 4185…</code> into Elasticsearch), <code>ZADD timeline post_id</code> (a set ignores duplicates), "set status = PUBLISHED".</li>
+  <li><strong>Dedup table / processed-set:</strong> store each <code>event_id</code> you've handled (with TTL); skip if present. Do the check and the side effect in the same DB transaction when possible.</li>
+  <li><strong>Conditional writes / versions:</strong> apply an update only if <code>event.version &gt; stored.version</code> — also fixes out-of-order delivery.</li>
+  <li><strong>Avoid non-idempotent increments:</strong> "likes += 1" on redelivery double-counts. Instead record the like as a row keyed by <code>(post_id, user_id)</code> and derive counts, or dedupe by event ID before incrementing.</li>
+</ul>
+<pre><code>def handle_like(evt):                       # at-least-once delivery, idempotent effect
+    with db.transaction() as tx:
+        inserted = tx.execute(
+            "INSERT INTO likes (post_id, user_id, created_at) VALUES (%s, %s, %s) "
+            "ON CONFLICT (post_id, user_id) DO NOTHING", (evt.post_id, evt.user_id, evt.ts)).rowcount
+    if inserted:                            # only the first delivery changes the counter
+        redis.hincrby(f"post:{evt.post_id}:counts", "likes", 1)
+        notify_author_once(evt.event_id)    # notification service dedupes by event_id too</code></pre>
+<p>(There is still a tiny window between the DB commit and the Redis increment; counters are periodically reconciled from the likes table — see <a href="likes-comments.html">Likes &amp; Counters</a>.)</p>
+
+<h2>8. Dead-letter queues and poison messages</h2>
+<p>A <strong>poison message</strong> is one that always fails — malformed JSON, a schema the consumer can't parse, a reference to a deleted user, or one that triggers a bug. In a partitioned log this is particularly nasty: if the consumer keeps retrying, it <strong>blocks the whole partition</strong> (everything behind it waits). Standard handling:</p>
+<ol class="steps">
+  <li><strong>Classify errors:</strong> transient (timeout, 503 from Elasticsearch) → retry; permanent (deserialization error, validation failure) → don't retry forever.</li>
+  <li><strong>Retry in place a few times</strong> with exponential backoff and jitter (see <a href="resilience-patterns.html">Resilience Patterns</a>).</li>
+  <li><strong>Retry topics:</strong> if still failing, publish the message to <code>post.created.retry.1m</code>, then <code>.retry.10m</code>, consumed by a delayed consumer — the main partition keeps flowing.</li>
+  <li><strong>Dead-letter queue (DLQ):</strong> after N attempts, park the message in <code>post.created.dlq</code> with error details in headers (exception, attempts, original partition/offset), commit the offset and move on.</li>
+  <li><strong>Alert and redrive:</strong> DLQ depth is an alert. Engineers fix the bug, then replay the DLQ back to the main topic.</li>
+</ol>
+<p>Trade-off: moving a message aside breaks per-key ordering (later events for that key get processed first). For order-critical streams, either pause the partition and page someone, or make consumers tolerant (versions/timestamps). SQS and RabbitMQ provide DLQs natively (SQS <em>redrive policy</em> with <code>maxReceiveCount</code>; RabbitMQ dead-letter exchanges); in Kafka it's an application pattern supported by frameworks (Spring Kafka, Kafka Connect).</p>
+
+<h2>9. Consumer lag and backpressure</h2>
+<p><strong>Consumer lag</strong> = (log end offset) − (group's committed offset), per partition. It is the single most important health metric for an async pipeline: it tells you how far behind real time a consumer is.</p>
+<pre><code>Partition 7 of post.created:  log end offset = 1,250,000   committed (feed-fanout) = 1,190,000
+lag = 60,000 messages.  Consume rate 2,000 msg/s, produce rate 1,500 msg/s
+→ catching up at 500 msg/s → back to real time in 60,000 / 500 = 120 s
+Lag in TIME (age of oldest unprocessed message) is what users feel: "followers see posts ~2 min late".</code></pre>
+<p>Lag grows when consumers are slower than producers — traffic spike, slow downstream (Elasticsearch GC pauses), a poison message, or a rebalance storm. Responses:</p>
+<ul>
+  <li><strong>Autoscale consumers</strong> on lag (e.g. KEDA in Kubernetes) — up to the partition count.</li>
+  <li><strong>Batch</strong> downstream writes (bulk index 500 docs at a time) and pipeline Redis commands.</li>
+  <li><strong>Prioritise:</strong> separate topics or consumer pools for urgent vs bulk work (e.g. DMs and normal users' fan-out vs celebrity fan-out, which goes through the pull path anyway).</li>
+  <li><strong>Shed or degrade:</strong> skip non-essential work under extreme lag (e.g. drop analytics enrichment, sample impressions).</li>
+</ul>
+<p><strong>Backpressure</strong> is how a system tells upstream "slow down". Kafka consumers <em>pull</em>, so they're never overwhelmed — the backlog simply accumulates in the log (that's the load-levelling buffer, bounded by retention: if lag exceeds retention, data is lost — alert well before!). Producers get backpressure when the broker can't keep up: the client's buffer (<code>buffer.memory</code>) fills and <code>send()</code> blocks or fails, which the service should turn into rate limiting or 503s rather than unbounded memory growth. Push-based brokers (RabbitMQ) use consumer <em>prefetch</em> limits for the same reason.</p>
+
+<h2>10. Publishing reliably: the transactional outbox and CDC</h2>
+<p>The Post service must do two things: <strong>write the post to its database</strong> and <strong>publish <code>post.created</code> to Kafka</strong>. These are two different systems with no shared transaction — the <strong>dual-write problem</strong>:</p>
+<ul>
+  <li>DB commit succeeds, then the service crashes before publishing → the post exists but nobody fans it out or indexes it.</li>
+  <li>Publish first, then the DB write fails → consumers process a post that doesn't exist.</li>
+</ul>
+<p><strong>Transactional outbox:</strong> in the <em>same</em> local DB transaction as the business write, insert the event into an <code>outbox</code> table. A separate relay reads the outbox and publishes to Kafka, marking rows as sent. Atomicity comes from the database; delivery is at-least-once (the relay might publish twice), so consumers stay idempotent.</p>
+<pre class="ascii">
+  Post service                      Post DB (one transaction)                 Relay / CDC         Kafka
+     | BEGIN                                                                     |                  |
+     |-- INSERT INTO posts (...) ------------&gt;|                                  |                  |
+     |-- INSERT INTO outbox (event_id, topic, key, payload) --&gt;|                 |                  |
+     | COMMIT  (both rows or neither)                                            |                  |
+     |                                         | -- commit log / WAL -------&gt;   | (Debezium tails)  |
+     |                                                                           |-- publish ------&gt;|
+     |                                                                           |   post.created   |
+</pre>
+<p><strong>Change Data Capture (CDC)</strong> is the best relay: tools like <strong>Debezium</strong> (running on Kafka Connect) read the database's replication log — PostgreSQL's WAL via logical decoding, MySQL's binlog, Cassandra's commit log/CDC — and emit every committed change as a Kafka event, with no polling and no extra load on tables. Debezium has a built-in "outbox event router" that turns outbox-table inserts into clean domain events on the right topic with the right key. CDC is also how you keep caches, search indexes and data warehouses in sync with a database without the application having to remember to publish (see <a href="caching.html">Caching</a> for CDC-driven cache invalidation).</p>
+
+<h2>11. Event schemas and schema evolution</h2>
+<p>Events outlive the code that produced them: a topic may hold 7 days of messages written by three different versions of the Post service, read by a dozen consumers deployed on their own schedules. Changing an event's shape carelessly breaks consumers at 3 a.m.</p>
+<ul>
+  <li><strong>Use a schema'd binary format:</strong> <strong>Avro</strong> (schema stored separately, compact, popular in the Kafka ecosystem) or <strong>Protobuf</strong> (numbered fields, great codegen) — or JSON Schema if you must use JSON. Binary formats are 3–10× smaller than JSON and enforce types.</li>
+  <li><strong>Schema registry:</strong> a service (Confluent Schema Registry, Apicurio, AWS Glue) storing every version of each topic's schema. Producers register/lookup the schema and prefix each message with a small schema ID; consumers fetch the writer's schema by ID to decode. The registry <strong>rejects incompatible changes</strong> at deploy time.</li>
+  <li><strong>Compatibility modes:</strong> <em>backward</em> (new consumers can read old data — upgrade consumers first), <em>forward</em> (old consumers can read new data — upgrade producers first), <em>full</em> (both). <em>Transitive</em> variants check against all past versions.</li>
+</ul>
+<pre><code>// post_created.proto — evolving safely
+message PostCreated {
+  fixed64 post_id     = 1;
+  fixed64 author_id   = 2;
+  int64   created_ms  = 3;
+  repeated string media_keys = 4;
+  string  caption     = 5;
+  // v2: added — old consumers ignore unknown field 6; new consumers see "" for old events
+  string  location_id = 6;
+  // NEVER reuse a removed field's number; mark it reserved instead
+  reserved 7;  // was: string filter_name
+}</code></pre>
+<p>Safe rules of thumb: <strong>add</strong> optional fields with defaults; never change a field's type or meaning; never reuse field numbers/names; to make big changes, publish a new event version on a new topic (<code>post.created.v2</code>) and run both during migration. Include standard envelope fields in every event: <code>event_id</code> (for dedupe), <code>event_type</code>, <code>occurred_at</code>, <code>producer</code>, <code>schema_version</code>, and a trace ID (see <a href="observability.html">Observability</a>).</p>
+
+<h2>12. How Instagram uses message queues</h2>
+<p>In our architecture diagram, producer services publish <strong>domain events</strong> to Kafka and five kinds of consumers react: the Search Indexer, Feed Fan-out Workers, Media Processing Workers, the Notification Service, and Analytics &amp; ML Training.</p>
+<div class="flow">
+  <div class="fnode svc">Producer services<small>Upload, Stories, Like/Comment, Follow</small></div><div class="farrow">→<small>domain events</small></div>
+  <div class="fnode async">Kafka event bus<small>topics × partitions, RF 3</small></div><div class="farrow">→<small>consumer groups</small></div>
+  <div class="fnode async">Workers<small>search, fan-out, media, notify, analytics</small></div><div class="farrow">→</div>
+  <div class="fnode store">Elasticsearch · Redis · S3 · APNs/FCM · warehouse</div>
+</div>
+<div class="table-wrap"><table>
+  <tr><th>Topic</th><th>Partition key</th><th>Producers</th><th>Consumers (each its own group)</th></tr>
+  <tr><td><code>media.uploaded</code></td><td><code>media_id</code></td><td>Upload Service (on object-created / finalize)</td><td>Media Processing Workers (resize, transcode, thumbnails, moderation)</td></tr>
+  <tr><td><code>media.processed</code></td><td><code>post_id</code></td><td>Media Processing Workers</td><td>Upload Service (mark post PUBLISHED, then emit <code>post.created</code>)</td></tr>
+  <tr><td><code>post.created</code> / <code>post.deleted</code></td><td><code>author_id</code></td><td>Upload / Post Service (via outbox + CDC)</td><td>Feed Fan-out Workers (push to followers' Redis timelines; pull path for celebrities), Search Indexer, Notification Service (mentions/tags), Analytics &amp; ML; on delete also media cleanup</td></tr>
+  <tr><td><code>story.created</code></td><td><code>author_id</code></td><td>Stories Service</td><td>Fan-out (stories tray), Notification Service, Analytics &amp; ML</td></tr>
+  <tr><td><code>like.created</code> / <code>comment.created</code></td><td><code>post_id</code></td><td>Like &amp; Comment Service</td><td>Notification Service ("ana liked your photo", batched), counter aggregation, Analytics &amp; ML (engagement signals for ranking)</td></tr>
+  <tr><td><code>follow.created</code> / <code>follow.deleted</code></td><td><code>follower_id</code></td><td>Follow / Graph Service</td><td>Feed (backfill or remove the followee's recent posts), Notification Service ("X started following you"), Search (people suggestions), Analytics &amp; ML</td></tr>
+  <tr><td><code>user.updated</code> (compacted)</td><td><code>user_id</code></td><td>User / Auth Service</td><td>Search Indexer (username, display name), cache invalidation</td></tr>
+  <tr><td><code>client.events</code> (impressions, views)</td><td>none / <code>user_id</code></td><td>Apps via a logging endpoint</td><td>Analytics &amp; ML Training (Spark / warehouse) — often a separate, high-volume cluster</td></tr>
+</table></div>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+Instagram's early public "What Powers Instagram" post described using <strong>Gearman</strong> as a task queue for work like fan-out and notifications, and later public talks mentioned <strong>Celery with RabbitMQ</strong> for asynchronous tasks in the Django stack. Today Instagram runs on Meta's in-house infrastructure, which has its own publicly described logging and streaming systems (e.g. Scribe for log transport and LogDevice for durable distributed logs). In a design interview, <strong>Kafka</strong> is the standard, well-understood stand-in for this event bus, and the important points are the ones in this lesson: per-key ordering, consumer groups per downstream system, at-least-once with idempotent consumers, outbox/CDC for reliable publishing, and lag monitoring.</div>
+<p><strong>Why <code>author_id</code> as the key for post events?</strong> It keeps a user's create/edit/delete events in order (a delete is never processed before its create). Post events are low-rate even for celebrities, so hot partitions aren't a concern. For likes, <code>post_id</code> keeps like/unlike for a post ordered; a viral post can make one partition hot, so the like consumer aggregates in memory and writes batched counter updates.</p>
+
+<h3>12.1 Sizing example</h3>
+<p>All inputs are assumptions for practice (see <a href="capacity-estimation.html">Back-of-the-Envelope Estimation</a>):</p>
+<pre><code>Domain events per day (assume):
+  likes 1B + comments 100M + posts 100M + stories 300M + follows 50M + misc 450M ≈ 2B events/day
+  average size (Protobuf + envelope) ≈ 1 KB
+
+Throughput:
+  2B / 86,400 s ≈ 23K msg/s ≈ 23 MB/s average;  peak ×3 ≈ 70K msg/s ≈ 70 MB/s
+
+Storage (7-day retention, replication factor 3):
+  2 TB/day × 7 × 3 ≈ 42 TB  (plus ~30% headroom → ~55 TB)
+
+Broker network/disk:
+  writes: 70 MB/s × 3 replicas = 210 MB/s cluster-wide at peak
+  reads:  ~5 consumer groups × 70 MB/s = 350 MB/s (mostly from page cache)
+  → ~9 brokers with ~6 TB each gives comfortable headroom (a broker can sustain hundreds of MB/s)
+
+Partitions (driven by consumer parallelism, not bytes):
+  post.created peaks at only ~3.5K posts/s, but each post fans out to hundreds of timelines;
+  assume one fan-out worker handles 50 posts/s → 70 workers → give the topic 96–128 partitions.
+  like.created at ~35K/s peak, 2,000/s per consumer → ≥ 18 → choose 64 for headroom and hot-key spread.
+
+Separate cluster for client.events: tens of billions of impressions/day → 100s of MB/s to GB/s.</code></pre>
+
+<h2>13. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Benefits</h4><ul>
+    <li>Fast user-facing writes; slow work off the critical path</li>
+    <li>Services decoupled in code, deployment, scaling and failure</li>
+    <li>Absorbs spikes; downstream outages don't lose work</li>
+    <li>Cheap fan-out to any number of consumers</li>
+    <li>Replay to rebuild indexes, backfill features, debug</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs</h4><ul>
+    <li>Eventual consistency — users may briefly see stale results</li>
+    <li>Duplicates and reordering must be handled by consumers</li>
+    <li>Operating Kafka (brokers, partitions, upgrades) is real work</li>
+    <li>Harder debugging across async hops — need tracing</li>
+    <li>Schema governance across teams</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Non-idempotent consumers</strong> under at-least-once delivery → double notifications, inflated counters.</li>
+  <li><strong>Dual writes</strong> (DB then publish) without an outbox → lost or phantom events.</li>
+  <li><strong>Too few partitions</strong> → consumer parallelism capped; adding partitions later reshuffles keys.</li>
+  <li><strong>Hot partitions</strong> from skewed keys (a celebrity, a viral post) → one consumer lags while others idle.</li>
+  <li><strong>Poison messages blocking a partition</strong> forever — no retry limit or DLQ.</li>
+  <li><strong>Lag exceeding retention</strong> → unprocessed events deleted. Alert on lag in time, not just count.</li>
+  <li><strong>Huge messages</strong> (images in Kafka) — send references (object-storage keys), not blobs ("claim check" pattern).</li>
+  <li><strong>Using a queue for request/response</strong> where a synchronous call is simpler and the user needs the answer now.</li>
+  <li><strong>Breaking schema changes</strong> deployed without registry checks.</li>
+  <li><strong>Slow processing inside the poll loop</strong> exceeding <code>max.poll.interval.ms</code> → endless rebalances.</li>
+</ul>
+
+<h2>14. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>Model</th><th>When to use</th></tr>
+  <tr><td>Apache Kafka (Confluent, Amazon MSK)</td><td>Partitioned, replicated log</td><td>High-volume event streams, many consumers, replay, CDC, stream processing</td></tr>
+  <tr><td>Redpanda</td><td>Kafka-API-compatible log in C++, no JVM</td><td>Kafka semantics with lower latency/ops overhead</td></tr>
+  <tr><td>Apache Pulsar</td><td>Log with separate storage (BookKeeper); queues + streams</td><td>Multi-tenancy, geo-replication, very many topics</td></tr>
+  <tr><td>Amazon Kinesis Data Streams</td><td>Managed sharded log</td><td>AWS-native streaming without running Kafka</td></tr>
+  <tr><td>RabbitMQ</td><td>AMQP broker: exchanges, queues, acks</td><td>Task queues, complex routing, per-message priorities/TTL</td></tr>
+  <tr><td>Amazon SQS (+ SNS for fan-out)</td><td>Managed queue (standard / FIFO), visibility timeout, DLQ</td><td>Simple, serverless job queues; SNS → many SQS queues for pub/sub</td></tr>
+  <tr><td>Google Pub/Sub, Azure Service Bus / Event Hubs</td><td>Managed pub/sub and logs</td><td>Cloud-native equivalents on GCP/Azure</td></tr>
+  <tr><td>Redis Streams, NATS JetStream</td><td>Lightweight streams/queues</td><td>Low-latency messaging, smaller scale, simple ops</td></tr>
+  <tr><td>Celery, Sidekiq, BullMQ</td><td>Task-queue frameworks on RabbitMQ/Redis</td><td>Background jobs in Python/Ruby/Node apps</td></tr>
+  <tr><td>Debezium (Kafka Connect)</td><td>CDC from database logs to Kafka</td><td>Outbox relay, syncing search/caches/warehouse from DBs</td></tr>
+  <tr><td>Confluent Schema Registry, Apicurio</td><td>Schema storage + compatibility checks</td><td>Governing Avro/Protobuf/JSON Schema events</td></tr>
+</table></div>
+
+<h2>15. Interview corner</h2>
+<details class="qa"><summary>Why use Kafka rather than RabbitMQ for Instagram's event bus?</summary>
+<p>The bus carries billions of events per day consumed by many independent systems (fan-out, search, notifications, analytics, ML). Kafka's partitioned log gives very high throughput through sequential I/O and batching, lets any number of consumer groups read the same events independently, retains events so we can replay to rebuild an index or backfill a new consumer, and guarantees ordering per key. RabbitMQ shines for task queues with rich routing and per-message acks/priorities but deletes messages once consumed and would require duplicating messages into a queue per consumer. Discrete jobs (send an email) could still use a task queue.</p></details>
+<details class="qa"><summary>How do you ensure a "like" followed by an "unlike" on the same post is processed in the right order?</summary>
+<p>Key both events by <code>post_id</code> (or <code>(post_id, user_id)</code>), so they go to the same partition, which is strictly ordered, and are processed by a single consumer in that group sequentially. Additionally make processing version-aware (each event carries a timestamp/version; apply only if newer than stored state), which protects against retries and DLQ redrives that could reorder.</p></details>
+<details class="qa"><summary>The Post service writes to Cassandra and then publishes to Kafka. What can go wrong and how do you fix it?</summary>
+<p>Dual-write failure: a crash between the two leaves a post that's never fanned out/indexed, or publishing first can announce a post that failed to save. Use the transactional outbox: write the post and an outbox record atomically, and have a relay (ideally CDC such as Debezium reading the commit log) publish it to Kafka. Delivery is at-least-once, so consumers dedupe by event_id or are naturally idempotent. (With Cassandra, a logged batch to both tables or Cassandra CDC can play the outbox role.)</p></details>
+<details class="qa"><summary>Explain at-least-once vs exactly-once and how you'd make the fan-out worker safe.</summary>
+<p>At-least-once: commit offsets after processing, so crashes cause redelivery and duplicates but no loss. Exactly-once in Kafka uses idempotent producers plus transactions to atomically write outputs and commit offsets, but only within Kafka. The fan-out worker writes to Redis, so it's at-least-once; it's made idempotent by using sorted-set <code>ZADD</code> with the post ID as member (re-adding is a no-op) and bounded trimming, so redelivery doesn't create duplicate feed entries.</p></details>
+<details class="qa"><summary>Consumer lag on the search-indexer group is growing. Walk through diagnosis and fixes.</summary>
+<p>Check whether lag is on all partitions (capacity problem: produce rate up, or Elasticsearch slow — look at bulk latency, rejections, GC) or one partition (hot key or poison message — check that consumer's errors/retries). Look for rebalance storms (poll interval exceeded). Fixes: scale consumers up to partition count; increase bulk batch size; fix/DLQ poison messages; add Elasticsearch capacity; temporarily lower priority work. Long-term: more partitions (new topic), better key distribution, autoscaling on lag, and alerts on lag age well below retention.</p></details>
+<details class="qa"><summary>How do you choose the number of partitions for a topic?</summary>
+<p>Take the max of (peak throughput ÷ per-partition throughput, typically ~5–10+ MB/s) and (peak message rate ÷ throughput of one consumer instance) — consumer parallelism is usually the binding constraint. Add headroom (2–3×) because increasing partitions later changes key mapping. Don't go wild: each partition costs broker memory, file handles and leader-election time; thousands per cluster is fine, millions is not.</p></details>
+<details class="qa"><summary>How do you evolve an event schema without breaking consumers?</summary>
+<p>Use Avro/Protobuf with a schema registry enforcing a compatibility mode (usually backward or full). Only add optional fields with defaults, never change types or reuse field numbers, and deprecate fields by reserving them. Upgrade consumers before producers under backward compatibility. For breaking changes, publish to a new versioned topic and dual-publish during migration. Every event carries an envelope with event_id, type, version and timestamps.</p></details>
+
+<h2>16. Check your understanding</h2>
+<details class="quiz"><summary>A topic has 12 partitions. The fan-out consumer group runs 20 instances. How many are doing work? What if a second group with 3 instances subscribes?</summary>
+<p>Only <strong>12</strong> of the 20 get partitions; 8 sit idle as hot standbys. The second group independently receives <em>all</em> messages, with its 3 consumers each owning 4 partitions. Groups don't affect each other.</p></details>
+<details class="quiz"><summary>Producer uses <code>acks=1</code>. The leader acknowledges a message and crashes before followers copy it. What happens?</summary>
+<p>A follower becomes leader without that message — it's <strong>lost</strong>, although the producer was told it succeeded. With <code>acks=all</code> and <code>min.insync.replicas=2</code>, the ack would only come after at least two replicas had it.</p></details>
+<details class="quiz"><summary>Your consumer commits offsets automatically every 5 s, and processes messages in a background thread pool. It crashes. What semantics do you have?</summary>
+<p>Potentially <strong>at-most-once</strong> for some messages (offsets committed for messages not yet processed by the pool → lost) and at-least-once for others. To get at-least-once, commit only offsets whose messages (and all before them in that partition) are fully processed.</p></details>
+<details class="quiz"><summary>Log end offset = 5,000,000; committed = 4,400,000; produce 3,000 msg/s; consume 4,000 msg/s. How long until caught up?</summary>
+<p>Lag 600,000; net drain 1,000 msg/s → <strong>600 s (10 minutes)</strong>. If the produce rate rises above 4,000 msg/s, lag grows without bound until consumers scale out.</p></details>
+<details class="quiz"><summary>Which topic should use log compaction: <code>like.created</code>, <code>user.profile</code>, <code>client.events</code>?</summary>
+<p><strong><code>user.profile</code></strong> — only the latest state per user matters, and new services can bootstrap from it. Likes and client events are facts/streams where every event matters (or only recent history), so they use time-based retention.</p></details>
+<details class="quiz"><summary>Why should a fan-out event carry the post ID and media keys rather than the image bytes?</summary>
+<p>Kafka is optimised for small messages (default max ~1 MB); multi-MB blobs hurt throughput, replication and page cache for everyone. The bytes already live in object storage; events carry references (the "claim check" pattern).</p></details>
+<details class="quiz"><summary>A message fails deserialization every time. With no DLQ, what happens to the partition, and what should happen?</summary>
+<p>The consumer retries forever (or crashes and restarts at the same offset), <strong>blocking every later message in that partition</strong> — lag grows for that partition only. It should be recognised as a permanent error, sent to a DLQ with error metadata, the offset committed, and an alert raised.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Go async for work the user doesn't need to wait for: you get <strong>decoupling, buffering, retries and fan-out</strong> at the price of eventual consistency.</li>
+    <li><strong>Queues</strong> delete on ack and distribute work; <strong>logs</strong> (Kafka) retain ordered events that many groups read by offset and can replay.</li>
+    <li>Kafka scales via <strong>partitions</strong>, stays durable via <strong>replication + ISR + acks=all</strong>, and orders <strong>per partition</strong> — choose keys deliberately.</li>
+    <li>Assume <strong>at-least-once</strong>; build <strong>idempotent consumers</strong>, retry topics and <strong>DLQs</strong>; watch <strong>consumer lag</strong>.</li>
+    <li>Publish reliably with the <strong>transactional outbox + CDC</strong>, and evolve events with <strong>Avro/Protobuf + a schema registry</strong>.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="news-feed.html">News Feed</a> — the fan-out workers consuming <code>post.created</code></li>
+  <li><a href="media-processing.html">Media Processing</a> — the worker pools behind <code>media.uploaded</code></li>
+  <li><a href="notifications.html">Notification System</a> — consuming likes, comments and follows to send pushes</li>
+  <li><a href="search.html">Search</a> — keeping Elasticsearch in sync from events</li>
+  <li><a href="analytics-ml.html">Analytics &amp; ML</a> — stream and batch processing of the event firehose</li>
+  <li><a href="microservices.html">Microservices</a> — sync vs async communication and data ownership</li>
+  <li><a href="resilience-patterns.html">Resilience Patterns</a> — retries, backoff and idempotency</li>
+  <li><a href="replication.html">Replication</a> — leader/follower and ISR ideas in general</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

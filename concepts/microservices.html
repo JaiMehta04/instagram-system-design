@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Microservices &amp; Stateless Services — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="microservices">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>A <strong>monolith</strong> is one deployable program; a <strong>modular monolith</strong> is one deployable with strict internal boundaries; <strong>microservices</strong> are many small, independently deployable programs that each own one business capability and its data.</li>
+    <li>Instagram famously started as — and, per its public engineering talks, still largely runs as — a very large <strong>Python/Django monolith</strong>. Read the diagram's "services" as <strong>logical domains</strong>; some are separate deployables, many are modules inside one big codebase.</li>
+    <li>Application servers must be <strong>stateless</strong>: any instance can serve any request because all state lives in databases, caches and session stores. That is what makes horizontal scaling, autoscaling and painless deploys possible.</li>
+    <li>Once you split, you inherit distributed-systems problems: <strong>service discovery</strong>, <strong>sync vs async communication</strong>, <strong>data ownership</strong>, and <strong>no cross-service ACID transactions</strong> — solved with <strong>sagas</strong> and the <strong>transactional outbox</strong>, not 2PC.</li>
+    <li>Operating many services needs <strong>containers, Kubernetes, autoscaling, canary/blue-green deploys, feature flags</strong> and often a <strong>service mesh</strong>. Split only when team size and scaling needs justify the cost (Conway's law).</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why split a system into services at all?</h2>
+<p>Picture Instagram in October 2010: a handful of engineers, one Django application, one PostgreSQL database. Every feature — sign-up, photo upload, the feed, likes, comments, follows — lived in <em>one</em> codebase and ran in <em>one</em> process type. That is a <strong>monolith</strong>, and it was exactly the right choice: one thing to build, test, deploy and debug.</p>
+<p>Now fast-forward to a company with thousands of engineers and 2+ billion monthly users. New problems appear that have nothing to do with any single feature:</p>
+<ul>
+  <li><strong>Team coupling.</strong> Hundreds of engineers commit to one codebase daily; a bug in comment ranking can block the Stories team's deploy.</li>
+  <li><strong>Uneven scaling.</strong> The <a href="news-feed.html">feed</a> is read tens of thousands of times per second; "change password" a few times a second. A monolith scales <em>everything together</em>.</li>
+  <li><strong>Blast radius.</strong> A memory leak in the upload path can crash the same process that serves likes.</li>
+  <li><strong>Technology fit.</strong> A <a href="direct-messaging.html">messaging</a> gateway holding millions of WebSocket connections wants a different runtime than a CRUD API in Python.</li>
+</ul>
+<p>Microservices are one answer: split the system along business boundaries into separately deployable services, each owned by one team. But — the most important sentence in this lesson — <strong>splitting trades code complexity for operational and distributed-systems complexity</strong>. Function calls become network calls that can time out; one database transaction becomes several databases that can disagree.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  A monolith is a <strong>food truck</strong>: one cook, one small kitchen — fast and easy to coordinate until the queue gets enormous. Microservices are a <strong>restaurant kitchen with stations</strong> (grill, pastry, salads), each with its own chef and fridge; you can add a grill chef without hiring a pastry chef. But now you need tickets (messages), a pass where dishes are assembled (API composition), a head chef calling orders (orchestration), and rules for when the steak burns after the salad is plated (compensation). A <em>modular monolith</em> is a well-organised food truck: one kitchen, every tool in its labelled place.
+</div>
+
+<h2>2. Monolith vs modular monolith vs microservices</h2>
+
+<h3>2.1 Definitions</h3>
+<ul>
+  <li><strong>Monolith</strong> — a single deployable unit (one Django project, one image) containing all features, usually over one shared database. The defining trait: <em>built, deployed and scaled as one</em>.</li>
+  <li><strong>Modular monolith</strong> — still one deployable, but divided into <strong>modules</strong> with explicit interfaces (<code>feed.api</code>, <code>graph.api</code>), enforced import rules and per-module table ownership. Calls stay in-process, yet a module could later be extracted.</li>
+  <li><strong>Microservices</strong> — many <strong>independently deployable</strong> services, each owning one <em>bounded context</em> (a business capability with its own language and data, e.g. "social graph") and its own datastore, communicating only via APIs (REST, gRPC) or events (Kafka).</li>
+</ul>
+
+<div class="diagram">
+<svg viewBox="0 0 840 320" width="840" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-ms-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="700" text-anchor="middle">
+    <text x="140" y="22">Monolith</text>
+    <text x="420" y="22">Modular monolith</text>
+    <text x="700" y="22">Microservices</text>
+  </g>
+  <!-- Monolith -->
+  <rect x="20" y="35" width="240" height="175" rx="10" fill="#e8f5e9" stroke="#2e7d32"/>
+  <g text-anchor="middle">
+    <rect x="35" y="50" width="95" height="30" rx="5" fill="#ffffff" stroke="#2e7d32" stroke-dasharray="3 2"/><text x="82" y="70">users</text>
+    <rect x="150" y="50" width="95" height="30" rx="5" fill="#ffffff" stroke="#2e7d32" stroke-dasharray="3 2"/><text x="197" y="70">posts</text>
+    <rect x="35" y="100" width="95" height="30" rx="5" fill="#ffffff" stroke="#2e7d32" stroke-dasharray="3 2"/><text x="82" y="120">feed</text>
+    <rect x="150" y="100" width="95" height="30" rx="5" fill="#ffffff" stroke="#2e7d32" stroke-dasharray="3 2"/><text x="197" y="120">likes</text>
+    <text x="140" y="160" font-size="11.5" fill="#555">code freely calls code;</text>
+    <text x="140" y="176" font-size="11.5" fill="#555">any module reads any table</text>
+    <text x="140" y="198" font-size="11.5" font-weight="600">1 deployable</text>
+  </g>
+  <g stroke="#2e7d32" stroke-width="1" fill="none" opacity="0.7">
+    <path d="M130,65 L150,115"/><path d="M130,115 L150,65"/><path d="M82,80 L82,100"/><path d="M197,80 L197,100"/>
+  </g>
+  <rect x="60" y="250" width="160" height="45" rx="8" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="140" y="270" text-anchor="middle" font-weight="600">One shared DB</text>
+  <text x="140" y="287" text-anchor="middle" font-size="11.5">all tables, all modules</text>
+  <!-- Modular monolith -->
+  <rect x="300" y="35" width="240" height="175" rx="10" fill="#e8f5e9" stroke="#2e7d32"/>
+  <g text-anchor="middle">
+    <rect x="315" y="50" width="95" height="30" rx="5" fill="#ffffff" stroke="#2e7d32" stroke-width="2"/><text x="362" y="70">users</text>
+    <rect x="430" y="50" width="95" height="30" rx="5" fill="#ffffff" stroke="#2e7d32" stroke-width="2"/><text x="477" y="70">posts</text>
+    <rect x="315" y="100" width="95" height="30" rx="5" fill="#ffffff" stroke="#2e7d32" stroke-width="2"/><text x="362" y="120">feed</text>
+    <rect x="430" y="100" width="95" height="30" rx="5" fill="#ffffff" stroke="#2e7d32" stroke-width="2"/><text x="477" y="120">likes</text>
+    <text x="420" y="160" font-size="11.5" fill="#555">calls only via module APIs</text>
+    <text x="420" y="176" font-size="11.5" fill="#555">(in-process, no network)</text>
+    <text x="420" y="198" font-size="11.5" font-weight="600">1 deployable</text>
+  </g>
+  <g stroke="#2e7d32" stroke-width="1.3" fill="none" marker-end="url(#ar-ms-1)">
+    <path d="M362,100 L362,82"/><path d="M410,115 L428,115"/>
+  </g>
+  <rect x="320" y="250" width="200" height="45" rx="8" fill="#fff8e1" stroke="#f9a825"/>
+  <line x1="370" y1="250" x2="370" y2="295" stroke="#f9a825"/><line x1="420" y1="250" x2="420" y2="295" stroke="#f9a825"/><line x1="470" y1="250" x2="470" y2="295" stroke="#f9a825"/>
+  <g text-anchor="middle" font-size="11"><text x="345" y="277">users</text><text x="395" y="277">posts</text><text x="445" y="277">feed</text><text x="495" y="277">likes</text></g>
+  <text x="420" y="312" text-anchor="middle" font-size="11.5" fill="#555">one DB, schema per module</text>
+  <!-- Microservices -->
+  <g text-anchor="middle">
+    <rect x="580" y="45" width="105" height="34" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="632" y="67">User svc</text>
+    <rect x="715" y="45" width="105" height="34" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="767" y="67">Post svc</text>
+    <rect x="580" y="150" width="105" height="34" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="632" y="172">Feed svc</text>
+    <rect x="715" y="150" width="105" height="34" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="767" y="172">Like svc</text>
+    <rect x="590" y="95" width="85" height="26" rx="5" fill="#fff8e1" stroke="#f9a825"/><text x="632" y="113" font-size="11.5">Postgres</text>
+    <rect x="725" y="95" width="85" height="26" rx="5" fill="#fff8e1" stroke="#f9a825"/><text x="767" y="113" font-size="11.5">Cassandra</text>
+    <rect x="590" y="200" width="85" height="26" rx="5" fill="#fff8e1" stroke="#f9a825"/><text x="632" y="218" font-size="11.5">Redis</text>
+    <rect x="725" y="200" width="85" height="26" rx="5" fill="#fff8e1" stroke="#f9a825"/><text x="767" y="218" font-size="11.5">Cassandra</text>
+    <rect x="600" y="255" width="200" height="34" rx="6" fill="#f3e5f5" stroke="#6a1b9a"/><text x="700" y="277">Kafka (events)</text>
+    <text x="700" y="312" font-size="11.5" fill="#555">N deployables, DB per service</text>
+  </g>
+  <g stroke="#555" stroke-width="1.2" fill="none" marker-end="url(#ar-ms-1)">
+    <path d="M632,79 L632,93"/><path d="M767,79 L767,93"/><path d="M632,184 L632,198"/><path d="M767,184 L767,198"/>
+    <path d="M685,167 L713,167"/>
+    <path d="M820,62 C835,120 835,230 802,262" stroke-dasharray="4 3"/>
+  </g>
+</svg>
+<div class="caption">Same four domains, three packaging choices. The difference is where the boundaries are enforced: nowhere (monolith), by code rules (modular monolith), or by the network and separate databases (microservices).</div>
+</div>
+
+<h3>2.2 Side-by-side comparison</h3>
+<div class="table-wrap"><table>
+  <tr><th>Dimension</th><th>Monolith</th><th>Modular monolith</th><th>Microservices</th></tr>
+  <tr><td><b>Deployable units</b></td><td>1</td><td>1</td><td>Tens to thousands</td></tr>
+  <tr><td><b>Calls between features</b></td><td>In-process function calls (ns–µs)</td><td>In-process calls through module interfaces</td><td>Network calls (≈0.5–5 ms each), can fail or time out</td></tr>
+  <tr><td><b>Data</b></td><td>One shared schema; joins everywhere</td><td>One DB, but tables owned per module; cross-module joins discouraged</td><td>Database per service; no cross-service joins</td></tr>
+  <tr><td><b>Transactions</b></td><td>Easy: one ACID transaction</td><td>Easy (same DB), but discouraged across modules</td><td>No cross-service ACID; use sagas, outbox, idempotency</td></tr>
+  <tr><td><b>Scaling</b></td><td>Scale everything together</td><td>Scale everything together (can route endpoint pools separately)</td><td>Scale each service independently</td></tr>
+  <tr><td><b>Team autonomy</b></td><td>Low — shared release train</td><td>Medium — clear ownership, shared release</td><td>High — independent releases</td></tr>
+  <tr><td><b>Failure isolation</b></td><td>Poor — one bad path can crash the process</td><td>Poor to medium</td><td>Good, if timeouts and circuit breakers are used</td></tr>
+  <tr><td><b>Operational cost</b></td><td>Lowest</td><td>Low</td><td>High: discovery, tracing, mesh, many pipelines</td></tr>
+  <tr><td><b>Best for</b></td><td>Start-ups, small teams, unclear domains</td><td>Most companies, most of the time</td><td>Large orgs with many teams and very different scaling needs</td></tr>
+</table></div>
+
+<div class="callout instagram"><span class="callout-title">📸 Honest note about Instagram</span>
+Instagram's server began as a <strong>Django (Python) monolith</strong>, and Instagram engineers have publicly described it — in talks and blog posts about their Python 3 migration, static analysis tooling and the Cinder CPython fork — as a monolith with <strong>millions of lines of Python</strong>, deployed continuously many times a day. It is reasonably described as one of the largest Django deployments in the world. So when the architecture diagram on the home page shows "Upload Service", "Stories Service", "Like &amp; Comment Service" and so on, read them as <strong>logical components (domains)</strong>. Some genuinely are separate systems — real-time messaging, media processing, search indexing, notifications and much of Meta's shared infrastructure (e.g. the TAO graph store and caches) run as separate services — while many product features are modules inside the big web tier. That hybrid is extremely common in real companies, and it is a perfectly good answer in an interview as long as you can explain the trade-offs.</div>
+
+<h3>2.3 Why a monolith scaled so far for Instagram</h3>
+<p>The key insight: <strong>"monolith" describes how code is packaged, not how it scales</strong>. A stateless monolith can be copied onto 10,000 servers behind a <a href="load-balancer.html">load balancer</a> just as easily as a microservice. What it can't easily do is let 200 teams deploy independently — Instagram compensated with tooling (continuous deployment with canaries, code ownership, static analysis enforcing boundaries, feature flags). Meanwhile the <em>data</em> tier was split aggressively: <a href="sharding.html">sharded PostgreSQL</a>, <a href="databases.html">Cassandra</a>, <a href="caching.html">Memcached/Redis</a>. Scale comes mostly from the data layer and async workers.</p>
+
+<h2>3. Benefits and costs of microservices</h2>
+
+<h3>3.1 Benefits</h3>
+<div class="cards">
+  <div class="card"><h4>🚀 Independent deployment</h4><p>Stories ships a fix at 3 pm without waiting for Feed's release. Smaller deploys, faster rollback.</p></div>
+  <div class="card"><h4>📈 Independent scaling</h4><p>3,000 instances of the feed read path, 50 of account settings; instance types per workload.</p></div>
+  <div class="card"><h4>🧯 Fault isolation</h4><p>Search down? The feed still loads (only with timeouts, circuit breakers and fallbacks).</p></div>
+  <div class="card"><h4>🧰 Technology freedom</h4><p>Each service picks its runtime and datastore.</p></div>
+  <div class="card"><h4>👥 Ownership</h4><p>"You build it, you run it": code, data, dashboards and on-call per team.</p></div>
+</div>
+
+<h3>3.2 Costs (the part people underestimate)</h3>
+<ul>
+  <li><strong>Network unreliability.</strong> The <em>fallacies of distributed computing</em> — "the network is reliable", "latency is zero", "bandwidth is infinite", "topology doesn't change" — are all false. Every call needs a timeout, retry policy and fallback (see <a href="resilience-patterns.html">Resilience patterns</a>).</li>
+  <li><strong>Availability multiplies down.</strong> If a request synchronously needs 10 services that are each 99.9% available, the request succeeds only <code>0.999<sup>10</sup> ≈ 99.0%</code> of the time — about <strong>7 hours of failure per month</strong> instead of 43 minutes.</li>
+  <li><strong>Tail latency amplifies.</strong> If each of 10 parallel downstream calls is slow 1% of the time, the chance that <em>at least one</em> is slow is <code>1 − 0.99<sup>10</sup> ≈ 9.6%</code>. Your p99 becomes your p90.</li>
+  <li><strong>No more cross-feature transactions or joins.</strong> Consistency across services is eventual; you need sagas, outboxes and idempotent consumers (sections 8–9).</li>
+  <li><strong>Operational overhead and harder debugging.</strong> Every service needs CI/CD, dashboards, on-call and a versioned API; one request may touch 30 services, so you need <a href="observability.html">distributed tracing</a>.</li>
+</ul>
+<div class="callout warn"><span class="callout-title">⚠️ The distributed monolith</span>
+The worst outcome: services split over the network that still must deploy together, share a database, or call each other in long synchronous chains — all the costs, none of the benefits. Symptom: "we need to release A, B and C together".</div>
+
+<h2>4. Stateless services</h2>
+
+<h3>4.1 What "stateless" means</h3>
+<p>A service is <strong>stateless</strong> when an instance keeps <em>no data between requests that another instance would need</em>. Every request carries (or can look up) everything required to process it: an auth token identifying the user, the IDs it operates on, and access to shared datastores. The instance's memory and local disk are scratch space only — losing the instance loses nothing important.</p>
+<p>By contrast, a <strong>stateful</strong> server keeps something meaningful locally: a user's login session in memory, an uploaded file on local disk, a counter it increments, an open WebSocket connection, a partition of a database.</p>
+
+<h3>4.2 Why statelessness matters so much</h3>
+<ol>
+  <li><strong>Horizontal scaling is trivial.</strong> Need more capacity? Start 200 more identical instances and register them with the load balancer. No data needs to move.</li>
+  <li><strong>Any instance can serve any request.</strong> The load balancer can use simple round-robin or least-connections — no <em>sticky sessions</em> needed. Load spreads evenly.</li>
+  <li><strong>Failure is cheap.</strong> If an instance dies, the load balancer's health check removes it and in-flight requests are retried elsewhere. Nobody loses their login.</li>
+  <li><strong>Deploys and autoscaling are painless.</strong> Rolling deploys replace instances one batch at a time; autoscalers add and remove instances at will (section 10).</li>
+</ol>
+
+<h3>4.3 Where the state goes instead</h3>
+<p>State doesn't disappear — it is <em>pushed down</em> into systems designed to hold it durably and share it:</p>
+<div class="diagram">
+<svg viewBox="0 0 820 300" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-ms-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g text-anchor="middle">
+    <rect x="20" y="125" width="110" height="44" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="75" y="145" font-weight="600">📱 Clients</text><text x="75" y="161" font-size="11">token in header</text>
+    <rect x="170" y="125" width="120" height="44" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="230" y="145" font-weight="600">Load balancer</text><text x="230" y="161" font-size="11">round-robin</text>
+    <rect x="340" y="40" width="150" height="44" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="415" y="60" font-weight="600">App instance 1</text><text x="415" y="76" font-size="11">no local state</text>
+    <rect x="340" y="125" width="150" height="44" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="415" y="145" font-weight="600">App instance 2</text><text x="415" y="161" font-size="11">no local state</text>
+    <rect x="340" y="210" width="150" height="44" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="415" y="230" font-weight="600">App instance N</text><text x="415" y="246" font-size="11">no local state</text>
+    <rect x="560" y="20" width="240" height="44" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="680" y="40" font-weight="600">Session / token store</text><text x="680" y="56" font-size="11">Redis or signed JWT (no store)</text>
+    <rect x="560" y="85" width="240" height="44" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="680" y="105" font-weight="600">Cache (Redis / Memcached)</text><text x="680" y="121" font-size="11">timelines, counters, hot objects</text>
+    <rect x="560" y="150" width="240" height="44" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="680" y="170" font-weight="600">Databases</text><text x="680" y="186" font-size="11">PostgreSQL, Cassandra (truth)</text>
+    <rect x="560" y="215" width="240" height="44" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="680" y="235" font-weight="600">Object storage (S3)</text><text x="680" y="251" font-size="11">uploaded photos and videos</text>
+  </g>
+  <g stroke="#555" stroke-width="1.4" fill="none" marker-end="url(#ar-ms-2)">
+    <path d="M130,147 L168,147"/>
+    <path d="M290,140 L338,65"/><path d="M290,147 L338,147"/><path d="M290,155 L338,230"/>
+    <path d="M490,147 L558,45"/><path d="M490,147 L558,107"/><path d="M490,147 L558,172"/><path d="M490,147 L558,235"/>
+  </g>
+</svg>
+<div class="caption">Stateless app instances are interchangeable. All durable or shared state lives below them, in stores built for it.</div>
+</div>
+<div class="table-wrap"><table>
+  <tr><th>Kind of state</th><th>Naive (stateful) place</th><th>Where it should live</th><th>Instagram example</th></tr>
+  <tr><td>Login session</td><td>In-memory session dict on one server</td><td>Signed token (JWT) carried by the client, or a session ID looked up in a shared store (Redis/DB)</td><td>Auth token validated at the <a href="api-gateway.html">API gateway</a> / <a href="authentication.html">Auth service</a></td></tr>
+  <tr><td>Business data</td><td>Local SQLite or files</td><td>Databases (source of truth)</td><td>Users in sharded PostgreSQL; posts in Cassandra</td></tr>
+  <tr><td>Hot derived data</td><td>Per-process dictionaries</td><td>Shared cache (Redis/Memcached); small per-process caches are OK as an <em>optimisation</em> only</td><td>Feed timelines and counters in Redis</td></tr>
+  <tr><td>Uploaded files</td><td>Local disk of the server that received them</td><td>Object storage</td><td>Photos uploaded straight to S3 via <a href="media-upload.html">pre-signed URLs</a></td></tr>
+  <tr><td>Background work</td><td>Threads inside the web process</td><td>Durable queue/log + workers</td><td>Kafka → fan-out, media processing</td></tr>
+  <tr><td>Long-lived connections</td><td>—</td><td>A dedicated, deliberately stateful connection tier with a registry mapping user → gateway</td><td>DM WebSocket gateways</td></tr>
+</table></div>
+<div class="callout tip"><span class="callout-title">💡 Stateless ≠ no memory at all</span>
+Stateless services can keep in-memory <strong>caches</strong> (a 30-second LRU of profiles) or warm connection pools — losing them must only cost performance, never correctness. Inherently stateful components (databases, caches, WebSocket gateways) are concentrated into a few well-managed tiers.</div>
+
+<h3>4.4 Sticky sessions — the tempting shortcut</h3>
+<p>A load balancer can pin a user to one instance ("session affinity"). It lets stateful code limp along, but load becomes uneven and scale-in or deploys log people out. Use stickiness only for <em>performance</em>, never correctness. See <a href="load-balancer.html">Load balancing</a>.</p>
+
+<h2>5. Service discovery: how does service A find service B?</h2>
+<p>Instances change IPs every minute under autoscaling. <strong>Service discovery</strong> maps a logical name ("<code>graph-service</code>") to the current set of healthy addresses.</p>
+
+<h3>5.1 The service registry</h3>
+<p>A <strong>service registry</strong> is a highly available database of "service name → instances (IP, port, health)". Instances get into it by:</p>
+<ul>
+  <li><strong>Self-registration</strong>: the instance registers on start-up and sends <em>heartbeats</em>; if they stop, the entry expires after a TTL (ZooKeeper's <em>ephemeral znodes</em> vanish when the session dies).</li>
+  <li><strong>Third-party registration</strong>: the platform does it — Kubernetes tracks which pods pass their <em>readiness probes</em> and updates each Service's endpoints.</li>
+</ul>
+<p>Because everything depends on it, the registry runs as a 3- or 5-node consensus cluster: <strong>ZooKeeper</strong> (ZAB; ephemeral nodes + watches, also leader election), <strong>etcd</strong> (Raft; the brain of Kubernetes) or <strong>Consul</strong> (Raft; built-in health checks, DNS interface, multi-DC). Netflix <strong>Eureka</strong> deliberately chooses availability, serving possibly-stale lists during partitions. Clients cache the last known list so a registry outage doesn't instantly break traffic.</p>
+
+<h3>5.2 Client-side vs server-side discovery</h3>
+<pre class="ascii">
+CLIENT-SIDE DISCOVERY                         SERVER-SIDE DISCOVERY
+
+ Feed svc                Registry              Feed svc
+   |  (1) where is graph-svc?  |                 |  (1) GET http://graph-svc/...
+   |-------------------------->|                 v
+   |  (2) [10.0.1.5, 10.0.1.9, |            +-----------+   watches   +----------+
+   |       10.0.2.3]           |            | LB / VIP  |&lt;------------| Registry |
+   |&lt;--------------------------|            | (or K8s   |             +----------+
+   |  (3) client picks one     |            |  Service) |
+   |      (round robin / P2C)  |            +-----------+
+   |---------> 10.0.1.9                           |  (2) forwards to a healthy instance
+                                                  v
+                                             10.0.1.9
+</pre>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Client-side discovery</th><th>Server-side discovery</th></tr>
+  <tr><td><b>Who chooses the instance</b></td><td>The calling service, using a smart client library</td><td>A load balancer / proxy in the middle</td></tr>
+  <tr><td><b>Extra network hop</b></td><td>None — direct instance-to-instance</td><td>Yes (through the LB), unless the proxy runs as a local sidecar</td></tr>
+  <tr><td><b>Load-balancing smarts</b></td><td>Rich: least-outstanding-requests, power-of-two-choices, zone awareness</td><td>Whatever the LB supports</td></tr>
+  <tr><td><b>Language burden</b></td><td>Every language needs the client library (Java, Python, Go…)</td><td>Clients stay dumb; just call a hostname</td></tr>
+  <tr><td><b>Examples</b></td><td>Netflix Eureka + Ribbon, gRPC client-side LB, Finagle</td><td>AWS ALB/NLB, Kubernetes Service (kube-proxy), Envoy/Istio sidecars</td></tr>
+</table></div>
+<p>A <strong>service mesh</strong> (section 11) is effectively a hybrid: the "client" is a local sidecar proxy, so the application calls <code>localhost</code>, while the sidecar does smart client-side balancing using endpoint lists pushed from a control plane.</p>
+
+<h3>5.3 DNS-based discovery</h3>
+<p>The simplest registry is <a href="dns.html">DNS</a>: <code>graph-service.prod.internal</code> resolves to healthy instances (A records; <strong>SRV records</strong> add ports and weights). Consul exposes a DNS interface; Kubernetes' CoreDNS resolves <code>graph.default.svc.cluster.local</code> to a Service VIP. It works in every language for free, but resolvers cache answers for the TTL (some ignore it), so removed instances keep getting traffic, and DNS carries no load information. Hence DNS usually finds a <em>load balancer or VIP</em> that does health-aware balancing.</p>
+
+<h2>6. How services talk: synchronous vs asynchronous</h2>
+
+<h3>6.1 Synchronous request/response (REST, gRPC)</h3>
+<p>The caller sends a request and <strong>waits</strong> — needed when it can't continue without the result (the <a href="news-feed.html">Feed service</a> needs post metadata and counts to build its response).</p>
+<ul>
+  <li><strong>REST over HTTP/JSON</strong> — universal and easy to debug; verbose, informal schemas.</li>
+  <li><strong>gRPC</strong> — HTTP/2 + Protocol Buffers: compact binary, generated stubs, strict evolvable schemas, streaming, deadline propagation. The default for internal calls at scale (Meta's equivalent is Thrift).</li>
+</ul>
+<p>See <a href="api-design.html">API design</a>. Every sync call needs a <strong>timeout</strong> (ideally a shrinking deadline budget), bounded <strong>retries with backoff and jitter</strong>, and a <strong>circuit breaker</strong> — otherwise one slow service exhausts upstream thread pools (cascading failure).</p>
+
+<h3>6.2 Asynchronous messaging (events)</h3>
+<p>The producer publishes to a broker (Kafka, RabbitMQ, SQS) and <strong>does not wait</strong>. <strong>Commands/jobs</strong> ("resize this photo") go to a queue for one worker; <strong>domain events</strong> (<code>PostCreated{post_id: 42, author_id: 7}</code>) are facts about the past that <em>any</em> number of unknown consumers can react to.</p>
+<p>That's the Instagram diagram: <code>PostCreated</code> goes to Kafka and fan-out workers, the search indexer, notifications and analytics consume it on their own schedule. If the indexer is down for 10 minutes, posts still publish; it catches up from the log. See <a href="message-queues.html">Message queues &amp; Kafka</a>.</p>
+
+<h3>6.3 Choosing between them</h3>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Synchronous (REST/gRPC)</th><th>Asynchronous (events/queues)</th></tr>
+  <tr><td><b>Coupling</b></td><td>Temporal: both must be up at once</td><td>Decoupled in time; broker buffers</td></tr>
+  <tr><td><b>User latency</b></td><td>Adds up along the chain</td><td>Fast "accepted"; work happens later</td></tr>
+  <tr><td><b>Consistency</b></td><td>Result visible immediately</td><td>Eventual (seconds)</td></tr>
+  <tr><td><b>Failures</b></td><td>Timeouts, retries, circuit breakers</td><td>Redelivery, dead-letter queues, idempotent consumers</td></tr>
+  <tr><td><b>Load spikes</b></td><td>Hit every downstream immediately</td><td>Queue absorbs them (load levelling)</td></tr>
+  <tr><td><b>Instagram</b></td><td>Feed read → post metadata, counts, "has viewer liked"</td><td>PostCreated → fan-out, search, notifications; LikeCreated → notifications</td></tr>
+</table></div>
+<div class="callout tip"><span class="callout-title">💡 Rule of thumb</span>
+<strong>Sync</strong> for <em>queries</em> the user waits on, with shallow chains (parallel fan-out, ≤2–3 hops). <strong>Async events</strong> for <em>side effects</em> of a write. "Post a photo" synchronously does only the minimum (validate, store metadata).</div>
+
+<h2>7. Data ownership: database per service</h2>
+
+<h3>7.1 The rule</h3>
+<p><strong>Each service owns its data exclusively.</strong> Only the Graph service touches follow tables; only the Like service touches likes. Others go through the owner's API or consume its events. Each picks its own store: a TAO-like association store for Graph, Redis for Feed, PostgreSQL for Users, Elasticsearch for Search.</p>
+<p>Why so strict? A shared database is a <strong>hidden, unversioned API</strong>: if Feed runs <code>SELECT … FROM likes JOIN posts …</code> directly, the Like team can never change schema, move to Cassandra or reshard without breaking Feed — and shared tables mean shared load.</p>
+
+<h3>7.2 But then how do I query across services?</h3>
+<ol>
+  <li><strong>API composition</strong> — the caller (or an <a href="api-gateway.html">API gateway / BFF</a>) calls services in parallel and stitches results: feed rendering gets post IDs from the timeline, then batch-fetches metadata, profiles, counts and "viewer has liked" flags.</li>
+  <li><strong>Replicated read models (CQRS)</strong> — subscribe to others' events and keep a <em>denormalised copy</em>: Search builds Elasticsearch from <code>UserUpdated</code>/<code>PostCreated</code> and never queries the User DB.</li>
+  <li><strong>Denormalise into the event</strong> — <code>PostCreated</code> carries author_id, timestamp, media type and audience so consumers needn't call back.</li>
+</ol>
+<div class="callout warn"><span class="callout-title">⚠️ Price of ownership</span>
+Copies are <em>eventually consistent</em> — a renamed user may show the old name in search for seconds. Every copy needs a clear source of truth and a way to be rebuilt (replay the log or re-scan the owner).</div>
+
+<h2>8. Distributed transactions: 2PC vs sagas</h2>
+<p>In one database, "do A and B atomically" is <code>BEGIN; …; COMMIT;</code>. Across services with separate databases there is no shared transaction.</p>
+
+<h3>8.1 Two-phase commit (2PC)</h3>
+<p>A <strong>coordinator</strong> asks every participant to <em>prepare</em> (write durably, hold locks, promise to commit). If all vote "yes" it tells everyone to <em>commit</em>; otherwise everyone <em>aborts</em>.</p>
+<pre class="ascii">
+ Coordinator            Post DB                 User DB
+     |--- PREPARE -------->|                        |
+     |--- PREPARE ------------------------------->  |
+     |&lt;-- YES (locks held) |                        |
+     |&lt;-- YES (locks held) ------------------------ |
+     |  write "COMMIT" to coordinator log           |
+     |--- COMMIT --------->|                        |
+     |--- COMMIT ---------------------------------->|
+     |&lt;-- ACK ------------ |&lt;-- ACK ----------------|
+
+ If the coordinator crashes after PREPARE, participants are stuck holding
+ locks ("in doubt") until it recovers — 2PC is a BLOCKING protocol.
+</pre>
+<p>Problems at scale: <strong>blocking</strong> (locks held across round trips; stuck if the coordinator dies), <strong>availability</strong> (every participant must be up), <strong>latency</strong> (two round trips plus forced log writes), and <strong>support</strong> (many NoSQL stores and brokers don't speak XA/2PC). It's used <em>inside</em> engineered databases (Spanner and CockroachDB run 2PC over Paxos/Raft groups so the coordinator can't vanish), rarely <em>between</em> microservices.</p>
+
+<h3>8.2 Sagas</h3>
+<p>A <strong>saga</strong> breaks a business transaction into a sequence of <strong>local transactions</strong>, each committed in one service's own database. If a later step fails, the saga runs <strong>compensating transactions</strong> that semantically undo the earlier steps (you can't roll back a committed transaction, but you can apply its opposite). Sagas give up isolation — other requests can see intermediate states — in exchange for availability and loose coupling. This is why posts have explicit states like <code>PROCESSING</code>.</p>
+
+<h3>8.3 Instagram example: publishing a post as a saga</h3>
+<p>Publishing touches several domains. Suppose these steps (simplified):</p>
+<ol class="steps">
+  <li><strong>Post service</strong>: insert post row with <code>status = PROCESSING</code> (local transaction) → emit <code>PostSubmitted</code>.</li>
+  <li><strong>Media processing</strong>: generate renditions in S3 → emit <code>MediaReady</code> (or <code>MediaFailed</code>).</li>
+  <li><strong>Integrity / moderation</strong>: classify the media and caption → emit <code>ContentApproved</code> (or <code>ContentRejected</code>).</li>
+  <li><strong>Post service</strong>: set <code>status = PUBLISHED</code>; <strong>User service</strong> increments the author's <code>post_count</code> → emit <code>PostCreated</code>.</li>
+  <li><strong>Fan-out, search, notifications</strong>: consume <code>PostCreated</code>.</li>
+</ol>
+<p>Compensations: if moderation rejects the post after it was published (e.g. a delayed review), the saga sets <code>status = REMOVED</code>, decrements <code>post_count</code>, emits <code>PostRemoved</code> so fan-out workers delete the ID from timelines and the indexer drops it, deletes renditions, and notifies the author. If media processing fails, the post goes to <code>FAILED</code> and the client is told to retry. Notice that compensations must be <strong>idempotent</strong> and <strong>always succeed eventually</strong> (retry until done).</p>
+
+<h3>8.4 Choreography vs orchestration</h3>
+<div class="diagram">
+<svg viewBox="0 0 840 300" width="840" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-ms-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="700" text-anchor="middle"><text x="200" y="20">Choreography (events)</text><text x="630" y="20">Orchestration (central coordinator)</text></g>
+  <line x1="420" y1="10" x2="420" y2="290" stroke="#ccc" stroke-dasharray="4 4"/>
+  <!-- choreography -->
+  <g text-anchor="middle">
+    <rect x="140" y="125" width="120" height="40" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="200" y="150" font-weight="600">Kafka topics</text>
+    <rect x="20" y="40" width="120" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="80" y="65">Post svc</text>
+    <rect x="260" y="40" width="130" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="325" y="65">Media workers</text>
+    <rect x="20" y="215" width="120" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="80" y="240">Moderation</text>
+    <rect x="260" y="215" width="130" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="325" y="240">Fan-out / search</text>
+  </g>
+  <g stroke="#6a1b9a" stroke-width="1.3" fill="none" marker-end="url(#ar-ms-3)">
+    <path d="M110,80 L165,123"/><path d="M235,123 L290,82"/><path d="M290,82 L235,123" stroke-dasharray="3 3"/>
+    <path d="M165,167 L110,213"/><path d="M110,213 L165,167" stroke-dasharray="3 3"/><path d="M235,167 L290,213"/>
+  </g>
+  <text x="200" y="285" text-anchor="middle" font-size="11.5" fill="#555">each service reacts to events and emits new ones</text>
+  <!-- orchestration -->
+  <g text-anchor="middle">
+    <rect x="555" y="120" width="150" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/><text x="630" y="141" font-weight="600">Publish-post</text><text x="630" y="158" font-size="11.5">orchestrator</text>
+    <rect x="445" y="40" width="120" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="505" y="65">Post svc</text>
+    <rect x="695" y="40" width="130" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="760" y="65">Media workers</text>
+    <rect x="445" y="215" width="120" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="505" y="240">Moderation</text>
+    <rect x="695" y="215" width="130" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="760" y="240">User svc</text>
+  </g>
+  <g stroke="#2e7d32" stroke-width="1.3" fill="none" marker-end="url(#ar-ms-3)">
+    <path d="M590,120 L540,82"/><path d="M670,120 L725,82"/><path d="M590,170 L540,213"/><path d="M670,170 L725,213"/>
+  </g>
+  <text x="630" y="285" text-anchor="middle" font-size="11.5" fill="#555">one component tells each step what to do</text>
+</svg>
+<div class="caption">Choreography spreads the workflow logic across event handlers; orchestration puts it in one explicit state machine.</div>
+</div>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Choreography</th><th>Orchestration</th></tr>
+  <tr><td><b>How</b></td><td>Services subscribe to each other's events and react</td><td>A coordinator (workflow engine) sends commands and tracks state</td></tr>
+  <tr><td><b>Coupling</b></td><td>Very loose; easy to add a new consumer</td><td>Services depend on the orchestrator's commands</td></tr>
+  <tr><td><b>Visibility</b></td><td>The flow is implicit — hard to answer "where is post 42 stuck?"</td><td>Explicit state per saga instance; easy to monitor and retry</td></tr>
+  <tr><td><b>Risk</b></td><td>Cyclic event chains, "event spaghetti"</td><td>Orchestrator becomes a bottleneck or a "god service"</td></tr>
+  <tr><td><b>Fits</b></td><td>Simple, few-step flows; broadcast side effects (fan-out, search, notifications)</td><td>Long, multi-step, business-critical flows with compensations</td></tr>
+  <tr><td><b>Tools</b></td><td>Kafka, SNS/SQS, any pub/sub</td><td>Temporal, Cadence, AWS Step Functions, Camunda, Netflix Conductor</td></tr>
+</table></div>
+<div class="callout instagram"><span class="callout-title">📸 Instagram-flavoured orchestration: account deletion</span>
+Deleting an account must remove posts, stories, comments, likes, follow edges, messages, search entries, caches and blobs across dozens of stores, verifiably and within legal deadlines — a classic <strong>orchestrated</strong> saga that walks the user's data graph, retries for days if needed and records progress. Meta has publicly described such a framework (the "DELF" paper, USENIX Security 2020). "A post was published", by contrast, fits <strong>choreography</strong>.</div>
+
+<h2>9. The transactional outbox pattern</h2>
+
+<h3>9.1 The dual-write problem</h3>
+<p>The Post service must update its database <em>and</em> publish <code>PostCreated</code> — two different systems — so this naive code is broken:</p>
+<pre><code>db.execute("UPDATE posts SET status='PUBLISHED' WHERE id=%s", post_id)
+db.commit()
+kafka.publish("post-events", PostCreated(post_id))   # what if we crash right here?</code></pre>
+<ul>
+  <li>Crash after commit, before publish → the post is published but <strong>no follower ever sees it</strong> in their feed, and it's never indexed.</li>
+  <li>Publish first, then the DB commit fails → consumers fan out a post that <strong>doesn't exist</strong>.</li>
+</ul>
+
+<h3>9.2 The fix: write the event in the same local transaction</h3>
+<p>Add an <code>outbox</code> table to the service's own database. In <em>one</em> local ACID transaction, update the business row and insert the event into the outbox. A separate <strong>relay</strong> process reads the outbox and publishes to Kafka, marking rows as sent.</p>
+<div class="flow">
+  <div class="fnode svc">Post service<small>1 local transaction</small></div><div class="farrow">→<small>posts + outbox rows</small></div>
+  <div class="fnode store">Post DB<small>outbox table</small></div><div class="farrow">→<small>poll or CDC</small></div>
+  <div class="fnode async">Outbox relay<small>Debezium / poller</small></div><div class="farrow">→<small>publish</small></div>
+  <div class="fnode async">Kafka<small>post-events</small></div><div class="farrow">→<small>at-least-once</small></div>
+  <div class="fnode svc">Consumers<small>idempotent</small></div>
+</div>
+<pre><code>BEGIN;
+  UPDATE posts SET status = 'PUBLISHED' WHERE post_id = 42;
+  INSERT INTO outbox (event_id, aggregate_id, type, payload, created_at)
+  VALUES ('evt-9f1c', 42, 'PostCreated',
+          '{"post_id":42,"author_id":7,"media":"photo","audience":"followers"}', now());
+COMMIT;      -- both happen, or neither does
+
+-- relay loop (separate process)
+loop:
+  rows = SELECT * FROM outbox WHERE sent_at IS NULL ORDER BY created_at LIMIT 500
+  for r in rows: kafka.publish(topic="post-events", key=r.aggregate_id, value=r.payload)
+  kafka.flush()                         # wait for broker acks
+  UPDATE outbox SET sent_at = now() WHERE event_id IN (rows.ids)</code></pre>
+<ul>
+  <li><strong>Atomicity</strong> of "state changed" and "event recorded" comes from the local transaction.</li>
+  <li>The relay can crash between publishing and marking sent → <em>at-least-once</em> delivery, so consumers must be <strong>idempotent</strong> (dedupe on <code>event_id</code>, or naturally idempotent ops like a sorted-set add).</li>
+  <li>Keying Kafka messages by post ID keeps a post's events ordered on one partition.</li>
+  <li><strong>CDC</strong> relays (Debezium) tail the replication log (PostgreSQL WAL, MySQL binlog) instead of polling.</li>
+</ul>
+<p>The consumer-side mirror is the <strong>inbox / idempotent consumer</strong>: record processed <code>event_id</code>s in the same transaction as the state change.</p>
+
+<h2>10. Deploying and running many services</h2>
+
+<h3>10.1 Containers</h3>
+<p>A <strong>container</strong> (Docker/OCI image) packages a service with its exact runtime, libraries and config into one immutable artifact. The same image runs on a laptop, in CI and in production — no more "works on my machine". Containers share the host OS kernel (unlike virtual machines), so they start in seconds and you can pack dozens onto one host. Each build produces a versioned image (e.g. <code>feed-service:2026.10.23-ab12cd</code>); deploying means "run this image version".</p>
+
+<h3>10.2 Kubernetes in five concepts</h3>
+<ul>
+  <li><strong>Pod</strong> — one or more containers sharing a network namespace (e.g. app + sidecar proxy).</li>
+  <li><strong>Deployment</strong> — "run 40 replicas of <code>feed-service:v123</code>"; Kubernetes reconciles reality to this desired state, rescheduling pods from dead nodes.</li>
+  <li><strong>Service</strong> — a stable name and virtual IP in front of changing pods (server-side discovery).</li>
+  <li><strong>Probes</strong> — <em>liveness</em> (restart if wedged) and <em>readiness</em> (no traffic until warmed up).</li>
+  <li><strong>Requests/limits</strong> — CPU and memory per pod, for bin-packing and noisy-neighbour protection.</li>
+</ul>
+
+<h3>10.3 Autoscaling</h3>
+<p>Because services are stateless, capacity can follow demand. The Kubernetes <strong>Horizontal Pod Autoscaler (HPA)</strong> computes:</p>
+<pre><code>desiredReplicas = ceil( currentReplicas × currentMetric / targetMetric )
+
+Example: 40 feed pods at 90% average CPU, target 60%
+         → ceil(40 × 90 / 60) = 60 pods</code></pre>
+<p>Metrics can be CPU, memory, requests per second or queue lag (e.g. scale fan-out workers on Kafka consumer lag). A <strong>cluster autoscaler</strong> adds or removes whole machines when pods can't be scheduled or nodes sit idle. Practical details matter: scale up fast, scale down slowly (avoid flapping); keep headroom because new instances need time to start and warm caches; and pre-scale for predictable peaks (evenings, New Year's Eve, big sports finals) rather than relying purely on reactive scaling.</p>
+
+<h3>10.4 Release strategies</h3>
+<div class="table-wrap"><table>
+  <tr><th>Strategy</th><th>How it works</th><th>Pros</th><th>Cons</th></tr>
+  <tr><td><b>Rolling update</b></td><td>Replace instances in batches (e.g. 10% at a time) with the new version</td><td>No extra capacity needed; default in Kubernetes</td><td>Both versions serve traffic during rollout; rollback is another rolling update</td></tr>
+  <tr><td><b>Blue/green</b></td><td>Run the full new version ("green") beside the old ("blue"); flip the load balancer to green at once; keep blue for instant rollback</td><td>Instant switch and instant rollback; test green with real infra before cut-over</td><td>Needs 2× capacity during release; DB schema must work for both versions</td></tr>
+  <tr><td><b>Canary</b></td><td>Send a small slice of traffic (1% → 5% → 25% → 100%) to the new version; compare error rates, latency and business metrics against the old version; halt automatically on regression</td><td>Limits blast radius; catches problems that only show under real traffic</td><td>Needs good metrics and automated analysis; slow for urgent fixes</td></tr>
+  <tr><td><b>Feature flags</b></td><td>Ship code "dark", then enable it at runtime for specific users, % of users, countries or employees</td><td>Decouples <em>deploy</em> from <em>release</em>; instant kill switch; enables A/B tests</td><td>Flag debt (stale flags), combinatorial testing, config itself can cause outages</td></tr>
+</table></div>
+<div class="callout instagram"><span class="callout-title">📸 Instagram's continuous deployment</span>
+Instagram engineering has publicly described <strong>continuous deployment</strong> of its Django monolith: every change that passes tests is pushed to production, many times a day, first to a small <strong>canary</strong> set of servers where automated checks watch error rates before rolling out to the whole fleet. Product changes are typically released via feature flags/gating (Meta's "Gatekeeper" system is publicly documented), so a new Stories feature can be turned on for employees, then 1% of users, then everyone — and turned off in seconds without a deploy. This is a big reason a single monolith can support so many engineers.</div>
+<div class="callout warn"><span class="callout-title">⚠️ Schema changes during deploys</span>
+During any rolling or canary deploy, <em>old and new code run at the same time</em> against the same database and the same event topics. Use <strong>expand → migrate → contract</strong>: first add the new column/field (old code ignores it), deploy code that writes both and reads the new one, backfill, and only later remove the old column. Event schemas must be backward- and forward-compatible (add optional fields; never repurpose a field).</div>
+
+<h2>11. Service mesh and sidecars</h2>
+<p>With hundreds of services, every one of them needs the same plumbing: mutual TLS, retries, timeouts, circuit breaking, load balancing, metrics, tracing headers. Re-implementing these in every language's client library is painful. A <strong>service mesh</strong> moves this plumbing out of the application into a <strong>sidecar proxy</strong> (most commonly Envoy) that runs next to every instance — in the same Kubernetes pod — and intercepts all inbound and outbound traffic.</p>
+<div class="diagram">
+<svg viewBox="0 0 820 290" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-ms-4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g text-anchor="middle">
+    <rect x="260" y="15" width="300" height="50" rx="8" fill="#eceff1" stroke="#455a64"/><text x="410" y="36" font-weight="600">Control plane (e.g. Istiod)</text><text x="410" y="53" font-size="11.5">config, certificates, endpoint lists</text>
+    <rect x="40" y="110" width="320" height="140" rx="10" fill="#ffffff" stroke="#999" stroke-dasharray="5 3"/><text x="200" y="130" font-size="11.5" fill="#555">Pod: feed-service</text>
+    <rect x="60" y="145" width="130" height="80" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="125" y="180" font-weight="600">Feed app</text><text x="125" y="198" font-size="11.5">calls localhost</text>
+    <rect x="215" y="145" width="125" height="80" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="277" y="175" font-weight="600">Envoy</text><text x="277" y="193" font-size="11.5">sidecar proxy</text>
+    <rect x="460" y="110" width="320" height="140" rx="10" fill="#ffffff" stroke="#999" stroke-dasharray="5 3"/><text x="620" y="130" font-size="11.5" fill="#555">Pod: graph-service</text>
+    <rect x="480" y="145" width="125" height="80" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="542" y="175" font-weight="600">Envoy</text><text x="542" y="193" font-size="11.5">sidecar proxy</text>
+    <rect x="630" y="145" width="130" height="80" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="695" y="180" font-weight="600">Graph app</text><text x="695" y="198" font-size="11.5">plain HTTP/gRPC</text>
+  </g>
+  <g stroke="#555" stroke-width="1.4" fill="none" marker-end="url(#ar-ms-4)">
+    <path d="M190,185 L213,185"/><path d="M340,185 L478,185"/><path d="M605,185 L628,185"/>
+    <path d="M330,65 L285,143" stroke-dasharray="4 3"/><path d="M490,65 L535,143" stroke-dasharray="4 3"/>
+  </g>
+  <text x="410" y="175" text-anchor="middle" font-size="11.5" fill="#ef6c00" font-weight="600">mTLS</text>
+  <text x="410" y="205" text-anchor="middle" font-size="11" fill="#555">retries, timeouts,</text>
+  <text x="410" y="220" text-anchor="middle" font-size="11" fill="#555">metrics, traces</text>
+  <text x="410" y="275" text-anchor="middle" font-size="11.5" fill="#555">Data plane = all sidecars. The apps never deal with TLS, discovery or retries themselves.</text>
+</svg>
+<div class="caption">A service mesh: each instance gets a sidecar proxy; a control plane pushes routing rules, endpoints and certificates to all proxies.</div>
+</div>
+<ul>
+  <li><strong>Data plane</strong> — the sidecars carrying traffic: client-side load balancing, retry budgets, outlier ejection, uniform metrics for every hop.</li>
+  <li><strong>Control plane</strong> — distributes routes (5% to v2: a mesh-level canary), policy (only Feed may call Graph) and short-lived certificates for <strong>mTLS</strong>.</li>
+  <li><strong>Costs</strong> — an extra local proxy hop per side (sub-millisecond, but it adds up), CPU/memory per pod, and a complex system to operate; sidecar-less designs (Istio ambient, eBPF/Cilium) reduce this.</li>
+</ul>
+<p>Meta built equivalent capabilities into shared RPC libraries (Thrift-based) long before off-the-shelf meshes existed; a mesh is the "buy" version of that "build".</p>
+
+<h2>12. Conway's law: architecture mirrors the org chart</h2>
+<blockquote style="border-left:4px solid #6a1b9a;padding:6px 14px;margin:12px 0;color:#444"><em>"Any organization that designs a system will produce a design whose structure is a copy of the organization's communication structure."</em> — Melvin Conway, 1968</blockquote>
+<p>If you have three teams building a compiler, you get a three-pass compiler. Applied to microservices: <strong>service boundaries follow team boundaries</strong>, whether you plan it or not. The practical lessons:</p>
+<ul>
+  <li><strong>Design teams and services together</strong> (the "inverse Conway manoeuvre"): want a Stories service? Create a Stories team that owns it end to end.</li>
+  <li><strong>One owner per service</strong>; a service owned by everyone is owned by no one.</li>
+  <li><strong>Small orgs shouldn't copy big-org architectures.</strong> Ten engineers running 40 services contradicts the org chart.</li>
+</ul>
+
+<h2>13. When to split — and when not to</h2>
+<h3>13.1 Good reasons to extract a service</h3>
+<ul>
+  <li><strong>Different scaling or runtime profile</strong>: feed reads at 100k+ QPS vs settings at 10 QPS; GPU transcoding; long-lived WebSocket connections.</li>
+  <li><strong>Different security requirements</strong>: auth and payments benefit from a small, tightly controlled surface.</li>
+  <li><strong>Team autonomy</strong>: a large team blocked by the shared release train.</li>
+  <li><strong>A clean bounded context</strong> with a narrow API and little shared data.</li>
+</ul>
+<h3>13.2 Bad reasons</h3>
+<ul>
+  <li>"Microservices are modern." Fashion is not a requirement.</li>
+  <li>A small team, or domain boundaries still changing weekly — you'll cut in the wrong place.</li>
+  <li>Messy code: a messy monolith split up becomes a messy <em>distributed</em> system. Modularise first.</li>
+  <li>Entities constantly read and written together — you'll recreate joins over the network.</li>
+</ul>
+<h3>13.3 How to split safely: the strangler fig</h3>
+<ol class="steps">
+  <li><strong>Modularise in place</strong>: define the module's API and stop other modules touching its tables.</li>
+  <li><strong>Route through a facade</strong> (gateway or in-code) and build the new service behind the same API; shadow traffic to compare responses.</li>
+  <li><strong>Migrate data</strong>: backfill, keep in sync via CDC, then move ownership.</li>
+  <li><strong>Shift traffic gradually</strong> (canary %), then delete the old code — the new service has "strangled" the old path like a strangler fig around a tree.</li>
+</ol>
+
+<h2>14. How Instagram uses microservices &amp; stateless services</h2>
+<p>Putting it together, a realistic reading of the diagram:</p>
+<div class="flow">
+  <div class="fnode client">📱 App<small>auth token</small></div><div class="farrow">→</div>
+  <div class="fnode edge">LB + API gateway<small>TLS, auth, rate limits</small></div><div class="farrow">→<small>route by path</small></div>
+  <div class="fnode svc">Stateless web tier<small>Django monolith: feed, likes, comments, upload API…</small></div><div class="farrow">→<small>RPC</small></div>
+  <div class="fnode svc">Specialised services<small>graph store, DM gateways, search, ranking</small></div>
+</div>
+<div class="flow">
+  <div class="fnode svc">Web tier writes<small>+ outbox / events</small></div><div class="farrow">→</div>
+  <div class="fnode async">Kafka-style event bus</div><div class="farrow">→</div>
+  <div class="fnode async">Async workers<small>fan-out, media, notifications, indexer, ML</small></div><div class="farrow">→</div>
+  <div class="fnode store">Data layer<small>Postgres, Cassandra, Redis/Memcache, S3, ES</small></div>
+</div>
+<ul>
+  <li><strong>The web tier is stateless</strong>: thousands of identical Django servers behind load balancers; tokens for auth, data in sharded PostgreSQL/Cassandra/caches, media in object storage — so the fleet scales horizontally and redeploys many times a day.</li>
+  <li><strong>"Services" in the diagram are domains</strong> (Upload, Stories, Like &amp; Comment, Feed), largely modules in the monolith with clear ownership of tables and events.</li>
+  <li><strong>Separate systems</strong> exist where runtime or scale differs: messaging connections, media pipelines, search, notification delivery, ML ranking, and Meta-wide graph and cache infrastructure.</li>
+  <li><strong>Async events glue domains together</strong> (<code>PostCreated</code>, <code>StoryCreated</code>, <code>LikeCreated</code>, <code>FollowCreated</code>) — choreography made reliable by outbox-style publishing and idempotent consumers.</li>
+</ul>
+<div class="callout instagram"><span class="callout-title">📸 Rough numbers (assumptions)</span>
+Assume 500M daily active users making ~50 API requests each per day → <code>500M × 50 / 86,400 ≈ 290k requests/s</code> average, maybe ~600k–900k/s at peak. If one stateless Python web server handles ~300 requests/s, peak needs roughly <strong>2,000–3,000 servers</strong> for the web tier alone, plus headroom (N+1 per region, failover capacity). Because the tier is stateless, adding 20% capacity before a big event is just "deploy 500 more identical instances". Use <a href="capacity-estimation.html">back-of-the-envelope estimation</a> to redo this with your own assumptions.</div>
+
+<h2>15. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Microservices give you</h4><ul>
+    <li>Independent deploys and team autonomy</li>
+    <li>Independent scaling and technology choices per workload</li>
+    <li>Fault isolation (with timeouts, breakers and fallbacks)</li>
+    <li>Clear data ownership and smaller codebases</li>
+    <li>Stateless tiers that autoscale and deploy safely</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ And cost you</h4><ul>
+    <li>Network latency and partial failures on every call</li>
+    <li>No cross-service ACID transactions or joins</li>
+    <li>Eventual consistency between data copies</li>
+    <li>Heavy operational tooling: discovery, tracing, mesh, CI/CD per service</li>
+    <li>Harder debugging and integration testing</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Distributed monolith</strong> — services that must deploy together or share a database.</li>
+  <li><strong>Chatty synchronous chains</strong> — A calls B calls C calls D; latencies add up and availability multiplies down. Prefer parallel fan-out, batching APIs and async events.</li>
+  <li><strong>Dual writes without an outbox</strong> — "write DB, then publish" silently loses events on crashes.</li>
+  <li><strong>Non-idempotent consumers</strong> — at-least-once delivery means duplicates; a duplicate <code>LikeCreated</code> must not double-count.</li>
+  <li><strong>Hidden state in "stateless" services</strong> — files on local disk, in-memory rate-limit counters, sticky sessions relied on for correctness.</li>
+  <li><strong>Retry storms</strong> — every layer retrying 3× turns one slow call into 27; use retry budgets, backoff with jitter and deadlines.</li>
+</ul>
+
+<h2>16. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Category</th><th>Tools</th><th>When to use</th></tr>
+  <tr><td>Containers &amp; orchestration</td><td>Docker/OCI, Kubernetes (EKS, GKE, AKS), Nomad</td><td>Running many stateless services with self-healing, scheduling and autoscaling</td></tr>
+  <tr><td>Service discovery / config</td><td>Consul, etcd, ZooKeeper, Kubernetes DNS, Eureka</td><td>Mapping service names to healthy instances; leader election; dynamic config</td></tr>
+  <tr><td>RPC frameworks</td><td>gRPC, Apache Thrift, Finagle, REST/OpenAPI</td><td>Typed, efficient service-to-service calls</td></tr>
+  <tr><td>Service mesh / proxies</td><td>Envoy, Istio, Linkerd, Consul Connect, Cilium</td><td>Uniform mTLS, retries, traffic splitting and telemetry across languages</td></tr>
+  <tr><td>Event bus</td><td>Apache Kafka, Pulsar, AWS SNS/SQS, Google Pub/Sub</td><td>Async events, choreography, CDC streams</td></tr>
+  <tr><td>CDC / outbox relay</td><td>Debezium, Kafka Connect, AWS DMS</td><td>Publishing outbox rows or DB changes to Kafka reliably</td></tr>
+  <tr><td>Workflow / saga orchestration</td><td>Temporal, Cadence, AWS Step Functions, Netflix Conductor, Camunda</td><td>Long-running, multi-step business processes with compensations</td></tr>
+  <tr><td>Progressive delivery</td><td>Argo Rollouts, Flagger, LaunchDarkly, Unleash</td><td>Canary analysis, blue/green, feature flags</td></tr>
+</table></div>
+
+<h2>17. Interview corner</h2>
+<details class="qa"><summary>Would you design Instagram as microservices or a monolith?</summary>
+<p>I'd describe the system as <strong>bounded contexts</strong> — upload, stories, engagement, graph, feed, search, messaging, users/auth — each owning its data and publishing events. Whether each is a separate deployable depends on team size and scaling profile. I'd extract pieces with very different runtimes from day one (DM WebSocket gateways, media workers, search indexing, fan-out workers) and keep CRUD product logic in a well-modularised, stateless web tier until team scale forces a split — which mirrors Instagram's Django monolith plus separate messaging, media, search and graph systems. Non-negotiables: stateless request tier, data ownership, async events for side effects.</p></details>
+<details class="qa"><summary>What makes a service stateless and why do you care?</summary>
+<p>No state another instance would need is kept on the instance: auth from a token, data in shared DBs/caches, files in object storage, background work in a queue. So the LB balances freely, autoscalers and failures add/kill instances without data loss, and capacity scales linearly. Local caches are fine if losing them only costs latency. Inherently stateful pieces (DBs, caches, WebSocket gateways) live in dedicated tiers with their own replication.</p></details>
+<details class="qa"><summary>A user publishes a post. How do you guarantee followers' feeds, search and notifications all eventually reflect it?</summary>
+<p>Write the post row and a <code>PostCreated</code> event into an <strong>outbox table in the same local transaction</strong>. A relay (poller or Debezium CDC) publishes to Kafka keyed by post_id, at-least-once. Fan-out, search indexer and notifications consume independently with their own offsets and are <strong>idempotent</strong> (timeline ZADD is naturally idempotent; notifications dedupe on event_id). A down consumer catches up from the retained log. No 2PC; consistency within seconds.</p></details>
+<details class="qa"><summary>Explain 2PC and why we usually avoid it between microservices.</summary>
+<p>A coordinator asks all participants to prepare (persist and lock), then commits if all vote yes. It's atomic but blocking (locks held across round trips; participants stuck in doubt if the coordinator dies), needs every participant up, costs extra round trips and fsyncs, and many stores/brokers don't support it. Between services we use sagas with idempotency and outbox events; 2PC belongs inside databases engineered for it (Spanner, CockroachDB).</p></details>
+<details class="qa"><summary>Choreography or orchestration for a saga — how do you decide?</summary>
+<p>Choreography suits loosely coupled, few-step broadcast side effects (PostCreated → fan-out, search, notifications). When the flow is long, ordered and needs compensations, the implicit workflow becomes hard to reason about, so I'd use an orchestrator (Temporal/Step Functions or in-house) that persists progress, retries and compensates — e.g. account deletion across dozens of stores. Many systems use both.</p></details>
+<details class="qa"><summary>How would you roll out a risky change to the feed ranking code?</summary>
+<p>Ship it dark behind a feature flag; enable for employees, then a 1% population; compare guardrail metrics (errors, p99, crashes) and product metrics against a control group (A/B test); ramp 5/25/50/100% with automatic halt on regression; keep the flag as a kill switch, then delete it to avoid flag debt. The binary itself goes out via canary deploys first.</p></details>
+
+<h2>18. Check your understanding</h2>
+<details class="quiz"><summary>What is the difference between a modular monolith and microservices, in one sentence each?</summary>
+<p>A <strong>modular monolith</strong> enforces boundaries in code (module APIs, table ownership) but deploys and runs as one unit with in-process calls. <strong>Microservices</strong> enforce boundaries with the network and separate databases, so each can be deployed and scaled independently — at the price of network failures and eventual consistency.</p></details>
+<details class="quiz"><summary>A request synchronously depends on 6 services, each 99.95% available. What is the best-case availability of the request?</summary>
+<p><code>0.9995<sup>6</sup> ≈ 0.9970</code>, i.e. about <strong>99.7%</strong> — roughly 2.2 hours of failure per month instead of ~22 minutes for one service. This is why we cut synchronous dependencies, add fallbacks and push side effects to async events.</p></details>
+<details class="quiz"><summary>An engineer stores uploaded photos on the web server's local disk "temporarily" before processing. Why is this a problem?</summary>
+<p>It makes the server stateful: the processing step must run on the same machine, the file is lost if the instance is terminated by autoscaling or a deploy, and the load balancer can't freely route retries. Uploads should go straight to object storage (pre-signed URLs) and processing should be triggered by an event.</p></details>
+<details class="quiz"><summary>The Post service commits the DB transaction, then crashes before publishing <code>PostCreated</code>. What happens and how do you fix it?</summary>
+<p>The post exists but no fan-out, indexing or notifications ever happen — a silent inconsistency. Fix with the <strong>transactional outbox</strong>: insert the event into an outbox table in the same transaction; a relay publishes it later (at-least-once), with idempotent consumers.</p></details>
+<details class="quiz"><summary>HPA: 25 pods run at 80% CPU with a 50% target. How many pods will the autoscaler request?</summary>
+<p><code>ceil(25 × 80 / 50) = ceil(40) = 40</code> pods. (In practice scale-up is also limited by rate policies and by whether the cluster autoscaler can add nodes quickly enough.)</p></details>
+<details class="quiz"><summary>Scenario: a saga increments the author's post_count, then moderation rejects the post. What should happen, and what properties must the compensation have?</summary>
+<p>Run compensating actions: mark the post removed, decrement post_count, emit PostRemoved so timelines and search drop it, delete renditions, notify the author. Compensations must be <strong>idempotent</strong> (safe to retry), <strong>eventually always succeed</strong> (retried until done) and be <strong>semantic</strong> undos — other users may already have seen the post, which is the isolation trade-off sagas accept.</p></details>
+<details class="quiz"><summary>Why does Conway's law suggest a 12-person startup should not run 40 microservices?</summary>
+<p>Architecture mirrors communication structure. With one or two teams, 40 services means each person owns several deploy pipelines, dashboards and on-call rotations, and almost every feature crosses many services owned by the same people — all the coordination overhead with none of the autonomy benefit. A modular monolith fits that organisation far better.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Monolith, modular monolith and microservices are <strong>packaging choices</strong>; scale comes mostly from a <strong>stateless request tier</strong> plus a well-sharded data layer and async workers.</li>
+    <li>Instagram's web tier is famously a large <strong>Django monolith</strong>; read the diagram's services as <strong>domains</strong>, with truly separate systems where runtimes differ (DMs, media, search, graph infrastructure).</li>
+    <li>Statelessness pushes state into DBs, caches, session/token stores and object storage, enabling autoscaling, cheap failures and continuous deploys.</li>
+    <li>Use <strong>sync RPC for queries</strong> the user waits on, <strong>async events for side effects</strong>; keep chains shallow and always use timeouts.</li>
+    <li>Each service <strong>owns its data</strong>; replace cross-service transactions with <strong>sagas</strong> and make event publishing reliable with the <strong>transactional outbox</strong> and idempotent consumers.</li>
+    <li>Operate with containers, Kubernetes, autoscaling, <strong>canaries and feature flags</strong>; split only when team structure and workload differences justify it (Conway's law, strangler fig).</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="api-design.html">API Design</a> — REST vs gRPC, idempotency keys and versioning for service APIs</li>
+  <li><a href="message-queues.html">Message Queues &amp; Kafka</a> — the event bus behind choreography and the outbox</li>
+  <li><a href="load-balancer.html">Load Balancing</a> — why stateless instances make balancing simple; sticky sessions</li>
+  <li><a href="api-gateway.html">API Gateway</a> — the front door that routes to services and composes responses</li>
+  <li><a href="resilience-patterns.html">Resilience Patterns</a> — timeouts, retries, circuit breakers between services</li>
+  <li><a href="observability.html">Observability</a> — distributed tracing across many services</li>
+  <li><a href="databases.html">Databases</a> — choosing a store per service</li>
+  <li><a href="cap-consistency.html">CAP &amp; Consistency</a> — why cross-service data is eventually consistent</li>
+  <li><a href="media-upload.html">Media Upload</a> — a full saga-like flow with a post state machine and outbox</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

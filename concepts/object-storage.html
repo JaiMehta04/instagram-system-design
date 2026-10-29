@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Object / Blob Storage (S3) — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="object-storage">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li><strong>Object storage</strong> (Amazon S3 and friends) stores immutable blobs — photos, videos, backups — as <strong>objects</strong>: a key, the bytes, and metadata, in a <strong>flat namespace</strong> inside a <strong>bucket</strong>, accessed over HTTP.</li>
+    <li>It scales to exabytes and trillions of objects because it gives up what file systems promise (in-place edits, directories, POSIX locking) and keeps only <code>PUT</code>/<code>GET</code>/<code>DELETE</code>/<code>LIST</code>.</li>
+    <li>Durability ("11 nines") comes from <strong>replication</strong> or, far more cheaply, <strong>erasure coding</strong> (Reed-Solomon) across disks, racks and availability zones, plus constant checksumming and repair.</li>
+    <li>Cost is managed with <strong>storage classes</strong> (hot → infrequent → archive) and <strong>lifecycle policies</strong>; uploads use <strong>pre-signed URLs</strong> and <strong>multipart upload</strong>; users download through the <a href="cdn.html">CDN</a>, never straight from the bucket.</li>
+    <li>Facebook's public <strong>Haystack</strong> and <strong>f4</strong> papers show why billions of small photos need special treatment: pack them as "needles" into huge volume files so a read costs one disk seek, then move cooling data to erasure-coded warm storage.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why do we need object storage?</h2>
+<p>Every Instagram post starts as a multi-megabyte photo or video. Each upload becomes many files — the original plus several resized images and a ladder of video bitrates and segments (see <a href="media-processing.html">Media Processing</a>). Assume, purely for practice, 100 million photos and 20 million videos uploaded per day: that's <strong>hundreds of terabytes per day</strong> and <strong>hundreds of petabytes per year</strong>, kept essentially forever, any of which might be viewed at any moment.</p>
+<p>Where could all that live?</p>
+<ul>
+  <li><strong>In the database as BLOB columns?</strong> Databases are optimised for small rows, indexes and transactions. Multi-MB values bloat the buffer pool, slow replication and backups, and make the DB 10–50× more expensive per GB. The metadata (who posted, caption, timestamps) belongs in a database; the bytes don't.</li>
+  <li><strong>On a big network file system (NAS/NFS)?</strong> File systems maintain a directory tree, permissions, in-place writes and locking — all of which cost metadata operations. At billions of files the metadata itself becomes the bottleneck (Facebook hit exactly this; see Haystack below).</li>
+  <li><strong>On local disks of app servers?</strong> Then a server failure loses photos and every server would need to know which server has which file.</li>
+</ul>
+<p>Object storage is the answer: a giant, cheap, durable, HTTP-addressable key → bytes store that scales horizontally by adding disks.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  Object storage is a <strong>coat check / valet service</strong>. You hand over your coat (the bytes) and get a ticket (the key). You don't know or care which rack or room your coat is on; you can't alter the coat while it's checked in — you can only collect it, replace it with a different coat, or throw it away. Because customers never walk into the back room, the valet company can reorganise, duplicate and move coats between warehouses freely, and serve millions of customers with the same simple counter.
+</div>
+
+<h2>2. Block vs file vs object storage</h2>
+<p>There are three fundamental ways to expose storage. Understanding the difference is a classic interview warm-up.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 880 270" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <text x="140" y="24" text-anchor="middle" font-weight="700">Block storage</text>
+  <text x="440" y="24" text-anchor="middle" font-weight="700">File storage</text>
+  <text x="740" y="24" text-anchor="middle" font-weight="700">Object storage</text>
+  <g fill="#fff8e1" stroke="#f9a825">
+    <rect x="40" y="45" width="44" height="34"/><rect x="88" y="45" width="44" height="34"/><rect x="136" y="45" width="44" height="34"/><rect x="184" y="45" width="44" height="34"/>
+    <rect x="40" y="83" width="44" height="34"/><rect x="88" y="83" width="44" height="34"/><rect x="136" y="83" width="44" height="34"/><rect x="184" y="83" width="44" height="34"/>
+    <rect x="40" y="121" width="44" height="34"/><rect x="88" y="121" width="44" height="34"/><rect x="136" y="121" width="44" height="34"/><rect x="184" y="121" width="44" height="34"/>
+  </g>
+  <g font-size="11" text-anchor="middle" fill="#333">
+    <text x="62" y="66">#0</text><text x="110" y="66">#1</text><text x="158" y="66">#2</text><text x="206" y="66">#3</text>
+    <text x="62" y="104">#4</text><text x="110" y="104">#5</text><text x="158" y="104">#6</text><text x="206" y="104">#7</text>
+    <text x="62" y="142">#8</text><text x="110" y="142">#9</text><text x="158" y="142">#10</text><text x="206" y="142">#11</text>
+  </g>
+  <g fill="#e8f5e9" stroke="#2e7d32">
+    <rect x="390" y="42" width="100" height="28" rx="5"/>
+    <rect x="320" y="92" width="100" height="28" rx="5"/><rect x="460" y="92" width="100" height="28" rx="5"/>
+    <rect x="300" y="142" width="110" height="28" rx="5"/><rect x="420" y="142" width="80" height="28" rx="5"/><rect x="510" y="142" width="80" height="28" rx="5"/>
+  </g>
+  <g stroke="#2e7d32" fill="none"><path d="M440,70 L370,92"/><path d="M440,70 L510,92"/><path d="M370,120 L355,142"/><path d="M370,120 L460,142"/><path d="M510,120 L550,142"/></g>
+  <g font-size="11.5" text-anchor="middle">
+    <text x="440" y="61">/</text><text x="370" y="111">/home</text><text x="510" y="111">/var</text>
+    <text x="355" y="161">ana/photo.jpg</text><text x="460" y="161">notes.txt</text><text x="550" y="161">log.txt</text>
+  </g>
+  <rect x="640" y="40" width="200" height="140" rx="10" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="740" y="58" text-anchor="middle" font-size="11.5" font-weight="600">bucket: ig-media</text>
+  <g font-size="11" fill="#fff" stroke="#f9a825">
+    <rect x="655" y="68" width="170" height="30" rx="5"/><rect x="655" y="104" width="170" height="30" rx="5"/><rect x="655" y="140" width="170" height="30" rx="5"/>
+  </g>
+  <g font-size="11" fill="#333">
+    <text x="662" y="81">key: p/9f3a/1080.jpg</text><text x="662" y="93">bytes + metadata</text>
+    <text x="662" y="117">key: p/9f3a/640.webp</text><text x="662" y="129">bytes + metadata</text>
+    <text x="662" y="153">key: v/77c1/seg_001.m4s</text><text x="662" y="165">bytes + metadata</text>
+  </g>
+  <g font-size="12" fill="#333" text-anchor="middle">
+    <text x="140" y="190">Numbered fixed-size blocks.</text><text x="140" y="207">Read/write block #N in place.</text><text x="140" y="224">One server mounts it (a "disk").</text>
+    <text x="440" y="200">Hierarchy of directories &amp; files.</text><text x="440" y="217">Open/seek/write/lock via POSIX.</text><text x="440" y="234">Shared by many servers (NFS/SMB).</text>
+    <text x="740" y="200">Flat key → whole object.</text><text x="740" y="217">PUT/GET/DELETE over HTTP.</text><text x="740" y="234">Scales to trillions of objects.</text>
+  </g>
+</svg>
+<div class="caption">Three abstractions over the same disks: blocks (a raw disk), files (a tree with in-place edits), objects (a flat key → immutable blob map).</div>
+</div>
+
+<div class="table-wrap"><table>
+  <tr><th></th><th>Block storage</th><th>File storage</th><th>Object storage</th></tr>
+  <tr><td><b>Unit</b></td><td>Fixed-size block (e.g. 4 KB) addressed by number</td><td>File inside a directory tree</td><td>Object = key + data + metadata in a bucket</td></tr>
+  <tr><td><b>Interface</b></td><td>SCSI/NVMe, iSCSI — the OS puts a file system or DB on top</td><td>POSIX (open, seek, write, rename, lock) via NFS/SMB</td><td>HTTP REST: PUT, GET, HEAD, DELETE, LIST</td></tr>
+  <tr><td><b>Modify in place?</b></td><td>Yes, any block</td><td>Yes, any byte range</td><td>No — replace the whole object (or new version)</td></tr>
+  <tr><td><b>Metadata</b></td><td>None</td><td>Fixed (owner, permissions, times)</td><td>Rich, custom key-value metadata per object</td></tr>
+  <tr><td><b>Latency</b></td><td>Lowest (sub-ms)</td><td>Low (ms)</td><td>Higher (tens of ms to first byte)</td></tr>
+  <tr><td><b>Scale</b></td><td>Single volume, TBs; attached to one host</td><td>PBs, but metadata servers limit file count</td><td>Effectively unlimited: exabytes, trillions of objects</td></tr>
+  <tr><td><b>Cost / GB</b></td><td>Highest</td><td>High</td><td>Lowest (plus cheaper cold tiers)</td></tr>
+  <tr><td><b>Examples</b></td><td>AWS EBS, SAN LUNs, local NVMe</td><td>AWS EFS, NetApp, Azure Files, CephFS</td><td>S3, Google Cloud Storage, Azure Blob, MinIO, Ceph RGW</td></tr>
+  <tr><td><b>Instagram use</b></td><td>Disks under PostgreSQL and Cassandra nodes</td><td>Rare (shared config, legacy tools)</td><td>All photos, videos, renditions, backups, ML datasets</td></tr>
+</table></div>
+
+<h2>3. The object model</h2>
+<div class="cards">
+  <div class="card"><h4>🪣 Bucket</h4><p>A named container with a region, access policy, versioning and lifecycle settings, e.g. <code>ig-media-prod-us</code>. Bucket names are globally unique in S3.</p></div>
+  <div class="card"><h4>🔑 Key</h4><p>A string up to 1,024 bytes that uniquely names the object within the bucket, e.g. <code>p/3049215820194820101/1080.jpg</code>.</p></div>
+  <div class="card"><h4>📦 Value (data)</h4><p>The bytes: 0 B up to 5 TB per object in S3. Treated as opaque and immutable.</p></div>
+  <div class="card"><h4>🏷️ Metadata</h4><p>System metadata (size, <code>Content-Type</code>, <code>ETag</code> checksum, last-modified, storage class) plus user metadata (<code>x-amz-meta-owner-id: 1001</code>) and tags.</p></div>
+</div>
+<p><strong>Flat namespace.</strong> There are no real directories. The key <code>p/3049/1080.jpg</code> is just a string containing slashes. When a console shows "folders", it is running <code>LIST</code> with <code>prefix=p/3049/</code> and <code>delimiter=/</code> and grouping keys that share a prefix. This is a big reason object stores scale: there's no directory tree to lock, no rename of a directory (renaming means copying every object), and the index is just a giant sorted key → location map that can be partitioned by key range.</p>
+<p><strong>Immutability.</strong> You can't append or overwrite bytes 100–200; a <code>PUT</code> replaces the entire object atomically — readers see either the old or the new object, never a mix. With <strong>versioning</strong> enabled, an overwrite creates a new version and a delete inserts a "delete marker", so older versions remain recoverable (protecting against bugs and ransomware, at the cost of storing every version until a lifecycle rule expires them).</p>
+<p>For Instagram this model is a perfect fit: processed media is <strong>write-once, read-many and never edited</strong>. An "edit" (e.g. a new filter) produces new renditions under new keys.</p>
+
+<h2>4. The S3-style API</h2>
+<h3>4.1 Basic operations</h3>
+<pre><code>PUT    /ig-media/p/3049215820194820101/1080.jpg     (body = bytes, Content-Type: image/jpeg)
+GET    /ig-media/p/3049215820194820101/1080.jpg     (optional Range: bytes=0-1048575)
+HEAD   /ig-media/p/3049215820194820101/1080.jpg     (metadata only: size, ETag, type)
+DELETE /ig-media/p/3049215820194820101/1080.jpg
+GET    /ig-media?list-type=2&amp;prefix=p/3049215820194820101/   (LIST keys by prefix, paginated, 1,000 per page)</code></pre>
+<p><strong>Range GETs</strong> fetch part of an object — essential for video players seeking within a file and for parallel downloads. <code>ETag</code> is a checksum-like version identifier useful for conditional requests and CDN revalidation.</p>
+
+<h3>4.2 Multipart upload</h3>
+<p>A single <code>PUT</code> is fine for a 3 MB photo but terrible for a 2 GB video on a mobile network: one dropped connection at 95% means starting over. <strong>Multipart upload</strong> splits an object into parts uploaded independently and in parallel:</p>
+<ol class="steps">
+  <li><code>CreateMultipartUpload</code> → returns an <code>UploadId</code>.</li>
+  <li><code>UploadPart</code> (partNumber 1…10,000, each 5 MB–5 GB except the last) — in parallel, in any order, retrying only failed parts. Each returns an ETag.</li>
+  <li><code>CompleteMultipartUpload</code> with the list of (partNumber, ETag) → the store stitches parts into one object, atomically visible.</li>
+  <li>Or <code>AbortMultipartUpload</code>. Incomplete uploads keep their parts (and keep costing money) until aborted — add a lifecycle rule <code>AbortIncompleteMultipartUpload: 1 day</code>.</li>
+</ol>
+<p>Benefits: resumability on flaky mobile networks, higher throughput through parallelism, and the ability to start uploading before the whole file exists (e.g. while the phone is still encoding). See <a href="media-upload.html">Media Upload</a> for the client side.</p>
+
+<h3>4.3 Pre-signed URLs: let the client talk to storage directly</h3>
+<p>Routing upload bytes through the Upload Service would make those servers a bandwidth bottleneck. Instead the service issues a <strong>pre-signed URL</strong>: a URL for one specific operation on one specific key, containing an expiry and an HMAC signature computed with the service's secret credentials. Anyone holding the URL can perform <em>exactly that</em> operation until it expires — no AWS credentials on the phone.</p>
+<pre class="ascii">
+ Phone                    Upload Service                 Object Storage (S3)          Kafka
+   |-- POST /uploads ------------&gt;|                               |                      |
+   |   (auth token, size, type)   | authZ, quota, pick key        |                      |
+   |                              | sign PUT URL (expires 15 min) |                      |
+   |&lt;-- {upload_url, media_id} ---|                               |                      |
+   |-- PUT bytes (multipart) -----------------------------------&gt; |                      |
+   |&lt;------------------------------------------------- 200 OK --- |                      |
+   |                              |&lt;-- ObjectCreated event -------|                      |
+   |-- POST /posts {media_id,...}&gt;|-- "media.uploaded" ------------------------------&gt;  |
+   |                              |                               |   media workers resize/transcode
+</pre>
+<pre><code>import boto3
+s3 = boto3.client("s3")
+url = s3.generate_presigned_url(
+    "put_object",
+    Params={"Bucket": "ig-uploads-raw", "Key": f"raw/{media_id}",
+            "ContentType": "image/jpeg"},
+    ExpiresIn=900)            # 15 minutes; signature covers bucket, key, method, headers, expiry
+# The phone PUTs to `url`. The signature can't be reused for another key or for GET.</code></pre>
+<p>Security details: keep expiries short; sign the content type and (with POST policies) a maximum size; upload into a separate <strong>raw/quarantine bucket</strong> that is never served publicly until the <a href="media-processing.html">media pipeline</a> validates it; generate keys server-side so clients can't overwrite others' objects. Pre-signed <strong>GET</strong> URLs work the same way for private downloads, though at Instagram's scale downloads go through CDN-signed URLs (see <a href="cdn.html">CDN</a>).</p>
+
+<h2>5. Inside an object store</h2>
+<p>A distributed object store has three logical layers. Understanding them explains its performance and consistency behaviour.</p>
+<div class="flow">
+  <div class="fnode client">Client / CDN<small>HTTP request</small></div><div class="farrow">→</div>
+  <div class="fnode edge">Front-end / API tier<small>auth, signatures, routing</small></div><div class="farrow">→<small>where is key?</small></div>
+  <div class="fnode svc">Metadata (index) service<small>key → chunk locations</small></div><div class="farrow">→<small>read/write chunks</small></div>
+  <div class="fnode store">Storage nodes<small>disks, chunks, checksums</small></div>
+</div>
+<ul>
+  <li><strong>Front-end tier</strong> — stateless HTTP servers that authenticate requests (checking signatures and bucket policies), split large uploads, and stream bytes. Scaled horizontally behind load balancers.</li>
+  <li><strong>Metadata / index service</strong> — a distributed, strongly consistent key-value index mapping <code>(bucket, key, version)</code> → size, checksum and the list of chunk locations. It's partitioned by key range (so <code>LIST prefix=…</code> is a range scan) and replicated with a consensus protocol. This index, not the disks, is what limits request rate per key prefix.</li>
+  <li><strong>Storage nodes</strong> — servers packed with large HDDs (cheap per TB) that store <strong>chunks</strong>, often appended into large container files, each protected by a checksum. Background processes <strong>scrub</strong> (re-read and verify checksums), <strong>repair</strong> lost chunks from redundancy, and <strong>rebalance</strong> when nodes are added.</li>
+</ul>
+<p>A <code>PUT</code> streams the data to several storage nodes (replicas or erasure-coded fragments), waits until enough have durably written it, then commits the index entry — only then does it return 200. That ordering is why an acknowledged write survives failures.</p>
+
+<h2>6. Durability: replication and erasure coding</h2>
+<p><strong>Durability</strong> is the probability that data you stored is still there (uncorrupted) later. It's different from <strong>availability</strong> (can I read it <em>right now</em>?). S3 Standard is designed for <strong>99.999999999% ("11 nines") annual durability</strong> and 99.99% availability.</p>
+<p>What does 11 nines mean? The annual probability of losing a given object is about 10<sup>−11</sup>. If you store 10 million objects, you'd expect to lose one object about once every 10,000 years. At Instagram's scale (say 10<sup>12</sup> objects) the same rate still means ~10 objects per year — which is why hyperscalers add cross-region redundancy on top.</p>
+<p>Disks fail constantly at scale: with a ~1–2% annual failure rate, a fleet of 500,000 drives loses on the order of <strong>15–25 drives per day</strong>. Durability comes from storing redundant data in independent <strong>failure domains</strong> (disk, server, rack, power, availability zone) and <strong>repairing faster</strong> than further failures arrive.</p>
+
+<h3>6.1 Replication</h3>
+<p>Store N full copies (typically 3) on different nodes, ideally in different availability zones. Simple, fast to read (any copy) and fast to repair (just copy), but it costs <strong>3× the raw storage</strong> — 200% overhead. For hundreds of petabytes that's hundreds of petabytes of extra disks.</p>
+
+<h3>6.2 Erasure coding — the intuition</h3>
+<p>Erasure coding is "RAID for the data center". Split the object into <strong>k data fragments</strong>, compute <strong>m parity fragments</strong> from them, and store all <strong>k + m</strong> fragments on different nodes. The magic property of a <strong>Reed-Solomon</strong> code: <em>any</em> k of the k + m fragments are enough to reconstruct the original. You survive the loss of any m fragments while storing only <code>(k + m) / k</code> times the data.</p>
+<p><strong>Simplest case — XOR parity (k = 2, m = 1):</strong></p>
+<pre><code>D1 = 1011        D2 = 0110
+P  = D1 XOR D2 = 1101             (store D1, D2, P on three different nodes)
+
+Lose D2?  D2 = D1 XOR P = 1011 XOR 1101 = 0110  ✔
+Lose D1?  D1 = D2 XOR P = 0110 XOR 1101 = 1011  ✔
+Overhead: 3/2 = 1.5×, survives any 1 loss (replication would need 2× for the same).</code></pre>
+<p>XOR only survives one loss. Reed-Solomon generalises this: treat the k data fragments as coefficients of a polynomial over a finite field (Galois field arithmetic, so values stay in a byte range); the k + m fragments are the polynomial <strong>evaluated at k + m different points</strong>. A polynomial of degree k − 1 is uniquely determined by any k points (just as any 2 points determine a line), so any k surviving fragments let you recover all the data. Real systems use parameters like <strong>RS(6,3)</strong> (1.5×, survives 3 losses), <strong>RS(10,4)</strong> (1.4×, survives 4 losses) or wider.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 880 240" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-obj-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600">
+    <rect x="20" y="70" width="120" height="50" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="80" y="91" text-anchor="middle">Video part</text><text x="80" y="108" text-anchor="middle" font-weight="400" font-size="11.5">4 MB</text>
+    <rect x="180" y="70" width="130" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="245" y="91" text-anchor="middle">RS encoder</text><text x="245" y="108" text-anchor="middle" font-weight="400" font-size="11.5">k = 4, m = 2</text>
+  </g>
+  <g font-weight="600" text-anchor="middle">
+    <rect x="360" y="70" width="70" height="50" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="395" y="100">D1</text>
+    <rect x="442" y="70" width="70" height="50" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="477" y="100">D2</text>
+    <rect x="524" y="70" width="70" height="50" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="559" y="100">D3</text>
+    <rect x="606" y="70" width="70" height="50" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="641" y="100">D4</text>
+    <rect x="688" y="70" width="70" height="50" rx="6" fill="#f3e5f5" stroke="#6a1b9a"/><text x="723" y="100">P1</text>
+    <rect x="770" y="70" width="70" height="50" rx="6" fill="#f3e5f5" stroke="#6a1b9a"/><text x="805" y="100">P2</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-obj-1)">
+    <path d="M140,95 L178,95"/><path d="M310,95 L358,95"/>
+  </g>
+  <g fill="none" stroke="#455a64" stroke-dasharray="5 3">
+    <rect x="352" y="55" width="166" height="85" rx="8"/><rect x="520" y="55" width="162" height="85" rx="8"/><rect x="684" y="55" width="162" height="85" rx="8"/>
+  </g>
+  <g font-size="12" fill="#455a64" text-anchor="middle">
+    <text x="435" y="48">Availability zone A</text><text x="601" y="48">Availability zone B</text><text x="765" y="48">Availability zone C</text>
+  </g>
+  <g font-size="12" fill="#333" text-anchor="middle">
+    <text x="600" y="165">1 MB each · any 4 of the 6 fragments rebuild the data</text>
+    <text x="600" y="185">storage overhead 6/4 = 1.5× (vs 3× for triple replication)</text>
+    <text x="600" y="205">survives losing any 2 fragments — e.g. one whole AZ</text>
+  </g>
+</svg>
+<div class="caption">Reed-Solomon RS(4,2): four data fragments plus two parity fragments, spread so that losing an entire availability zone loses at most two fragments.</div>
+</div>
+
+<div class="table-wrap"><table>
+  <tr><th></th><th>3× replication</th><th>Erasure coding RS(10,4)</th></tr>
+  <tr><td><b>Raw storage per logical TB</b></td><td>3 TB</td><td>1.4 TB</td></tr>
+  <tr><td><b>Failures tolerated</b></td><td>Any 2 copies</td><td>Any 4 fragments</td></tr>
+  <tr><td><b>Normal read</b></td><td>Read one copy (1 disk)</td><td>Read k fragments from k disks (or one if stored systematically and you read a fragment range)</td></tr>
+  <tr><td><b>Degraded read / repair cost</b></td><td>Copy 1 replica</td><td>Read k fragments over the network to rebuild one — ~10× repair traffic</td></tr>
+  <tr><td><b>CPU</b></td><td>None</td><td>Encode/decode math (cheap with SIMD, but not free)</td></tr>
+  <tr><td><b>Small objects</b></td><td>Fine</td><td>Wasteful/slow — pack small objects into big stripes first</td></tr>
+  <tr><td><b>Best for</b></td><td>Hot, small, latency-sensitive data</td><td>Large, warm/cold, bulk data — most bytes in an object store</td></tr>
+</table></div>
+<p>Practical systems often combine both: <strong>replicate fresh, hot data</strong> (fast writes, cheap repairs) and <strong>erasure-code it once it cools</strong> — exactly the Haystack → f4 journey in section 9. Durability also needs end-to-end <strong>checksums</strong> (detect silent bit-rot), background <strong>scrubbing</strong>, and <strong>fast repair</strong>: the shorter the window between a failure and its repair, the less likely a second and third failure land in the same stripe.</p>
+
+<h2>7. Consistency</h2>
+<p>For years S3 offered <em>read-after-write consistency for new objects</em> but only <em>eventual consistency</em> for overwrites, deletes and <code>LIST</code> — a reader might see an old version or a list missing a just-written key. Since <strong>December 2020, S3 provides strong read-after-write consistency</strong> for all <code>PUT</code>s and <code>DELETE</code>s of objects and for <code>LIST</code> operations, at no extra cost. Google Cloud Storage and Azure Blob Storage are also strongly consistent for object operations.</p>
+<ul>
+  <li><strong>What "strong" means here:</strong> after a successful <code>PUT</code> returns, any subsequent <code>GET</code> or <code>LIST</code> (from anywhere) sees the new object/version.</li>
+  <li><strong>Concurrent writers:</strong> two simultaneous <code>PUT</code>s to the same key don't merge; the one with the latest timestamp wins (last-writer-wins). There is no locking. S3 has added <strong>conditional writes</strong> (e.g. <code>If-None-Match: *</code> to create-only-if-absent, and <code>If-Match</code> on ETag), which let you build compare-and-swap; otherwise coordinate via a database.</li>
+  <li><strong>No multi-object transactions:</strong> writing an object and its metadata row in your DB are separate; design for the gap (write the object first, then the DB row that references it; garbage-collect orphans).</li>
+  <li><strong>Caches downstream are not strongly consistent:</strong> the <a href="cdn.html">CDN</a> may still serve an old copy — another reason to use immutable, versioned keys.</li>
+  <li><strong>Cross-region replicas</strong> are asynchronous, so a replica bucket is eventually consistent with its source (see section 13).</li>
+</ul>
+<p>See <a href="cap-consistency.html">CAP &amp; Consistency Models</a> for the vocabulary.</p>
+
+<h2>8. Storage classes, lifecycle policies and cost</h2>
+<p>Not all bytes are equal. A photo posted today might be fetched (by the CDN) thousands of times this week and almost never next year. Object stores offer <strong>storage classes</strong> that trade lower storage price for higher retrieval cost or latency. Approximate S3 US list prices at the time of writing (check current pricing; at Meta's scale, custom hardware replaces these):</p>
+<div class="table-wrap"><table>
+  <tr><th>Class</th><th>≈ $/GB-month</th><th>Retrieval</th><th>Min. duration</th><th>Use for</th></tr>
+  <tr><td><b>Standard</b> (hot)</td><td>0.023</td><td>ms, no fee</td><td>none</td><td>New and frequently accessed media</td></tr>
+  <tr><td><b>Intelligent-Tiering</b></td><td>0.023 → lower tiers automatically</td><td>ms (archive tiers optional)</td><td>none (small monitoring fee/object)</td><td>Unknown or changing access patterns</td></tr>
+  <tr><td><b>Standard-IA</b> (infrequent access)</td><td>0.0125</td><td>ms, ~$0.01/GB fee</td><td>30 days; objects billed as ≥ 128 KB</td><td>Older media still viewable instantly</td></tr>
+  <tr><td><b>One Zone-IA</b></td><td>0.01</td><td>ms, fee</td><td>30 days</td><td>Re-creatable data (e.g. derived renditions)</td></tr>
+  <tr><td><b>Glacier Instant Retrieval</b></td><td>0.004</td><td>ms, higher fee (~$0.03/GB)</td><td>90 days</td><td>Rarely accessed but must be instant (old posts)</td></tr>
+  <tr><td><b>Glacier Flexible Retrieval</b> (archive)</td><td>~0.0036</td><td>minutes–hours</td><td>90 days</td><td>Backups, raw originals for disaster recovery</td></tr>
+  <tr><td><b>Glacier Deep Archive</b></td><td>~0.001</td><td>~12–48 hours</td><td>180 days</td><td>Compliance archives, legal holds</td></tr>
+</table></div>
+<p><strong>Lifecycle policies</strong> move or delete objects automatically based on age, prefix or tags:</p>
+<pre><code>{
+  "Rules": [
+    { "ID": "renditions-cool-down", "Filter": { "Prefix": "p/" }, "Status": "Enabled",
+      "Transitions": [ { "Days": 60,  "StorageClass": "STANDARD_IA" },
+                       { "Days": 365, "StorageClass": "GLACIER_IR" } ] },
+    { "ID": "raw-uploads-cleanup", "Filter": { "Prefix": "raw/" }, "Status": "Enabled",
+      "Expiration": { "Days": 7 },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 1 } },
+    { "ID": "old-versions", "Filter": {}, "Status": "Enabled",
+      "NoncurrentVersionExpiration": { "NoncurrentDays": 30 } }
+  ]
+}</code></pre>
+<h3>8.1 Cost reasoning: when does a cooler tier pay off?</h3>
+<p>Moving from Standard ($0.023) to Standard-IA ($0.0125) saves $0.0105 per GB-month but adds ~$0.01 per GB retrieved. So IA wins only if each byte is fetched from the <em>origin</em> less than about <strong>once a month</strong>. That's true for most old Instagram media precisely because the CDN absorbs repeat views. Other traps:</p>
+<ul>
+  <li><strong>Small objects:</strong> IA bills each object as at least 128 KB — a 20 KB thumbnail costs 6× its size. Keep tiny thumbnails in Standard (or pack them).</li>
+  <li><strong>Minimum durations:</strong> deleting a Glacier object after 10 days still bills 90 days. Don't archive Stories that expire in 24 hours.</li>
+  <li><strong>Archive tiers are not for user-facing media:</strong> nobody will wait 12 hours for a 2015 photo to load. Archive is for disaster-recovery copies of originals, compliance and logs.</li>
+  <li><strong>Request and transition fees</strong> add up with billions of objects: transitioning 10 billion objects at ~$0.01 per 1,000 requests is ~$100K by itself.</li>
+</ul>
+
+<h2>9. Lessons from Facebook's Haystack and f4</h2>
+<p>Facebook's photo storage papers — <em>Finding a needle in Haystack</em> (OSDI 2010) and <em>f4: Facebook's Warm BLOB Storage System</em> (OSDI 2014) — are the best public explanation of how a social network stores billions of small media files. Instagram today runs on Meta's infrastructure, so these ideas are directly relevant.</p>
+
+<h3>9.1 The problem: per-file metadata overhead</h3>
+<p>Facebook originally stored each photo as a file on NFS-mounted network storage. The Haystack paper (which reported ~260 billion images and ~20 PB at the time) explains why that broke down:</p>
+<ul>
+  <li>Reading one photo from a regular file system takes <strong>several disk operations</strong>: translate the path to an inode (directory lookups), read the inode, then read the data. Directories with thousands of files made it worse; the paper reports about <strong>3 disk operations per photo</strong> in practice.</li>
+  <li>The obvious fix — keep all metadata in RAM — doesn't fit: a Linux XFS inode structure is hundreds of bytes (the paper cites 536 bytes), times billions of files, and most of it (permissions, owner, timestamps) is useless for photos.</li>
+  <li>The CDN absorbs popular photos, but social networks have a <strong>long tail</strong>: many requests are for old, unpopular photos that miss the CDN and hit storage. Those reads were dominated by metadata seeks, not by reading the photo bytes.</li>
+</ul>
+<p>Lesson: <strong>at billions of small objects, metadata, not bandwidth, is the bottleneck.</strong> The goal became "one disk operation per photo read".</p>
+
+<h3>9.2 The Haystack design: needles in big volume files</h3>
+<div class="diagram">
+<svg viewBox="0 0 880 250" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-obj-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <rect x="20" y="30" width="250" height="170" rx="8" fill="#e8f5e9" stroke="#2e7d32"/>
+  <text x="145" y="52" text-anchor="middle" font-weight="700">In-memory index (RAM)</text>
+  <g font-size="11.5">
+    <text x="32" y="76" font-weight="600">photo key, size → offset, len</text>
+    <rect x="32" y="84" width="226" height="24" fill="#fff" stroke="#2e7d32"/><text x="40" y="101">8812, 1080 → 0, 240 KB</text>
+    <rect x="32" y="112" width="226" height="24" fill="#fff" stroke="#2e7d32"/><text x="40" y="129">8812, 320 → 240 KB, 40 KB</text>
+    <rect x="32" y="140" width="226" height="24" fill="#fff" stroke="#2e7d32"/><text x="40" y="157">9031, 1080 → 51.7 GB, 230 KB</text>
+    <text x="40" y="186" fill="#555">~10 bytes per photo, not ~500</text>
+  </g>
+  <text x="575" y="52" text-anchor="middle" font-weight="700">Physical volume file (~100 GB, append-only)</text>
+  <rect x="320" y="70" width="520" height="56" fill="#fff8e1" stroke="#f9a825"/>
+  <g stroke="#f9a825">
+    <line x1="400" y1="70" x2="400" y2="126"/><line x1="450" y1="70" x2="450" y2="126"/><line x1="560" y1="70" x2="560" y2="126"/><line x1="600" y1="70" x2="600" y2="126"/><line x1="720" y1="70" x2="720" y2="126"/>
+  </g>
+  <g font-size="11" text-anchor="middle">
+    <text x="360" y="102">needle</text><text x="425" y="102">ndl</text><text x="505" y="102">needle</text><text x="580" y="102">✗ del</text><text x="660" y="102">needle</text><text x="780" y="102">free → append</text>
+  </g>
+  <rect x="320" y="150" width="520" height="66" rx="6" fill="#fff" stroke="#999"/>
+  <text x="330" y="170" font-size="11.5" font-weight="600">Needle layout:</text>
+  <text x="330" y="188" font-size="11.5">magic | cookie | key | alt key | flags | size | DATA | checksum | pad</text>
+  <text x="330" y="206" font-size="11.5" fill="#555">cookie = random value in the URL, so URLs can't be guessed</text>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-obj-2)">
+    <path d="M258,96 C290,96 300,96 322,96"/>
+  </g>
+  <text x="290" y="88" text-anchor="middle" font-size="11" fill="#555">1 seek</text>
+</svg>
+<div class="caption">Haystack keeps a tiny per-photo index in RAM and packs millions of photos ("needles") into a few huge append-only files, so a read is one seek plus one sequential read.</div>
+</div>
+<ul>
+  <li><strong>Physical volumes:</strong> each Store machine holds ~100 large files (~100 GB each). Millions of photos are <strong>appended</strong> into each file as <em>needles</em> (header, cookie, 64-bit key, alternate key for the size variant, flags, data, checksum).</li>
+  <li><strong>Logical volumes:</strong> a write is appended synchronously to the same logical volume on <strong>3 physical volumes</strong> on different machines (replication).</li>
+  <li><strong>In-memory index:</strong> each Store keeps a map <code>(key, alt key) → (flags, offset, size)</code> — on the order of 10 bytes per photo — so reading is: look up RAM, one <code>pread()</code> at the offset. An index file checkpoint speeds up restarts.</li>
+  <li><strong>Haystack Directory:</strong> maps logical volumes to physical machines, load-balances writes over writable volumes, and marks full volumes <strong>read-only</strong>. URLs encode the CDN, Cache, machine and logical volume + photo ID, so serving needs no extra lookup.</li>
+  <li><strong>Haystack Cache:</strong> an internal cache in front of the Stores, mainly for <strong>recently uploaded</strong> photos (the hottest ones) that the CDN hasn't absorbed yet.</li>
+  <li><strong>Deletes</strong> just set a flag; a background <strong>compaction</strong> copies live needles to a new file and drops deleted ones — the same trick as LSM-tree compaction (see <a href="indexing.html">Indexing</a>).</li>
+</ul>
+<p>Modern object stores use the same core idea internally: <strong>pack small objects into large append-only containers</strong> and keep a compact index — it's why S3 can store trillions of objects.</p>
+
+<h3>9.3 f4: warm storage with erasure coding</h3>
+<p>Haystack's replication (3 copies, each on RAID-6 disks) gave an effective replication factor of about <strong>3.6×</strong>. But request rates for photos and videos drop sharply with age: the newest content is "hot", while the vast majority of bytes are "warm" — still occasionally viewed, still needing low latency, but rarely. Paying 3.6× for warm data is wasteful. The f4 paper describes moving BLOBs whose volumes have cooled (after some months) from Haystack into <strong>f4</strong>:</p>
+<ul>
+  <li>Inside a cell, data is <strong>Reed-Solomon(10,4)</strong> erasure-coded → 1.4×, tolerating 4 failures in a stripe, with fragments spread across racks.</li>
+  <li>For region-level failures, rather than a second full copy (2 × 1.4 = 2.8×), f4 <strong>XORs</strong> blocks from two different regions and stores the XOR in a third region, bringing the effective factor down to about <strong>2.1×</strong>.</li>
+  <li>Warm data is read-only (no updates), which makes erasure coding simple; deletes are handled by encrypting each BLOB with its own key and deleting the key.</li>
+</ul>
+<p>Takeaway: <strong>tier by temperature</strong>. Hot: replicated, fast, maybe cached. Warm: erasure-coded, still online. Cold: archived. The physical storage cost difference between 3.6× and 2.1× across tens of petabytes is enormous.</p>
+
+<h2>10. Key naming design</h2>
+<p>Keys look trivial but affect performance, security, operations and cost.</p>
+<pre><code>Good:   {hash4}/p/{post_id}/{version}/{rendition}.{ext}
+        e.g. 7c2e/p/3049215820194820101/v2/1080.webp
+Bad:    photos/2026/10/23/ana_k_beach_holiday.jpg</code></pre>
+<ul>
+  <li><strong>Spread load across the keyspace.</strong> The metadata index is partitioned by key range. S3 supports at least ~3,500 writes and ~5,500 reads per second <em>per partitioned prefix</em> and splits busy ranges automatically, but keys that all start with today's date (or with a time-ordered ID!) concentrate all new uploads on one range. Prefixing with a short hash of the ID (<code>7c2e/</code>) spreads writes evenly. Note that Instagram-style IDs are time-sortable (see <a href="id-generation.html">ID Generation</a>), so <code>p/{post_id}</code> alone would cluster new writes.</li>
+  <li><strong>Immutable, versioned keys.</strong> Never overwrite; a changed rendition gets a new version segment → no CDN purge needed and caches can use <code>immutable</code>.</li>
+  <li><strong>Unguessable and PII-free.</strong> Don't put usernames or captions in keys (they leak and change); use IDs plus a random component or signed URLs so private photos can't be enumerated (Haystack's "cookie" serves this purpose).</li>
+  <li><strong>Group by lifecycle.</strong> Prefixes or separate buckets per data class (<code>raw/</code>, <code>p/</code>, <code>stories/</code>, <code>backups/</code>) let lifecycle rules, replication and permissions target them precisely.</li>
+  <li><strong>Derivable keys.</strong> If the rendition key can be computed from <code>post_id + size + format</code>, the DB stores one media ID instead of a dozen URLs.</li>
+  <li><strong>Content addressing (optional).</strong> Keying by <code>sha256(content)</code> gives free deduplication (the same meme uploaded 10,000 times is stored once) but complicates deletion (reference counting) and leaks "has this file been uploaded before?".</li>
+</ul>
+
+<h2>11. Cost and capacity math for Instagram</h2>
+<p>All inputs are assumptions for practice (see <a href="capacity-estimation.html">Back-of-the-Envelope Estimation</a>):</p>
+<pre><code>Photos: 100M/day × (2 MB original + 0.5 MB of renditions: 1080/640/320/thumbnail, JPEG+WebP/AVIF)
+        = 100M × 2.5 MB = 250 TB/day
+Videos: 20M/day × 40 MB (original + bitrate ladder of HLS/DASH segments)
+        = 800 TB/day
+Total logical ≈ 1.05 PB/day  ≈ 380 PB/year  (and it accumulates forever)
+
+Ingress bandwidth: 1.05 PB / 86,400 s ≈ 12 GB/s ≈ 100 Gbps average (peaks 2–3×)
+
+Physical storage for one year of uploads:
+  3× replication     → 380 × 3   ≈ 1,140 PB
+  RS(10,4) (1.4×)    → 380 × 1.4 ≈   530 PB
+  20 TB drives       → ~57,000 drives vs ~26,600 drives — erasure coding saves ~30,000 drives/year
+
+At cloud list prices (just for intuition):
+  380 PB in Standard  ≈ 380M GB × $0.023 ≈ $8.7M per month
+  Tiered (most bytes in IA after 60 days, avg ≈ $0.0135) ≈ $5.1M per month
+  … for ONE year of uploads; year 2 adds another 380 PB.
+
+Egress if users downloaded directly from the bucket: assume 10 PB/day × ~$0.05/GB
+  ≈ $500K per DAY → serving through a CDN / own edge network is mandatory.</code></pre>
+<p>These numbers explain why Meta builds its own storage (Haystack, f4 and successors) and edge network rather than renting: at exabyte scale, replication factor, disk density and egress pricing dominate the bill.</p>
+
+<h2>12. Deletion, privacy and GDPR</h2>
+<p>Deleting is harder than storing. When a user deletes a post (or their whole account), every copy must eventually disappear: all renditions, all replicas and erasure-coded fragments, CDN copies, cross-region replicas, old versions, and backups. Regulations such as the EU's GDPR ("right to erasure") require doing this without undue delay; Meta's public policy says deletion can take up to 90 days to fully complete across its systems.</p>
+<ol class="steps">
+  <li><strong>Soft delete immediately:</strong> mark the post deleted in the metadata DB. The API stops returning it and stops issuing URLs. Signed CDN URLs already handed out expire within minutes to hours.</li>
+  <li><strong>Purge caches:</strong> issue CDN purges for the media URLs (belt and braces; see <a href="cdn.html">CDN</a>).</li>
+  <li><strong>Enqueue a durable deletion job</strong> (e.g. a Kafka topic or deletion queue — see <a href="message-queues.html">Message Queues</a>) that enumerates <em>every</em> derived object — derivable keys or a manifest of renditions makes this reliable — and deletes them idempotently with retries.</li>
+  <li><strong>Versioned buckets:</strong> a plain <code>DELETE</code> only adds a delete marker; old versions remain. Delete specific version IDs or rely on a short <code>NoncurrentVersionExpiration</code> rule.</li>
+  <li><strong>Physical reclamation:</strong> in Haystack-style stores, compaction actually removes the bytes later; in erasure-coded warm storage, rewriting stripes is expensive, so f4 uses <strong>per-BLOB encryption keys</strong> and deletes the key ("crypto-shredding") — the remaining ciphertext is unreadable noise.</li>
+  <li><strong>Backups</strong> age out on a fixed retention schedule, or are also crypto-shredded by deleting per-user keys.</li>
+  <li><strong>Verify:</strong> deletion frameworks (Meta has published about its <em>DELF</em> framework) track every data type linked to a user so nothing is orphaned, and audit that deletion completed.</li>
+</ol>
+<div class="callout warn"><span class="callout-title">⚠️ Retention conflicts</span>
+Legal holds, law-enforcement preservation requests and child-safety reporting obligations can require keeping specific data even after a user deletes it. S3 <strong>Object Lock</strong> (WORM: write once, read many) and legal-hold flags enforce this; your deletion pipeline must respect them. Stories that "disappear after 24 hours" are hidden from viewers, not necessarily destroyed — they may live on in the user's private archive (see <a href="stories.html">Stories</a>).</div>
+
+<h2>13. Cross-region replication</h2>
+<p>A single region can fail (power, network, natural disaster). Object stores offer <strong>cross-region replication (CRR)</strong>: every new object written to a source bucket is copied <strong>asynchronously</strong> to a bucket in another region. S3 Replication Time Control offers an SLA of replicating 99.99% of objects within 15 minutes.</p>
+<ul>
+  <li><strong>Why:</strong> disaster recovery (RPO of minutes for media), lower-latency origin pulls for CDN shields in other continents, and compliance copies.</li>
+  <li><strong>Cost:</strong> a second full copy plus inter-region transfer (~$0.02/GB on AWS). At 1 PB/day that's ~$20K/day in transfer alone — so replicate selectively: originals and popular renditions; lesser renditions can be <strong>re-generated</strong> from the original by the media pipeline.</li>
+  <li><strong>Gotchas:</strong> replication is eventually consistent (a just-uploaded photo may 404 in the other region — fall back to the source region on miss); decide whether deletes (delete markers) replicate; avoid loops in bidirectional setups; respect <strong>data residency</strong> rules that forbid some data from leaving a jurisdiction.</li>
+  <li><strong>Alternatives:</strong> geo-distributed erasure coding (f4's XOR across regions) or dual-region buckets that write synchronously to two locations.</li>
+</ul>
+<p>See <a href="multi-region.html">Multi-Region &amp; Disaster Recovery</a> for RPO/RTO and failover.</p>
+
+<h2>14. Serving through the CDN</h2>
+<p>Object storage is optimised for durability and throughput, not for being hit by billions of phones. Users should <strong>never download directly from the bucket</strong>:</p>
+<ul>
+  <li>The bucket is <strong>private</strong>; only the CDN (authenticated with an origin access identity/control or private network) can read it.</li>
+  <li>The CDN does <strong>origin pull</strong> with an <strong>origin shield</strong>, so even a viral post causes a handful of origin reads (request collapsing).</li>
+  <li>Objects are written with <code>Cache-Control: public, max-age=31536000, immutable</code> because keys are versioned.</li>
+  <li>Apps receive <strong>signed CDN URLs</strong> (expiry + HMAC) from the API, not bucket URLs; the CDN validates them at the edge.</li>
+  <li>Video is fetched as small HLS/DASH segments or with <strong>Range</strong> requests, which the CDN caches individually (see <a href="media-processing.html">Media Processing</a>).</li>
+  <li>With a 95–99% CDN hit ratio, the origin serves only a few percent of media bytes — which is why cheaper, slower warm tiers are acceptable for old media.</li>
+</ul>
+
+<h2>15. How Instagram uses object storage</h2>
+<div class="flow">
+  <div class="fnode client">📱 App<small>gets pre-signed URL</small></div><div class="farrow">→<small>multipart PUT</small></div>
+  <div class="fnode store">Raw upload bucket<small>quarantine</small></div><div class="farrow">→<small>event via Kafka</small></div>
+  <div class="fnode async">Media workers<small>validate, resize, transcode</small></div><div class="farrow">→<small>PUT renditions</small></div>
+  <div class="fnode store">Media store<small>hot → warm tiers</small></div><div class="farrow">→<small>origin pull</small></div>
+  <div class="fnode edge">CDN<small>serves users</small></div>
+</div>
+<ol>
+  <li>The <a href="media-upload.html">Upload Service</a> authenticates the user, creates a media ID (see <a href="id-generation.html">ID Generation</a>), and returns a pre-signed, short-lived upload URL. The phone uploads directly (multipart and resumable for video).</li>
+  <li>An object-created event lands on Kafka; <a href="media-processing.html">Media Processing Workers</a> validate the file, strip EXIF location data, run moderation, and write renditions under immutable, hash-prefixed keys.</li>
+  <li>The post's metadata row in Cassandra stores the media ID and available renditions — never the bytes.</li>
+  <li>The <a href="news-feed.html">Feed</a> returns signed CDN URLs; the CDN pulls from object storage on a miss.</li>
+  <li>As media cools, it moves from replicated hot storage to erasure-coded warm storage; raw uploads in the quarantine bucket expire after a few days; originals may be kept for re-processing into new formats (e.g. AVIF) later.</li>
+</ol>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+Our architecture diagram labels this box "Object Storage (S3)", and early Instagram (2010–2012) did store photos on Amazon S3 while running on AWS, as described in the team's public "What Powers Instagram" engineering post. After moving into Facebook's data centers, Instagram media lives in Meta's in-house BLOB storage, whose public lineage is <strong>Haystack</strong> (hot photos, replicated) → <strong>f4</strong> (warm, erasure-coded) and later systems. For design interviews, saying "S3-compatible object storage, private bucket, pre-signed uploads, lifecycle tiering, CDN in front" is exactly right; mentioning Haystack's metadata insight shows depth.</div>
+
+<h2>16. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Strengths</h4><ul>
+    <li>Virtually unlimited scale and very high durability</li>
+    <li>Cheapest storage per GB, with even cheaper tiers</li>
+    <li>Simple HTTP API; direct client uploads via pre-signed URLs</li>
+    <li>Perfect fit for immutable media and CDN origins</li>
+    <li>Fully managed (cloud) — no disks to replace</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Limitations</h4><ul>
+    <li>Higher latency than block/file storage (tens of ms to first byte)</li>
+    <li>No in-place updates, appends, renames or locking</li>
+    <li>No transactions across objects or with your DB</li>
+    <li>LIST is slow and paginated — not a query engine</li>
+    <li>Egress, request and retrieval fees can surprise you</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Proxying uploads through app servers</strong> instead of pre-signed direct uploads → bandwidth bottleneck.</li>
+  <li><strong>Public buckets</strong> — the most common cause of real-world data leaks. Keep buckets private; serve through a CDN with signed URLs.</li>
+  <li><strong>Using LIST as a database</strong> ("list all photos of user X") — store an index in your DB instead.</li>
+  <li><strong>Overwriting keys</strong> → stale CDN copies and race conditions; use versioned keys.</li>
+  <li><strong>Forgetting incomplete multipart uploads and old versions</strong> — silent, growing storage bills.</li>
+  <li><strong>Archiving user-facing media</strong> into hours-latency tiers, or archiving tiny/short-lived objects that hit minimum-size/duration charges.</li>
+  <li><strong>Orphans:</strong> writing the object but failing to write the DB row (or vice versa); run a periodic reconciliation/garbage-collection job.</li>
+  <li><strong>Hot prefixes</strong> from date- or sequential-ID-first key names.</li>
+</ul>
+
+<h2>17. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>Notes</th><th>When to use</th></tr>
+  <tr><td>Amazon S3</td><td>The de-facto API standard; storage classes, lifecycle, CRR, Object Lock, strong consistency</td><td>Default choice on AWS</td></tr>
+  <tr><td>Google Cloud Storage</td><td>Strongly consistent; dual/multi-region buckets; Autoclass tiering</td><td>GCP workloads, built-in geo-redundancy</td></tr>
+  <tr><td>Azure Blob Storage</td><td>Hot/cool/cold/archive tiers; block/append/page blobs</td><td>Azure workloads</td></tr>
+  <tr><td>Cloudflare R2, Backblaze B2, Wasabi</td><td>S3-compatible, low or zero egress fees</td><td>Egress-heavy workloads, often paired with a CDN</td></tr>
+  <tr><td>MinIO</td><td>S3-compatible object server you run yourself; erasure coding</td><td>On-prem / private cloud, dev/test</td></tr>
+  <tr><td>Ceph (RADOS Gateway)</td><td>Open-source unified block/file/object storage with CRUSH placement</td><td>Large self-hosted clusters</td></tr>
+  <tr><td>HDFS</td><td>Distributed <em>file</em> system for big-data batch jobs (large files, append-only)</td><td>Hadoop/Spark analytics, not media serving</td></tr>
+  <tr><td>Haystack / f4 (Meta, internal)</td><td>Needle-packed hot store; erasure-coded warm store</td><td>Reference designs for billions of small media files</td></tr>
+</table></div>
+
+<h2>18. Interview corner</h2>
+<details class="qa"><summary>Why not store photos in the database?</summary>
+<p>Databases are optimised for small, indexed, transactional rows. Multi-MB blobs pollute the buffer pool, slow replication, backups and schema changes, and cost far more per GB (fast SSD, replicas, RAM). Object storage is ~10× cheaper per GB, scales to exabytes, gives 11-nines durability, and integrates with CDNs. Store bytes in object storage and only metadata (owner, caption, media ID/keys, dimensions) in the database.</p></details>
+<details class="qa"><summary>Design the photo upload path.</summary>
+<p>Client calls the Upload Service (authenticated), which validates quota/size/type, allocates a media ID and returns a pre-signed PUT (or multipart) URL for a private raw bucket, valid ~15 minutes. The client uploads directly to object storage, resumably for large videos. An object-created notification (or the client's "finalize" call) publishes a Kafka event; media workers validate, strip EXIF, generate renditions, run moderation and write processed objects to the media bucket under immutable keys, then mark the post ready. Raw uploads expire via lifecycle; incomplete multipart uploads are aborted after a day.</p></details>
+<details class="qa"><summary>Explain erasure coding vs replication and when you'd use each.</summary>
+<p>Replication stores N full copies: 3× storage, survives N−1 losses, trivial reads and cheap repair. Erasure coding (Reed-Solomon k+m) splits data into k fragments plus m parity; any k fragments reconstruct it, so RS(10,4) survives 4 losses at only 1.4× storage — but repairs need reading k fragments (more network), small objects are inefficient and there's CPU cost. Use replication for hot, small, latency-critical data; erasure coding for the bulk of warm/cold bytes. Facebook's Haystack (≈3.6×) → f4 (≈2.1×) migration is the canonical example.</p></details>
+<details class="qa"><summary>What problem did Haystack solve, and how?</summary>
+<p>Billions of small photos as individual files meant multiple disk seeks per read just for file-system metadata (directory, inode), and inode metadata was too large to cache in RAM. Haystack appends photos as needles into ~100 GB volume files and keeps a ~10-byte-per-photo in-memory index from photo key to (offset, size), so a read is one seek. Writes go to 3 replicas of a logical volume; deletes set a flag and compaction reclaims space; a Directory maps logical to physical volumes and a Cache serves freshly uploaded hot photos.</p></details>
+<details class="qa"><summary>How would you reduce storage cost for Instagram media by 40%+?</summary>
+<p>(1) Erasure-code warm data instead of replicating (3× → 1.4–2.1×). (2) Lifecycle tiering based on age/access: hot → infrequent-access tier after ~60 days, since the CDN absorbs repeat reads. (3) Better codecs (WebP/AVIF for images, AV1/HEVC for video) cut bytes 25–50% at equal quality. (4) Generate rare renditions lazily rather than eagerly. (5) Dedupe identical uploads by content hash. (6) Expire raw uploads, incomplete multipart uploads and non-current versions. (7) Don't replicate cross-region what can be regenerated.</p></details>
+<details class="qa"><summary>A user deletes their account. How do you make sure all their media is gone?</summary>
+<p>Soft-delete metadata immediately so nothing is served; issue CDN purges; enqueue a durable, idempotent deletion workflow that enumerates every media object (via the metadata index and derivable rendition keys) across all regions and versions and deletes them; for erasure-coded or backup data, rely on crypto-shredding by deleting per-user/per-object keys; let backups age out within a documented window; respect legal holds; and audit completion with a deletion framework that tracks all data types linked to the user.</p></details>
+<details class="qa"><summary>S3 used to be eventually consistent. Why did that matter, and what changed?</summary>
+<p>Before December 2020, overwrites, deletes and LIST were eventually consistent: a reader might get an old version or a listing missing new keys, which broke pipelines that wrote then listed (e.g. data lakes needed external consistency layers). Since then S3 offers strong read-after-write consistency for all object PUT/DELETE and LIST operations. Downstream caches (CDN) and cross-region replicas are still eventually consistent, so immutable keys remain best practice.</p></details>
+
+<h2>19. Check your understanding</h2>
+<details class="quiz"><summary>Block, file or object: (a) PostgreSQL data directory, (b) 4K Reel video segments, (c) a shared folder of config files mounted by 20 servers?</summary>
+<p>(a) <strong>Block</strong> — databases need low-latency random in-place writes. (b) <strong>Object</strong> — immutable, large volume, served via CDN. (c) <strong>File</strong> — POSIX semantics shared by many hosts.</p></details>
+<details class="quiz"><summary>RS(6,3): what's the storage overhead and how many fragment losses can it survive?</summary>
+<p>9/6 = <strong>1.5×</strong> overhead; survives any <strong>3</strong> lost fragments (any 6 of 9 reconstruct the data). Triple replication survives only 2 losses at 3×.</p></details>
+<details class="quiz"><summary>You store 1 billion objects with 11 nines of annual durability. How many do you expect to lose per year?</summary>
+<p>10⁹ × 10⁻¹¹ = <strong>0.01 objects/year</strong> — one object roughly every 100 years.</p></details>
+<details class="quiz"><summary>Why does "keep the inode metadata in RAM" fail for billions of photos, while Haystack's in-memory index succeeds?</summary>
+<p>A file-system inode is hundreds of bytes (536 B for XFS per the paper) with fields photos don't need; billions of them don't fit in RAM. Haystack stores only what's needed — key, flags, offset, size — about 10 bytes per photo, so the whole index fits in memory and a read needs a single disk seek.</p></details>
+<details class="quiz"><summary>A 15 KB thumbnail is moved to Standard-IA. Why might that <em>increase</em> its cost?</summary>
+<p>IA bills a minimum of 128 KB per object, so the 15 KB thumbnail is billed as 128 KB × $0.0125 ≈ more than 15 KB × $0.023 in Standard (≈ 4.6× more), plus retrieval fees per access. Small objects should stay in Standard or be packed together.</p></details>
+<details class="quiz"><summary>Your upload keys are <code>p/{post_id}/1080.jpg</code> where post IDs are time-sortable. Writes are throttled during peaks (503 Slow Down). Why, and how do you fix it?</summary>
+<p>Time-sortable IDs make all new keys share a narrow, increasing key range, so every upload hits the same index partition (hot prefix). Prefix keys with a short hash (<code>{hash4}/p/{post_id}/…</code>) to spread writes across many partitions.</p></details>
+<details class="quiz"><summary>The phone uploads a 1.5 GB video with a single PUT over a mobile network and fails at 90%. What should the design do instead?</summary>
+<p>Use <strong>multipart upload</strong>: split into e.g. 10 MB parts, upload several in parallel, retry only failed parts, and resume after interruption using the UploadId; complete when all parts are done. Add a lifecycle rule to abort abandoned uploads.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Object storage = flat namespace of immutable <strong>key → bytes + metadata</strong> objects over HTTP; it trades file-system features for limitless, cheap scale.</li>
+    <li>Upload with <strong>pre-signed URLs</strong> and <strong>multipart</strong>; download through the <strong>CDN</strong> from a private bucket.</li>
+    <li>Durability comes from redundancy across failure domains: <strong>replication</strong> (simple, 3×) or <strong>erasure coding</strong> (Reed-Solomon, ~1.4×), plus checksums, scrubbing and fast repair.</li>
+    <li>S3 is <strong>strongly consistent</strong> for object operations since 2020, but CDN caches and cross-region replicas are not — use immutable versioned keys.</li>
+    <li>Tier by temperature with <strong>storage classes and lifecycle rules</strong>; Haystack → f4 shows hot replicated → warm erasure-coded storage at Meta scale.</li>
+    <li>Design keys for load spreading, immutability and privacy; design deletion as a durable, auditable workflow.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="media-upload.html">Media Upload Service &amp; Pre-signed URLs</a> — the client-side upload flow in detail</li>
+  <li><a href="media-processing.html">Media Processing Pipeline</a> — how renditions are produced and stored</li>
+  <li><a href="cdn.html">CDN</a> — how stored media reaches users quickly</li>
+  <li><a href="replication.html">Replication</a> — the general theory behind copies and failure domains</li>
+  <li><a href="multi-region.html">Multi-Region &amp; DR</a> — cross-region replication, RPO and RTO</li>
+  <li><a href="security.html">Security &amp; Privacy</a> — encryption at rest, private buckets, deletion obligations</li>
+  <li><a href="capacity-estimation.html">Back-of-the-Envelope Estimation</a> — storage growth and cost math</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

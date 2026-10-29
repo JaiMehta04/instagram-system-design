@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Monitoring, Logging &amp; Tracing — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="observability">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li><strong>Monitoring</strong> tells you <em>that</em> something is wrong (known failure modes, dashboards, alerts); <strong>observability</strong> lets you ask new questions to find out <em>why</em>, without shipping new code.</li>
+    <li>Telemetry comes as <strong>metrics</strong> (cheap numbers over time), <strong>logs</strong> (detailed event records), <strong>traces</strong> (one request's path across services), plus <strong>profiles</strong> and change <strong>events</strong>.</li>
+    <li>Watch the <strong>four golden signals</strong> (latency, traffic, errors, saturation); use <strong>RED</strong> for services and <strong>USE</strong> for resources. Measure latency with <strong>percentiles from histograms</strong> — averages lie.</li>
+    <li>Define reliability with <strong>SLIs → SLOs → SLAs</strong> and manage it with <strong>error budgets</strong>; alert on <strong>symptoms</strong> and budget burn, page only for urgent user impact, and attach a <strong>runbook</strong> to every alert.</li>
+    <li>Run <strong>on-call</strong> and <strong>incident management</strong> with clear roles, and learn with <strong>blameless postmortems</strong>. Common tools: Prometheus, Grafana, ELK/OpenSearch, OpenTelemetry, Jaeger, Datadog.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why do we need observability?</h2>
+<p>It's 9 p.m. in Brazil, peak time. Some users report that the Instagram feed takes ten seconds to load. Somewhere among the <a href="load-balancer.html">load balancers</a>, the <a href="api-gateway.html">API Gateway</a>, the <a href="news-feed.html">News Feed Service</a>, ranking, Redis feed caches, Cassandra, the user DB, the <a href="cdn.html">CDN</a> and thousands of servers in several regions, something is wrong. Questions you must answer in minutes:</p>
+<ul>
+  <li>Is it real, and how many users are affected? Only Brazil? Only Android? Only one app version?</li>
+  <li>Which component is slow — and is it the cause, or just a victim of something further down?</li>
+  <li>Did anything change recently — a deploy, a config flag, a traffic spike from a viral post?</li>
+</ul>
+<p>In a monolith on one server you'd SSH in and look at the logs. In a distributed system with hundreds of services, a single user request touches dozens of machines; no human can inspect them one by one. You need the system to <strong>emit telemetry</strong> that is collected, stored and queryable centrally. That is what this lesson is about.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  A car's <strong>dashboard</strong> (speed, fuel, warning lights) is monitoring: a fixed set of gauges for problems the designers anticipated. When a strange noise appears that no warning light covers, the <strong>mechanic</strong> plugs in a diagnostic computer, reads detailed sensor logs, and follows the problem through the engine — that's observability: rich enough data to investigate problems nobody predicted. A hospital adds the rest: vital-sign thresholds that page a nurse (<strong>alerting</strong>), on-call doctors (<strong>on-call</strong>), and case reviews after something goes wrong where the goal is to fix the process, not to blame the nurse (<strong>blameless postmortems</strong>).
+</div>
+
+<h2>2. Monitoring vs observability</h2>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Monitoring</th><th>Observability</th></tr>
+  <tr><td><b>Question</b></td><td>"Is the system working? Is a known bad thing happening?"</td><td>"Why is it behaving this way?" — including for failures nobody predicted.</td></tr>
+  <tr><td><b>Approach</b></td><td>Predefined metrics, dashboards and threshold alerts.</td><td>High-cardinality, richly-attributed telemetry you can slice arbitrarily (by user, app version, shard, region, endpoint…).</td></tr>
+  <tr><td><b>Handles</b></td><td>Known-unknowns ("disk might fill up").</td><td>Unknown-unknowns ("Android 312.0 users on one carrier in São Paulo get slow feeds only for posts with carousels").</td></tr>
+  <tr><td><b>Relation</b></td><td colspan="2">Monitoring is a <em>subset</em> of observability. You need both: monitoring to detect, observability to diagnose.</td></tr>
+</table></div>
+
+<h2>3. The pillars of telemetry</h2>
+<div class="cards">
+  <div class="card"><h4>📈 Metrics</h4><p>Numeric measurements aggregated over time: request rate, error count, p99 latency, CPU %. Tiny and cheap per data point; great for dashboards and alerts; lose per-request detail.</p></div>
+  <div class="card"><h4>📜 Logs</h4><p>Timestamped records of discrete events with context: "user 42 upload failed: S3 timeout". Rich detail; expensive at volume.</p></div>
+  <div class="card"><h4>🧵 Traces</h4><p>The path of one request across services as a tree of timed <em>spans</em>. Show where time went and which dependency failed.</p></div>
+  <div class="card"><h4>🔥 Profiles</h4><p>Where CPU time and memory go <em>inside</em> a process, down to functions (flame graphs). Continuous profiling samples production all the time at low overhead.</p></div>
+  <div class="card"><h4>🏷️ Events / changes</h4><p>Deploys, config/feature-flag changes, schema migrations, failovers. Most incidents are caused by a change — overlaying change events on graphs is often the fastest diagnosis.</p></div>
+</div>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Metrics</th><th>Logs</th><th>Traces</th></tr>
+  <tr><td><b>Answers</b></td><td>Is something wrong? How much? Trend?</td><td>What exactly happened in this event?</td><td>Where in the request path is the problem?</td></tr>
+  <tr><td><b>Cost driver</b></td><td>Number of unique time series (cardinality)</td><td>Bytes ingested and retained</td><td>Number of spans kept (sampling rate)</td></tr>
+  <tr><td><b>Typical retention</b></td><td>Months–years (downsampled)</td><td>Days–weeks hot, longer in cold storage</td><td>Days</td></tr>
+  <tr><td><b>Typical tools</b></td><td>Prometheus, Datadog, Meta's ODS/Gorilla</td><td>ELK/OpenSearch, Loki, Splunk</td><td>Jaeger, Zipkin, Tempo, Meta's Canopy</td></tr>
+</table></div>
+<p>The pillars are most powerful when <strong>linked</strong>: a latency spike on a dashboard → click through to example traces from that minute (via <em>exemplars</em>) → a slow span → the logs for that span (same <code>trace_id</code>) → the profile of the slow host.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 860 280" width="860" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-obs-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600">
+    <rect x="15" y="30" width="150" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="90" y="51" text-anchor="middle">Services</text><text x="90" y="68" text-anchor="middle" font-weight="400" font-size="11">OpenTelemetry SDK</text>
+    <rect x="15" y="115" width="150" height="50" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="90" y="136" text-anchor="middle">Mobile apps</text><text x="90" y="153" text-anchor="middle" font-weight="400" font-size="11">perf + crash reports</text>
+    <rect x="15" y="200" width="150" height="50" rx="8" fill="#eceff1" stroke="#455a64"/><text x="90" y="221" text-anchor="middle">Hosts / infra</text><text x="90" y="238" text-anchor="middle" font-weight="400" font-size="11">node exporter, kernel</text>
+    <rect x="215" y="100" width="150" height="80" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="290" y="132" text-anchor="middle">Collectors</text><text x="290" y="150" text-anchor="middle" font-weight="400" font-size="11">agents, batching,</text><text x="290" y="165" text-anchor="middle" font-weight="400" font-size="11">sampling, Kafka</text>
+    <rect x="420" y="25" width="170" height="50" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="505" y="46" text-anchor="middle">Metrics TSDB</text><text x="505" y="63" text-anchor="middle" font-weight="400" font-size="11">Prometheus / Mimir</text>
+    <rect x="420" y="115" width="170" height="50" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="505" y="136" text-anchor="middle">Log store</text><text x="505" y="153" text-anchor="middle" font-weight="400" font-size="11">OpenSearch / Loki / S3</text>
+    <rect x="420" y="205" width="170" height="50" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="505" y="226" text-anchor="middle">Trace store</text><text x="505" y="243" text-anchor="middle" font-weight="400" font-size="11">Jaeger / Tempo</text>
+    <rect x="650" y="55" width="190" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="745" y="76" text-anchor="middle">Dashboards</text><text x="745" y="93" text-anchor="middle" font-weight="400" font-size="11">Grafana: query + link</text>
+    <rect x="650" y="175" width="190" height="50" rx="8" fill="#ffebee" stroke="#c62828"/><text x="745" y="196" text-anchor="middle">Alerting → on-call</text><text x="745" y="213" text-anchor="middle" font-weight="400" font-size="11">Alertmanager, PagerDuty</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-obs-1)">
+    <path d="M165,55 L213,115"/><path d="M165,140 L213,140"/><path d="M165,225 L213,165"/>
+    <path d="M365,120 L418,55"/><path d="M365,140 L418,140"/><path d="M365,160 L418,225"/>
+    <path d="M590,50 L648,75"/><path d="M590,140 L648,85"/><path d="M590,230 L648,95"/>
+    <path d="M590,60 L648,190"/>
+  </g>
+</svg>
+<div class="caption">A telemetry pipeline: services, apps and hosts emit metrics, logs and traces; collectors batch and sample them; specialised stores keep each type; dashboards query them together and alert rules page the on-call engineer.</div>
+</div>
+
+<h2>4. Metrics in depth</h2>
+
+<h3>4.1 Metric types</h3>
+<div class="table-wrap"><table>
+  <tr><th>Type</th><th>What it is</th><th>Instagram example</th></tr>
+  <tr><td><b>Counter</b></td><td>Monotonically increasing count; you graph its <em>rate</em>.</td><td><code>feed_requests_total{status="500"}</code></td></tr>
+  <tr><td><b>Gauge</b></td><td>A value that goes up and down; sampled.</td><td>Kafka consumer lag, Redis memory used, open WebSocket connections in the DM service.</td></tr>
+  <tr><td><b>Histogram</b></td><td>Counts of observations in buckets (≤10 ms, ≤25 ms, ≤50 ms…); percentiles computed at query time; aggregatable across hosts.</td><td><code>feed_request_duration_seconds_bucket</code></td></tr>
+  <tr><td><b>Summary</b></td><td>Percentiles computed in the client process.</td><td>Rarely preferred — per-host percentiles <strong>cannot be averaged</strong> into a fleet percentile.</td></tr>
+</table></div>
+
+<h3>4.2 Labels and cardinality</h3>
+<p>Metrics carry <strong>labels</strong> (dimensions): <code>http_requests_total{service="feed", endpoint="/v1/feed/timeline", status="200", region="eu"}</code>. Each unique combination of label values is a separate <strong>time series</strong> stored by the database. Cardinality multiplies: 50 endpoints × 10 status codes × 5 regions × 2,000 hosts = 5M series. Never put unbounded values like <code>user_id</code>, <code>post_id</code> or raw URLs in metric labels — that would create billions of series and take down the metrics system. High-cardinality questions ("which user?") belong in logs and traces.</p>
+
+<h3>4.3 Pull vs push</h3>
+<p><strong>Prometheus</strong> <em>pulls</em> ("scrapes") a <code>/metrics</code> endpoint on each target every 15–30 s; a target that disappears is immediately noticed (<code>up == 0</code>). <strong>Push</strong> systems (StatsD, OpenTelemetry OTLP, Datadog agents) have processes send metrics to a collector — better for short-lived jobs and for crossing network boundaries. Both are widely used; large fleets often combine local agents with a central, horizontally scalable TSDB.</p>
+<pre><code># What a service exposes on /metrics (Prometheus text format)
+# TYPE feed_requests_total counter
+feed_requests_total{endpoint="timeline",status="200"} 18233412
+feed_requests_total{endpoint="timeline",status="503"} 1204
+# TYPE feed_request_duration_seconds histogram
+feed_request_duration_seconds_bucket{endpoint="timeline",le="0.1"}  15011290
+feed_request_duration_seconds_bucket{endpoint="timeline",le="0.25"} 17950003
+feed_request_duration_seconds_bucket{endpoint="timeline",le="0.5"}  18190117
+feed_request_duration_seconds_bucket{endpoint="timeline",le="+Inf"} 18234616
+feed_request_duration_seconds_sum{endpoint="timeline"}   2735192.4
+feed_request_duration_seconds_count{endpoint="timeline"} 18234616</code></pre>
+
+<h2>5. What to measure: golden signals, RED and USE</h2>
+
+<h3>5.1 The four golden signals</h3>
+<p>Google's SRE book proposes that if you can only measure four things about a user-facing system, measure these:</p>
+<div class="table-wrap"><table>
+  <tr><th>Signal</th><th>Meaning</th><th>Feed Service example</th></tr>
+  <tr><td><b>Latency</b></td><td>Time to serve a request — track successful and failed requests <em>separately</em> (a fast error is not a fast success).</td><td>p50/p95/p99 of <code>GET /feed/timeline</code></td></tr>
+  <tr><td><b>Traffic</b></td><td>Demand on the system.</td><td>Feed requests/s per region and app version</td></tr>
+  <tr><td><b>Errors</b></td><td>Rate of failed requests — explicit (5xx), implicit (200 with an empty feed), or policy (slower than 1 s counts as failure).</td><td>% of feed loads returning errors or empty</td></tr>
+  <tr><td><b>Saturation</b></td><td>How "full" the service is — the most constrained resource; often a leading indicator.</td><td>Worker-thread utilisation, queue depth, Redis CPU, connection-pool usage</td></tr>
+</table></div>
+
+<h3>5.2 RED — for request-driven services</h3>
+<p><strong>R</strong>ate (requests/s), <strong>E</strong>rrors (failed requests/s), <strong>D</strong>uration (latency distribution). Every microservice — Upload, Feed, Search, Like &amp; Comment — gets the same three graphs per endpoint, which makes any service's dashboard instantly readable by any engineer.</p>
+
+<h3>5.3 USE — for resources</h3>
+<p>For every resource (CPU, memory, disk, network interface, connection pool, thread pool): <strong>U</strong>tilisation (% of time busy / % capacity used), <strong>S</strong>aturation (extra work queued that can't be served — run-queue length, swap, dropped packets), <strong>E</strong>rrors (disk errors, NIC errors, OOM kills). USE finds the bottleneck; RED tells you whether users are affected.</p>
+<div class="callout tip"><span class="callout-title">💡 Instagram-specific signals</span>
+Beyond generic RED/USE, each component has its own critical signals: <strong>Kafka consumer lag</strong> for fan-out, search-indexing and notification workers (are we falling behind?); <strong>replication lag</strong> on PostgreSQL replicas; <strong>cache hit ratio</strong> for Redis feed caches and the CDN; <strong>push delivery rate</strong> via APNs/FCM; <strong>media-processing queue age</strong>; <strong>WebSocket connection count</strong> for DMs; and client-side metrics such as app cold-start time, feed time-to-first-image and crash-free sessions.</div>
+
+<h2>6. Percentiles and histograms: why averages lie</h2>
+<p>A <strong>percentile</strong> pN is the value below which N% of observations fall: p50 is the median; p99 means "99% of requests were faster than this". Averages hide what users actually experience:</p>
+<pre><code>100 feed requests: 98 take 50 ms, 2 take 5,000 ms (stuck on a slow shard)
+  average = (98×50 + 2×5000) / 100 = 149 ms        ← "looks fine"
+  p50     = 50 ms
+  p99     = 5,000 ms                                ← 1 in 50 users waits 5 seconds
+
+Bimodal cache: 80% hits at 5 ms, 20% misses at 200 ms
+  average = 0.8×5 + 0.2×200 = 44 ms                 ← no request ever took 44 ms!</code></pre>
+<p>Why the tail matters even more at Instagram's scale:</p>
+<ul>
+  <li><strong>Volume</strong>: at 100,000 req/s, p99 describes 1,000 requests <em>every second</em> — real people.</li>
+  <li><strong>Heavy users hit the tail most</strong>: a user loading 50 feed pages a day will see the p99 experience at least once with probability 1 − 0.99<sup>50</sup> ≈ 40%.</li>
+  <li><strong>Fan-out amplifies tails</strong>: a request waiting on 100 shards sees at least one p99 response 63% of the time (see <a href="resilience-patterns.html">hedged requests</a>).</li>
+</ul>
+
+<h3>6.1 Computing percentiles correctly</h3>
+<p>You can't store every latency of 100,000 req/s forever, and you <strong>cannot average percentiles</strong>: the p99 of host A averaged with the p99 of host B is not the fleet p99. The solution is the <strong>histogram</strong>: each host counts requests into fixed buckets; bucket counts <em>can</em> be summed across hosts and time; the fleet percentile is estimated from the merged buckets.</p>
+<pre class="ascii">
+latency bucket   ≤10ms  ≤25ms  ≤50ms  ≤100ms  ≤250ms  ≤500ms  ≤1s   ≤2.5s  +Inf
+host A counts     120    800   2400    600      60      15     4      1      0
+host B counts      90    700   2600    500      80      20     8      2      0
+sum (fleet)       210   1500   5000   1100     140      35    12      3      0   total 8000
+cumulative        210   1710   6710   7810    7950    7985  7997   8000
+p99 → rank 7920 falls in the ≤250ms bucket (7810 &lt; 7920 ≤ 7950) → p99 ≈ 100–250 ms (interpolate ≈ 220 ms)
+</pre>
+<p>Accuracy depends on bucket boundaries — choose them around your SLO thresholds. Libraries such as HdrHistogram, DDSketch and Prometheus native histograms use exponential buckets to keep relative error small (~1–2%) at any scale.</p>
+
+<h2>7. SLIs, SLOs, SLAs and error budgets</h2>
+<div class="table-wrap"><table>
+  <tr><th>Term</th><th>Definition</th><th>Example for the Instagram feed</th></tr>
+  <tr><td><b>SLI</b> — Service Level Indicator</td><td>A measured quantity that reflects user experience, usually a ratio of good events to total events.</td><td>Fraction of feed requests that return successfully <em>and</em> within 800 ms, measured at the load balancer.</td></tr>
+  <tr><td><b>SLO</b> — Service Level Objective</td><td>An internal target for the SLI over a window.</td><td>99.9% of feed requests good over a rolling 28 days.</td></tr>
+  <tr><td><b>SLA</b> — Service Level Agreement</td><td>A contract with customers with consequences (refunds/credits) if missed. Looser than the SLO.</td><td>Consumer Instagram has no SLA; a paid API product (e.g. a business messaging API) might promise 99.5%.</td></tr>
+</table></div>
+
+<h3>7.1 Error budgets — worked example</h3>
+<p>An SLO of 99.9% means you are <em>allowed</em> 0.1% bad requests — that allowance is the <strong>error budget</strong>. Assume 10 billion feed requests per day:</p>
+<pre><code>28-day window: 10B × 28 = 280B requests
+Error budget  = 0.1% × 280B = 280M bad requests per 28 days
+In time terms = 0.001 × 28 days × 1,440 min = ~40 minutes of total outage per 28 days
+
+Incident: a bad deploy makes 30% of feed requests fail for 20 minutes
+  requests in 20 min = 10B / 1,440 × 20 ≈ 139M
+  bad requests       = 30% × 139M ≈ 42M  → 15% of the 28-day budget burned</code></pre>
+<p>The budget turns reliability into an engineering decision instead of an argument:</p>
+<ul>
+  <li><strong>Budget remaining</strong> → ship features, run experiments, take risks.</li>
+  <li><strong>Budget exhausted</strong> → freeze risky launches, prioritise reliability work until it recovers.</li>
+  <li><strong>100% is the wrong target</strong>: users can't tell 99.99% from 100% because their own phone network fails more often than that, and every extra nine costs roughly 10× more. Pick the SLO that matches what users notice.</li>
+</ul>
+
+<h3>7.2 Burn-rate alerting</h3>
+<p>The <strong>burn rate</strong> is how fast you're consuming budget relative to plan: burn rate 1 = you'll use exactly 100% of the budget by the end of the window; burn rate 14.4 sustained for 1 hour consumes 2% of a 30-day budget. A widely used scheme (from Google's SRE workbook) uses <strong>multiple windows</strong>:</p>
+<div class="table-wrap"><table>
+  <tr><th>Condition</th><th>Budget consumed</th><th>Action</th></tr>
+  <tr><td>Burn rate ≥ 14.4 over 1 h (and over last 5 min)</td><td>2% in an hour</td><td>🚨 Page immediately</td></tr>
+  <tr><td>Burn rate ≥ 6 over 6 h (and over last 30 min)</td><td>5% in 6 hours</td><td>🚨 Page</td></tr>
+  <tr><td>Burn rate ≥ 1 over 3 days</td><td>10% in 3 days</td><td>🎫 Ticket — fix during work hours</td></tr>
+</table></div>
+<p>The short confirmation window makes the alert stop quickly once the problem is fixed; the long window prevents paging on a brief blip.</p>
+
+<h2>8. Logging</h2>
+
+<h3>8.1 Structured logging</h3>
+<p>Unstructured logs (<code>"Upload failed for user 42 after 3 retries"</code>) are readable by humans but painful to search and aggregate. <strong>Structured logs</strong> are key-value records (usually JSON) that machines can index and filter:</p>
+<pre><code>{
+  "ts": "2026-10-23T15:42:07.118Z",
+  "level": "ERROR",
+  "service": "upload-service",
+  "host": "upload-7f9c-eu-3",
+  "region": "eu",
+  "version": "2026.10.23-1",
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "span_id": "00f067aa0ba902b7",
+  "user_id": 184467440737,
+  "event": "s3_put_failed",
+  "media_id": "3192…",
+  "attempt": 3,
+  "error": "TimeoutError: PUT exceeded 2000 ms",
+  "duration_ms": 2004
+}</code></pre>
+<ul>
+  <li><strong>Correlation IDs</strong>: every log line carries the <code>trace_id</code> (and a request ID), so you can pull all logs for one request across every service.</li>
+  <li><strong>Levels</strong>: DEBUG (off in production or sampled), INFO (significant business events), WARN (unexpected but handled), ERROR (a request failed), FATAL.</li>
+  <li><strong>Log events, not noise</strong>: log state changes and failures with context; don't log every successful cache hit — that's what metrics are for.</li>
+  <li><strong>Never log secrets or sensitive content</strong>: passwords, tokens, message bodies, full card numbers. Redact or hash PII; access to logs is itself audited (see <a href="security.html">Security</a>).</li>
+</ul>
+
+<h3>8.2 Log pipelines</h3>
+<div class="flow">
+  <div class="fnode svc">Service<small>writes JSON to stdout</small></div><div class="farrow">→</div>
+  <div class="fnode async">Agent<small>Fluent Bit / Vector</small></div><div class="farrow">→<small>buffer</small></div>
+  <div class="fnode async">Kafka<small>absorbs spikes</small></div><div class="farrow">→<small>parse, enrich, redact</small></div>
+  <div class="fnode store">Hot index<small>OpenSearch, 7–14 days</small></div><div class="farrow">→<small>age out</small></div>
+  <div class="fnode store">Cold archive<small>S3 / lake, months</small></div>
+</div>
+<p>The buffer (Kafka) matters: during an incident, error logs spike 10–100×, exactly when you need the log system most. Without a buffer, the log store falls over or the agents drop logs. Cost controls: sample repetitive INFO/DEBUG logs (keep 1%, keep 100% of errors), set per-service ingestion quotas, keep only a few days in the expensive full-text index and the rest in cheap object storage queried on demand. Rough scale (assumption): 20,000 servers × 500 lines/s × 500 bytes ≈ 5 GB/s ≈ 430 TB/day before sampling — logs can easily cost more than the service itself if unmanaged.</p>
+
+<h2>9. Distributed tracing</h2>
+<p>Metrics say the feed is slow; logs show errors in several services. But which service made <em>this</em> request slow? A <strong>distributed trace</strong> records the full journey of one request through every service as a tree of timed operations.</p>
+
+<h3>9.1 Traces, spans and IDs</h3>
+<ul>
+  <li><strong>Trace</strong>: everything that happened for one end-to-end request, identified by a globally unique <strong>trace ID</strong> (128-bit).</li>
+  <li><strong>Span</strong>: one timed operation within the trace (an RPC call, a DB query, a cache lookup) with a <strong>span ID</strong>, a <strong>parent span ID</strong>, start time, duration, status and attributes (<code>db.system=redis</code>, <code>shard=17</code>, <code>user.app_version=312.0</code>).</li>
+  <li>The parent/child links form a tree; drawn on a timeline it becomes a <strong>waterfall</strong> that shows which work was sequential, which was parallel, and where the time went.</li>
+</ul>
+
+<h3>9.2 An Instagram feed request, traced</h3>
+<pre class="ascii">
+trace_id 4bf92f3577b34da6a3ce929d0e0e4736   GET /v1/feed/timeline   user 1844…   total 412 ms
+time (ms)        0        50       100      150      200      250      300      350      400
+                 |--------|--------|--------|--------|--------|--------|--------|--------|
+lb + gateway     [████████████████████████████████████████████████████████████████████████] 412
+ ├ auth check    [██] 12
+ └ feed-service     [█████████████████████████████████████████████████████████████████████] 395
+    ├ redis: timeline  [█] 6                                  (precomputed post IDs)
+    ├ counters svc       [████] 20          ┐
+    ├ user svc           [███] 18           ├ run in parallel
+    ├ stories tray       [████] 22          ┘
+    ├ ranking svc        [██████████████████████████████████████████████] 250   ◄ slowest child
+    │  ├ feature store     [████████████████████████████████] 180            ◄ ROOT CAUSE
+    │  │   attrs: shard=17, keys=480, cache_hit=0.31 (normally 0.95)
+    │  └ model inference                                    [████████] 55
+    └ hydrate + sign CDN URLs                                            [█████] 30
+</pre>
+<p>Reading it: the gateway and auth are fine; the parallel calls are fast; the ranking call dominates, and within it the feature-store lookup takes 180 ms because its cache hit rate on shard 17 dropped from 95% to 31%. Without tracing, the ranking team, the feed team and the feature-store team would each see "slow" in their own metrics and argue about whose fault it is. With tracing, the critical path is obvious in seconds.</p>
+
+<h3>9.3 Context propagation</h3>
+<p>For spans from different services to join one trace, the trace context must travel with the request. The W3C <strong>Trace Context</strong> standard defines an HTTP header:</p>
+<pre><code>traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+             │  │                                │                └ flags (01 = sampled)
+             │  │                                └ parent span ID (the caller's span)
+             │  └ trace ID (same for the whole request)
+             └ version</code></pre>
+<ul>
+  <li><strong>Synchronous calls</strong>: tracing libraries (OpenTelemetry instrumentation for HTTP/gRPC clients and servers) read and inject the header automatically.</li>
+  <li><strong>Asynchronous hops</strong>: when the Upload Service publishes "post created" to <a href="message-queues.html">Kafka</a>, the context goes into the <em>message headers</em>; the fan-out worker that consumes it starts a span linked to the producer's span. Now you can trace "user posted → fan-out → push notification delivered" end to end.</li>
+  <li><strong>In-process</strong>: context must follow the request across thread pools and async callbacks — a common source of broken traces.</li>
+  <li><strong>Baggage</strong>: small key-values propagated alongside (e.g. <code>experiment=881</code>) so deep services can tag their telemetry. Keep it tiny; it travels on every hop.</li>
+</ul>
+
+<h3>9.4 Sampling</h3>
+<p>Recording every span of every request is too expensive (a feed request might produce 50+ spans; at 100k req/s that's 5M spans/s). So traces are <strong>sampled</strong>:</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Head-based sampling</th><th>Tail-based sampling</th></tr>
+  <tr><td><b>Decision made</b></td><td>At the start of the request (e.g. keep 1%), propagated in the <code>traceparent</code> flags so all services agree.</td><td>After the trace completes, by a collector that buffers all spans briefly.</td></tr>
+  <tr><td><b>Pros</b></td><td>Cheap and simple; no buffering.</td><td>Can keep the interesting traces: all errors, all slow (&gt; p99) requests, plus a small random baseline.</td></tr>
+  <tr><td><b>Cons</b></td><td>Rare errors are mostly discarded (99% of them with 1% sampling).</td><td>Needs to collect every span temporarily — expensive infrastructure.</td></tr>
+</table></div>
+<p>Practical systems combine them: head-sample a baseline, always keep errors and very slow requests, and allow <strong>forced tracing</strong> for specific debugging (e.g. an engineer's own account or a flagged request).</p>
+
+<h2>10. Alerting</h2>
+
+<h3>10.1 Symptom-based vs cause-based</h3>
+<p>Alert on <strong>symptoms users feel</strong> ("feed error rate above SLO burn threshold", "DM delivery p99 &gt; 5 s"), not on every possible <strong>cause</strong> ("CPU &gt; 80% on host 1234", "one Cassandra node down"). Causes are many and often harmless (a host at 85% CPU serving fine; a replica down with others healthy); symptoms are few and always matter. Cause metrics belong on dashboards for diagnosis. Exceptions: causes that predict imminent user impact without a symptom yet — "disk will be full in 4 hours", "certificate expires in 7 days", "Kafka consumer lag growing for 30 min".</p>
+
+<h3>10.2 Pages vs tickets</h3>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Page 🚨</th><th>Ticket 🎫</th></tr>
+  <tr><td><b>When</b></td><td>Users are hurt now or will be within hours; needs a human immediately.</td><td>Needs attention, but within a business day is fine.</td></tr>
+  <tr><td><b>Examples</b></td><td>Fast error-budget burn, upload success &lt; 99%, region unreachable, notification pipeline stalled.</td><td>Slow budget burn, a single host's disk degrading, backup job failed once, certificate expiring in 3 weeks.</td></tr>
+  <tr><td><b>Delivery</b></td><td>Phone call / push via PagerDuty or Opsgenie, escalates if unacknowledged.</td><td>Queue in the team's issue tracker.</td></tr>
+</table></div>
+
+<h3>10.3 Runbooks</h3>
+<p>Every alert should link to a <strong>runbook</strong>: what the alert means, the likely causes, the dashboards and queries to check, safe mitigation steps (roll back the last deploy, drain a region, enable degraded mode, flip a kill switch), and who to escalate to. A tired engineer at 4 a.m. should not have to reverse-engineer an alert.</p>
+<pre><code># Prometheus alert rule: fast burn of the feed availability SLO (99.9%)
+- alert: FeedSLOFastBurn
+  expr: |
+    (sum(rate(feed_requests_total{status=~"5.."}[1h])) / sum(rate(feed_requests_total[1h])))  &gt; (14.4 * 0.001)
+    and
+    (sum(rate(feed_requests_total{status=~"5.."}[5m])) / sum(rate(feed_requests_total[5m]))) &gt; (14.4 * 0.001)
+  labels:
+    severity: page
+    team: feed
+  annotations:
+    summary: "Feed is burning its error budget 14x too fast"
+    runbook: "wiki/runbooks/feed-slo-fast-burn"
+    dashboard: "grafana/d/feed-overview"</code></pre>
+
+<h3>10.4 Alert fatigue</h3>
+<p>When engineers receive dozens of alerts per shift, most of them unactionable or duplicates, they start ignoring them — and miss the real one. This is <strong>alert fatigue</strong>. Remedies:</p>
+<ul>
+  <li>Every page must be <strong>actionable, urgent and real</strong>; delete or downgrade alerts that are routinely acknowledged and ignored.</li>
+  <li><strong>Group and deduplicate</strong> (one page for "Redis cluster degraded", not 64 pages for 64 shards); add inhibition rules (don't page for every service when the region is down).</li>
+  <li>Require a minimum duration (<code>for: 5m</code>) to skip brief blips; use burn-rate alerts instead of raw thresholds.</li>
+  <li>Review alert statistics in a weekly on-call handover; track pages per shift as a team health metric (a common target: no more than ~2 incidents per 12-hour shift).</li>
+</ul>
+
+<h2>11. Dashboards</h2>
+<p>Dashboards are for <strong>humans to understand state quickly</strong>. Good practice:</p>
+<ul>
+  <li><strong>Hierarchy</strong>: a top-level "Instagram health" board (SLOs per user journey: open app, load feed, post, send DM, view story) → per-service RED boards → per-resource USE boards → drill-down queries.</li>
+  <li><strong>Same layout for every service</strong> (RED at the top, dependencies' RED next, saturation below) so on-call engineers can read any team's board.</li>
+  <li><strong>Overlay change events</strong> (deploys, flag flips, failovers) as vertical markers.</li>
+  <li><strong>Show percentiles and rates, not averages and raw counters</strong>; compare to the same time last week to separate daily patterns from anomalies.</li>
+  <li><strong>Break down by key dimensions</strong>: region, app version, platform (iOS/Android/web), endpoint — most incidents are localised to one of these.</li>
+  <li>Avoid "wall of 200 graphs" dashboards — nobody can read them under pressure.</li>
+</ul>
+
+<h2>12. On-call, incident management and postmortems</h2>
+
+<h3>12.1 On-call</h3>
+<p>Each service team runs an <strong>on-call rotation</strong>: one primary (and a secondary backup) responsible for responding to pages, typically for a week at a time, often "follow-the-sun" across time zones so nobody is woken at night routinely. Healthy on-call has manageable page volume, good runbooks, the authority to roll back, and time after a rough shift to fix the root causes.</p>
+
+<h3>12.2 Incident management</h3>
+<ol class="steps">
+  <li><strong>Detect</strong>: alert fires or users report a problem.</li>
+  <li><strong>Declare &amp; triage</strong>: open an incident, assign a severity (SEV1 = major user-facing outage, e.g. feed down in a region; SEV3 = minor degradation).</li>
+  <li><strong>Assign roles</strong>: <em>Incident Commander</em> (coordinates, decides — doesn't debug), <em>Operations/Tech lead</em> (hands on keyboard), <em>Communications lead</em> (status page, internal updates), <em>Scribe</em> (timeline).</li>
+  <li><strong>Mitigate first, root-cause later</strong>: roll back the deploy, drain the region, turn off the feature flag, enable degraded mode. Restoring users comes before understanding.</li>
+  <li><strong>Resolve &amp; monitor</strong>: confirm metrics are back to normal; keep watching.</li>
+  <li><strong>Postmortem</strong> within days.</li>
+</ol>
+
+<h3>12.3 Blameless postmortems</h3>
+<p>A <strong>postmortem</strong> is a written analysis of an incident. <strong>Blameless</strong> means it assumes everyone acted reasonably given the information and tools they had, and asks "how did the <em>system</em> allow this?" rather than "who messed up?". If people are punished for mistakes, they hide them, and the organisation stops learning. A typical template:</p>
+<div class="table-wrap"><table>
+  <tr><th>Section</th><th>Example content</th></tr>
+  <tr><td>Summary &amp; impact</td><td>"For 23 minutes, 18% of feed loads in South America failed; ~40M requests affected; 9% of 28-day error budget consumed."</td></tr>
+  <tr><td>Timeline</td><td>Detection time, key decisions, mitigation, resolution (from the scribe's notes and telemetry).</td></tr>
+  <tr><td>Root cause(s) &amp; contributing factors</td><td>A config change raised the feature-store cache TTL; a hot shard evicted keys; no canary for config changes; alert fired 9 minutes after impact began.</td></tr>
+  <tr><td>What went well / badly / lucky</td><td>Rollback was fast; dashboards lacked per-shard breakdown; the issue started off-peak.</td></tr>
+  <tr><td>Action items</td><td>Owned, prioritised, tracked: "canary config changes per cell", "add per-shard hit-ratio panel", "alert on hit-ratio drop".</td></tr>
+</table></div>
+
+<h2>13. How Instagram does observability</h2>
+<div class="flow">
+  <div class="fnode client">📱 App<small>perf, crashes, client errors</small></div><div class="farrow">→</div>
+  <div class="fnode edge">Edge / LB<small>request logs, SLIs</small></div><div class="farrow">→<small>traceparent</small></div>
+  <div class="fnode svc">Services<small>metrics, logs, spans</small></div><div class="farrow">→</div>
+  <div class="fnode async">Collection<small>Scribe/Kafka-style transport</small></div><div class="farrow">→</div>
+  <div class="fnode store">Stores<small>TSDB, logs, traces</small></div>
+</div>
+<ul>
+  <li><strong>SLIs measured at the edge and in the app.</strong> Server-side metrics can't see failures that happen before the request arrives (DNS, TLS, mobile network) or after (image decode, rendering). So user-journey SLIs — "feed loaded with first image visible", "photo posted successfully", "DM delivered" — are computed from both load-balancer logs and client telemetry (see <a href="clients.html">Clients</a>).</li>
+  <li><strong>Per-service RED + dependency signals</strong>: the Feed Service dashboard shows its own RED, its dependencies' RED (Redis timeline, ranking, counters), Kafka lag for fan-out, and cache hit ratios.</li>
+  <li><strong>Every deploy is an event</strong>: Instagram's engineering talks describe continuous deployment of its large Python/Django service through canary stages, where automated checks compare error rates and latency of the canary against the rest of the fleet and halt the rollout on regressions. That is observability used as a release gate.</li>
+  <li><strong>Correlation via IDs</strong>: request and trace IDs flow from the gateway through services and Kafka messages, so an engineer can jump from a user report to the exact request path.</li>
+</ul>
+<div class="callout instagram"><span class="callout-title">📸 Meta's publicly described tooling</span>
+Instagram runs on Meta's shared infrastructure, and Meta has published papers and posts about several observability systems: <strong>ODS</strong> (a large-scale time-series metrics store) and <strong>Gorilla</strong> (an in-memory time-series database with clever compression, VLDB 2015); <strong>Scuba</strong> (a real-time, in-memory store for slicing raw event samples by any dimension — the "observability" style of investigation); <strong>Canopy</strong> (end-to-end performance tracing, SOSP 2017); and continuous profiling across the fleet (publicly described as <strong>Strobelight</strong>). Instagram engineers have also written publicly about profiling and optimising the Python/Django stack (for example, efficiency work around CPython memory and garbage collection). Exact internal setups and numbers aren't public; open-source equivalents are listed below.</div>
+
+<h3>Rough numbers (assumptions)</h3>
+<pre><code>Metrics: 2,000 services × 300 metric names × ~500 label combos ≈ 300M active series
+         → requires a horizontally sharded TSDB, aggressive downsampling (10 s → 5 min after 2 weeks)
+Traces:  100k feed req/s × 50 spans × 1% head sampling = 50k spans/s (+ all errors and slow traces)
+Logs:    ~400 TB/day raw before sampling → keep ~1 week hot, sampled archive in object storage
+Error budget for a 99.9% feed SLO at 10B requests/day ≈ 280M bad requests per 28 days</code></pre>
+
+<h2>14. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Benefits</h4><ul>
+    <li>Detect problems before (or as soon as) users notice</li>
+    <li>Diagnose in minutes instead of hours (lower MTTR)</li>
+    <li>Objective reliability targets (SLOs) that balance speed and stability</li>
+    <li>Safe continuous deployment via canary analysis</li>
+    <li>Capacity planning and performance optimisation from real data</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs</h4><ul>
+    <li>Telemetry storage and processing can rival the cost of the service</li>
+    <li>Instrumentation overhead (CPU, latency, code)</li>
+    <li>Cardinality explosions can take down the metrics system</li>
+    <li>Sampling loses data; logs may leak sensitive information</li>
+    <li>Badly tuned alerts burn out on-call engineers</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Averages instead of percentiles</strong>; averaging per-host percentiles.</li>
+  <li><strong>Unbounded label values</strong> (user_id, URL) in metrics.</li>
+  <li><strong>Alerting on causes</strong> (CPU, single hosts) instead of user-facing symptoms → noise and fatigue.</li>
+  <li><strong>Alerts without runbooks</strong> or without an owner.</li>
+  <li><strong>Only server-side measurement</strong> — missing failures in DNS, the network, or the app.</li>
+  <li><strong>Broken trace propagation</strong> across async boundaries (Kafka, thread pools) → fragmented traces.</li>
+  <li><strong>The monitoring system depends on the system it monitors</strong> (same region, same Kafka): when production fails, observability fails with it. Run monitoring out-of-band and alert on "no data".</li>
+  <li><strong>Logging PII or secrets</strong>; keeping logs forever.</li>
+  <li><strong>Blame-oriented postmortems</strong> that make people hide mistakes.</li>
+</ul>
+
+<h2>15. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Tool</th><th>Category</th><th>When to use</th></tr>
+  <tr><td>Prometheus (+ Thanos, Cortex/Mimir, VictoriaMetrics)</td><td>Metrics collection, TSDB, PromQL, alert rules</td><td>The open-source default for metrics; add Thanos/Mimir for long-term, multi-cluster scale.</td></tr>
+  <tr><td>Grafana</td><td>Dashboards across many data sources; alerting</td><td>Unified visualisation of metrics, logs and traces.</td></tr>
+  <tr><td>ELK (Elasticsearch, Logstash, Kibana) / OpenSearch</td><td>Log ingestion, full-text indexing and search</td><td>Rich ad-hoc log search; budget for index cost.</td></tr>
+  <tr><td>Grafana Loki</td><td>Log aggregation indexing only labels</td><td>Cheaper logs when full-text indexing isn't needed.</td></tr>
+  <tr><td>OpenTelemetry</td><td>Vendor-neutral APIs/SDKs and Collector for traces, metrics, logs</td><td>Instrument once, send anywhere; standard context propagation.</td></tr>
+  <tr><td>Jaeger, Zipkin, Grafana Tempo</td><td>Distributed tracing backends and UIs</td><td>Storing and exploring traces (waterfalls, service maps).</td></tr>
+  <tr><td>Datadog, New Relic, Honeycomb, Dynatrace, Splunk</td><td>Commercial all-in-one observability</td><td>When you'd rather pay than operate the stack; Honeycomb excels at high-cardinality exploration.</td></tr>
+  <tr><td>Pyroscope / Grafana Pyroscope, Parca</td><td>Continuous profiling</td><td>Finding CPU/memory hot spots in production.</td></tr>
+  <tr><td>Sentry, Firebase Crashlytics</td><td>Client crash and error reporting</td><td>Mobile/web app health.</td></tr>
+  <tr><td>PagerDuty, Opsgenie, incident.io</td><td>Paging, escalation, on-call schedules, incident workflows</td><td>Turning alerts into a human response.</td></tr>
+</table></div>
+
+<h2>16. Interview corner</h2>
+<details class="qa"><summary>How would you monitor Instagram's feed service? What would you alert on?</summary>
+<p>Define user-journey SLIs: fraction of feed loads that succeed and render within, say, 800 ms (measured at the LB and from client telemetry). SLO 99.9% over 28 days. Dashboards: RED per endpoint broken down by region/platform/app version; dependency RED (Redis timeline, ranking, counters, user service); saturation (worker utilisation, queue depth, connection pools); cache hit ratio; fan-out Kafka lag; deploy markers. Alerts: multi-window burn-rate pages on the SLO; tickets for slow burn; a few predictive cause alerts (lag growing, disk full ETA). Every alert has a runbook. Traces with tail-sampling of slow/error requests and structured logs carrying trace IDs for diagnosis.</p></details>
+<details class="qa"><summary>Why are percentiles better than averages, and how do you compute a fleet-wide p99?</summary>
+<p>Averages hide the tail and multimodal distributions — 2% of requests at 5 s barely move the mean but ruin the experience for millions of users, and fan-out turns per-call tails into common request-level latency. Percentiles can't be averaged across hosts, so each host records a histogram (bucket counts); you sum bucket counts across hosts and time windows and estimate the p99 from the merged cumulative distribution, with bucket boundaries chosen around the SLO thresholds (or with exponential/sketch histograms like DDSketch for bounded relative error).</p></details>
+<details class="qa"><summary>Explain SLI, SLO, SLA and error budgets with numbers.</summary>
+<p>SLI: good requests / total, e.g. feed loads that succeed within 800 ms. SLO: 99.9% over 28 days. With 10B requests/day the budget is 0.1% × 280B = 280M bad requests (≈ 40 minutes of full outage). SLA: an external contract with penalties, set looser than the SLO (e.g. 99.5%), typically for paid APIs. If an incident burns 15% of the budget, that's fine; if the budget is exhausted, risky launches freeze and reliability work takes priority. Alert on burn rate (14.4× over 1 h pages) rather than raw error thresholds.</p></details>
+<details class="qa"><summary>How does distributed tracing work across services and Kafka?</summary>
+<p>The first service creates a trace ID and a root span; each outgoing call injects a <code>traceparent</code> header (trace ID, parent span ID, sampled flag); each receiving service extracts it, creates child spans and propagates further. For Kafka, the context is written into message headers, and the consumer starts a span linked to the producer's span. Spans are exported asynchronously to a collector, sampled (head-based baseline plus tail-based keep-all-errors/slow), and assembled into a waterfall in Jaeger/Tempo. Logs include the trace ID for cross-referencing.</p></details>
+<details class="qa"><summary>What makes a good alert? How do you fight alert fatigue?</summary>
+<p>Good alerts are symptom-based (user impact), urgent, actionable, owned, and linked to a runbook and dashboard. Fight fatigue by deleting alerts that don't lead to action, converting non-urgent ones to tickets, using burn-rate alerts with confirmation windows, grouping and inhibiting related alerts, and reviewing page statistics every on-call handover with a budget for pages per shift.</p></details>
+<details class="qa"><summary>Walk through how you'd run an incident and what happens afterwards.</summary>
+<p>Declare an incident and severity; assign an incident commander, ops lead, comms lead and scribe; open a shared channel and timeline. Focus on mitigation first — roll back recent changes, drain the affected region/cell, enable degraded modes — using dashboards, traces and change logs to localise. Communicate status regularly. After resolution, write a blameless postmortem within days: impact, timeline, root and contributing causes, what went well/badly, and owned action items (e.g. better canaries, new alerts, runbook fixes), tracked to completion.</p></details>
+
+<h2>17. Check your understanding</h2>
+<details class="quiz"><summary>Your SLO is 99.95% over 30 days for 2B requests/day. How many failed requests is your error budget? How many minutes of complete outage is that?</summary>
+<p>Requests = 2B × 30 = 60B; budget = 0.05% × 60B = <strong>30M</strong> failed requests. Time-wise: 0.0005 × 30 × 1,440 = <strong>21.6 minutes</strong> of total outage.</p></details>
+<details class="quiz"><summary>Host A reports p99 = 120 ms and host B reports p99 = 400 ms, with equal traffic. Is the fleet p99 260 ms?</summary>
+<p><strong>No.</strong> Percentiles can't be averaged. The fleet p99 depends on the full distributions: if B's slow requests make up most of the slowest 1% overall, the fleet p99 could be close to 400 ms or above. Merge histogram buckets from both hosts and compute the percentile from the combined distribution.</p></details>
+<details class="quiz"><summary>An engineer adds <code>user_id</code> as a label to the feed latency histogram with 12 buckets. With 500M daily users, what happens?</summary>
+<p>Each user creates ~14 new series (12 buckets + sum + count) → ~7 <strong>billion</strong> time series — a cardinality explosion that would overwhelm the metrics backend. Per-user questions belong in logs/traces (high-cardinality stores), or use bounded dimensions (region, app version, platform).</p></details>
+<details class="quiz"><summary>Which should page someone at 3 a.m.: (a) CPU at 90% on one feed host, (b) feed error budget burning at 20× for 10 minutes, (c) a backup job failed once, (d) Kafka fan-out lag growing steadily for 45 minutes?</summary>
+<p><strong>(b)</strong> definitely — active user impact burning budget fast. <strong>(d)</strong> likely — it predicts imminent impact (new posts not reaching feeds) and won't fix itself. (a) is a cause with no proven user impact → dashboard/ticket. (c) → ticket for the next business day (unless backups have been failing repeatedly).</p></details>
+<details class="quiz"><summary>With 1% head-based trace sampling, an error affects 0.05% of requests at 100k req/s. How many error traces per minute do you capture? How would tail-based sampling change this?</summary>
+<p>Errors: 0.0005 × 100,000 = 50/s = 3,000/min; with 1% head sampling you keep only ~<strong>30 per minute</strong> (and possibly fewer if the error affects only certain users). Tail-based sampling that keeps all error traces would capture all ~3,000/min (or a capped subset), making rare errors much easier to diagnose.</p></details>
+<details class="quiz"><summary>In a trace, the feed request takes 900 ms. Spans: Redis 5 ms, counters 30 ms and user service 25 ms (parallel), ranking 820 ms of which feature store 760 ms. Where do you look first, and why not at the counters service even though it logged errors?</summary>
+<p>The <strong>feature store</strong> inside ranking — it's on the critical path and accounts for ~85% of the latency. The counters service's errors may be real but it ran in parallel for only 30 ms (and presumably has a fallback), so it isn't what made this request slow. Tracing's value is precisely identifying the critical path.</p></details>
+<details class="quiz"><summary>Why should your monitoring and alerting stack not run only in the same region and on the same Kafka cluster as production?</summary>
+<p>Because the failures you most need to see — a regional outage or a Kafka failure — would also take down your telemetry, leaving you blind exactly when it matters. Run monitoring out-of-band (another region/provider), use external synthetic probes, and alert on missing data ("no metrics received").</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li><strong>Monitoring detects known problems; observability lets you investigate new ones.</strong> You need both.</li>
+    <li>Use the right signal: <strong>metrics</strong> for trends/alerts, <strong>logs</strong> for detail, <strong>traces</strong> for the request path, <strong>profiles</strong> for code hot spots, <strong>change events</strong> for "what changed?".</li>
+    <li>Measure with <strong>golden signals, RED and USE</strong>; use <strong>percentiles from mergeable histograms</strong>, never averages; avoid unbounded label cardinality.</li>
+    <li>Set <strong>SLOs</strong> on user-facing SLIs, spend <strong>error budgets</strong> deliberately, and alert on <strong>burn rate</strong>.</li>
+    <li>Propagate <strong>trace context</strong> everywhere (including Kafka) and sample smartly (keep errors and slow traces).</li>
+    <li>Page only for urgent symptoms with <strong>runbooks</strong>; run incidents with clear roles; learn with <strong>blameless postmortems</strong>.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="resilience-patterns.html">Resilience patterns</a> — timeouts, breakers and fallbacks that observability must make visible</li>
+  <li><a href="core-principles.html">Scalability, Availability, Reliability &amp; Performance</a> — what the SLOs are measuring</li>
+  <li><a href="analytics-ml.html">Analytics, Data Pipelines &amp; ML</a> — product analytics vs operational telemetry, shared event pipelines</li>
+  <li><a href="message-queues.html">Message Queues &amp; Kafka</a> — log transport and consumer-lag monitoring</li>
+  <li><a href="load-balancer.html">Load Balancing</a> — where request-level SLIs are measured</li>
+  <li><a href="multi-region.html">Multi-Region &amp; DR</a> — detecting regional failures and replication lag</li>
+  <li><a href="security.html">Security &amp; Privacy</a> — audit logs and keeping PII out of telemetry</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

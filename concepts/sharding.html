@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sharding (Partitioning) — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="sharding">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li><strong>Sharding</strong> (horizontal partitioning) splits one big dataset into many smaller pieces — <strong>shards</strong> — each stored on a different server, so data size, <strong>write throughput</strong> and failure <strong>blast radius</strong> are divided across machines. Replication copies data; sharding <em>splits</em> it.</li>
+    <li>The single most important decision is the <strong>shard key</strong>: high cardinality, even distribution, present in your hottest queries, and immutable. For Instagram, <code>user_id</code> is the natural key for users, posts and timelines.</li>
+    <li>Four strategies: <strong>range</strong> (good for scans, prone to hotspots), <strong>hash</strong> (even spread, no ranges), <strong>directory/lookup</strong> (flexible, extra hop) and <strong>geo</strong> (data residency, latency).</li>
+    <li>Instagram publicly described splitting PostgreSQL into <strong>thousands of logical shards</strong> (PostgreSQL schemas) mapped onto far fewer physical servers, so growth means <strong>moving whole logical shards</strong>, never re-hashing data — and every ID embeds its logical shard number.</li>
+    <li>Sharding's costs: <strong>cross-shard queries</strong> (scatter-gather), no cheap joins, <strong>local vs global secondary indexes</strong>, <strong>distributed transactions</strong> (avoid 2PC; design single-shard operations), <strong>hot shards</strong> (celebrities) and <strong>rebalancing</strong>.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why one database server eventually isn't enough</h2>
+<p>In the <a href="replication.html">replication</a> lesson we scaled <em>reads</em> by adding replicas. But every replica stores <strong>all</strong> the data and applies <strong>every</strong> write. Three limits remain:</p>
+<ul>
+  <li><strong>Data size.</strong> Assume Instagram stores 2 billion users (~1 KB each = 2 TB), 100 billion posts' metadata (~500 B each = 50 TB), and trillions of likes (hundreds of TB). A single server tops out at tens of TB of fast storage — and long before that, indexes stop fitting in RAM, backups take days and a replica rebuild takes a week.</li>
+  <li><strong>Write throughput.</strong> Assume ~60,000 likes/s on average and over 100,000/s at peak, plus posts, comments and follows. One primary can sustain perhaps 5,000–20,000 write transactions/s depending on hardware. Replicas don't help: they <em>repeat</em> the writes.</li>
+  <li><strong>Blast radius.</strong> With one primary, one bad disk, one runaway query or one botched migration affects 100% of users. With 1,000 shards, a single shard failing affects ~0.1%.</li>
+</ul>
+<p>The answer is to <strong>partition</strong> the data: give each server responsibility for a subset of the rows. That's <strong>sharding</strong>. (Terminology: MongoDB and Elasticsearch say <em>shard</em>; Cassandra says <em>partition</em> or <em>token range</em>; HBase says <em>region</em>; Bigtable <em>tablet</em>; CockroachDB <em>range</em>; Couchbase <em>vBucket</em>. Same idea.)</p>
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy: a city's phone directory</span>
+  When a city's phone book got too thick to print as one volume, publishers split it: <strong>Volume 1: A–F, Volume 2: G–M</strong>, and so on. Anyone looking up "Patel" knows to grab the volume covering P — that's a <strong>range shard</strong> with the surname as the <strong>shard key</strong>. But if half the city is named "Smith", the S volume becomes huge (a <strong>hotspot</strong>). And a question like "everyone living on Baker Street" means reading <em>every</em> volume (a <strong>scatter-gather</strong> query), because the books were split by name, not by street.
+</div>
+
+<h2>2. Vertical partitioning vs horizontal sharding</h2>
+<p>There are two ways to split a database, and real systems use both:</p>
+<ul>
+  <li><strong>Vertical partitioning</strong> splits by <em>columns</em> or by <em>tables</em>. (a) Move rarely-used or bulky columns of a table into a separate table (e.g. <code>users</code> core fields vs <code>user_profile_extras</code> with a long bio and settings JSON), so the hot table is narrow and cache-friendly. (b) At the architecture level, give each service its own database: users in one cluster, comments in another, DMs in a third — <strong>functional partitioning</strong>, the natural outcome of <a href="microservices.html">microservices</a>. It's simple and often the <em>first</em> step, but each table/service still lives on one machine, so it doesn't fix a single table that's too big or too write-heavy.</li>
+  <li><strong>Horizontal partitioning (sharding)</strong> splits by <em>rows</em>: every shard has the same schema but holds a different subset of rows — users 0–9,999,999 on shard 1, the next 10M on shard 2, or rows placed by a hash. This scales without a ceiling, at the cost of the complications covered in the rest of this lesson.</li>
+</ul>
+
+<div class="diagram">
+<svg viewBox="0 0 820 330" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-sh-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <text x="200" y="22" text-anchor="middle" font-weight="700">Vertical: split columns / tables</text>
+  <text x="615" y="22" text-anchor="middle" font-weight="700">Horizontal (sharding): split rows</text>
+  <rect x="40" y="40" width="320" height="34" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="200" y="62" text-anchor="middle" font-family="monospace" font-size="12">id | username | email | bio | settings</text>
+  <g stroke="#555" stroke-width="1.4" fill="none" marker-end="url(#ar-sh-1)">
+    <path d="M140,76 L110,118"/><path d="M260,76 L290,118"/>
+  </g>
+  <rect x="30" y="120" width="160" height="34" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="110" y="142" text-anchor="middle" font-family="monospace" font-size="12">id | username | email</text>
+  <rect x="210" y="120" width="160" height="34" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="290" y="142" text-anchor="middle" font-family="monospace" font-size="12">id | bio | settings</text>
+  <text x="110" y="172" text-anchor="middle" font-size="11" fill="#555">hot, narrow, cached</text>
+  <text x="290" y="172" text-anchor="middle" font-size="11" fill="#555">cold, bulky</text>
+  <g fill="#e8f5e9" stroke="#2e7d32">
+    <rect x="30" y="210" width="100" height="40" rx="8"/><rect x="150" y="210" width="100" height="40" rx="8"/><rect x="270" y="210" width="100" height="40" rx="8"/>
+  </g>
+  <g text-anchor="middle" font-size="12"><text x="80" y="235">Users DB</text><text x="200" y="235">Comments DB</text><text x="320" y="235">DMs DB</text></g>
+  <text x="200" y="275" text-anchor="middle" font-size="11.5" fill="#555">functional partitioning: one database per service</text>
+  <text x="200" y="295" text-anchor="middle" font-size="11.5" fill="#555">each still limited to one machine's capacity</text>
+  <path d="M410,30 V310" stroke="#bbb" stroke-dasharray="4 4"/>
+  <g fill="#fff8e1" stroke="#f9a825">
+    <rect x="470" y="40" width="290" height="26"/><rect x="470" y="66" width="290" height="26"/><rect x="470" y="92" width="290" height="26"/><rect x="470" y="118" width="290" height="26"/>
+  </g>
+  <g font-family="monospace" font-size="12">
+    <text x="480" y="58">user 17   | alice | …</text><text x="480" y="84">user 42   | bob   | …</text>
+    <text x="480" y="110">user 913  | carol | …</text><text x="480" y="136">user 2048 | dave  | …</text>
+  </g>
+  <g stroke="#555" stroke-width="1.4" fill="none" marker-end="url(#ar-sh-1)">
+    <path d="M540,146 L500,206"/><path d="M615,146 L615,206"/><path d="M690,146 L730,206"/>
+  </g>
+  <g fill="#fff8e1" stroke="#f9a825">
+    <rect x="430" y="208" width="120" height="60" rx="8"/><rect x="555" y="208" width="120" height="60" rx="8"/><rect x="680" y="208" width="120" height="60" rx="8"/>
+  </g>
+  <g text-anchor="middle" font-size="12">
+    <text x="490" y="230" font-weight="600">Shard 1</text><text x="490" y="250">users 17, 913</text>
+    <text x="615" y="230" font-weight="600">Shard 2</text><text x="615" y="250">user 42</text>
+    <text x="740" y="230" font-weight="600">Shard 3</text><text x="740" y="250">user 2048</text>
+  </g>
+  <text x="615" y="295" text-anchor="middle" font-size="11.5" fill="#555">same schema everywhere; rows placed by shard key</text>
+</svg>
+<div class="caption">Vertical partitioning splits a table's columns (or splits tables/services into separate databases); horizontal sharding splits a table's rows across servers using a shard key.</div>
+</div>
+
+<h2>3. Choosing a shard key</h2>
+<p>The <strong>shard key</strong> (partition key) is the column whose value decides which shard a row lives on. It's the most consequential and least reversible decision in a sharded design — changing it later means moving essentially all the data. Evaluate candidates against these criteria:</p>
+<ol>
+  <li><strong>High cardinality.</strong> Many distinct values, far more than the number of shards. <code>user_id</code> (billions) ✅; <code>country</code> (~200) ❌ — you can never have more than 200 useful shards, and they'd be wildly uneven.</li>
+  <li><strong>Even distribution of data <em>and</em> load.</strong> Not just row counts — request rates too. A key can spread rows evenly yet concentrate traffic (one celebrity's rows get 10,000× the reads).</li>
+  <li><strong>Query locality.</strong> The hottest queries should include the shard key, so they hit <em>one</em> shard. Data that's read together should share a shard key so it's <strong>co-located</strong>.</li>
+  <li><strong>No write hotspots.</strong> Monotonically increasing keys (timestamps, auto-increment IDs) under <em>range</em> sharding send all new writes to the last shard.</li>
+  <li><strong>Immutable.</strong> If the key value can change (e.g. username, country of residence), the row must move between shards on update. Use a stable surrogate ID.</li>
+  <li><strong>Supports growth.</strong> The scheme must let you add capacity without rewriting everything (Section 6).</li>
+</ol>
+
+<h3>3.1 Instagram shard-key decisions</h3>
+<div class="table-wrap"><table>
+  <tr><th>Data</th><th>Shard key</th><th>Why — and what it costs</th></tr>
+  <tr><td>Users / accounts</td><td><code>user_id</code></td><td>Every profile read, settings change and auth check is by user. Lookups by <code>username</code> need a separate mapping (a global index, Section 8).</td></tr>
+  <tr><td>Posts</td><td>author's <code>user_id</code></td><td>Profile grid ("posts by user X, newest first") becomes a single-shard range query; a user's posts are co-located with their account. Fetching a post by <code>post_id</code> alone works because Instagram-style IDs <strong>embed the shard number</strong>.</td></tr>
+  <tr><td>Likes</td><td><code>post_id</code></td><td>"Who liked this post / how many / did I like it" stays on one shard. "All posts user X liked" then needs a second copy keyed by <code>user_id</code>.</td></tr>
+  <tr><td>Comments</td><td><code>post_id</code></td><td>Comments are always displayed per post; keeps question/answer threads in order on one shard (consistent prefix).</td></tr>
+  <tr><td>Follow graph</td><td>both directions: <code>following</code> by follower_id, <code>followers</code> by followee_id</td><td>Each direction's list is single-shard. A follow writes two shards (handled asynchronously and idempotently — not via 2PC). See <a href="social-graph.html">Social Graph</a>.</td></tr>
+  <tr><td>Home timeline</td><td>viewer's <code>user_id</code></td><td>"My feed" is one key — one shard. Fan-out workers write to many shards. See <a href="news-feed.html">News Feed</a>.</td></tr>
+  <tr><td>Direct messages</td><td><code>conversation_id</code></td><td>A thread's messages are read together and must be ordered. See <a href="direct-messaging.html">Direct Messaging</a>.</td></tr>
+</table></div>
+<div class="callout warn"><span class="callout-title">⚠️ Shard keys that look tempting but fail</span>
+<code>created_at</code> with range sharding (every new write hits the newest shard); <code>country</code> (low cardinality, massively uneven — one shard for India, one for Iceland); <code>username</code> (mutable); <code>is_private</code> (two values). And a key that's great for one query can be terrible for another — which is why the same fact is often stored twice under two different shard keys.</div>
+
+<h2>4. Sharding strategies</h2>
+
+<h3>4.1 Range-based sharding</h3>
+<p>Each shard owns a <strong>contiguous range</strong> of key values: users 1–100M on shard A, 100M–200M on B, and so on (or usernames a–f, g–m…). A small routing table lists the boundaries.</p>
+<ul>
+  <li>✅ <strong>Range queries are efficient</strong> — "all events between 10:00 and 11:00" touches one or two shards.</li>
+  <li>✅ Easy to <strong>split</strong> a shard that grows too large (cut the range in half) — HBase, Bigtable, CockroachDB and Spanner split ranges automatically.</li>
+  <li>❌ <strong>Hotspots</strong> with sequential keys: if the key is a timestamp or auto-increment ID, <em>every</em> new write lands on the last range. Also skew when values cluster (many usernames start with "s").</li>
+</ul>
+
+<h3>4.2 Hash-based sharding</h3>
+<p>Apply a hash function to the key and use the hash to pick the shard: <code>shard = hash(user_id) mod S</code>. A good hash (MurmurHash, xxHash, MD5) scatters even sequential keys uniformly.</p>
+<ul>
+  <li>✅ <strong>Even distribution</strong> of data and writes, no sequential hotspots.</li>
+  <li>✅ Routing is pure computation — no lookup table.</li>
+  <li>❌ <strong>Range queries die</strong>: adjacent keys land on random shards, so "users 1000–2000" hits every shard.</li>
+  <li>❌ <strong>Naive <code>mod N</code> resharding moves almost everything</strong>: change S from 4 to 5 and ~80% of keys change shard. The fixes are a <strong>fixed number of logical partitions</strong> (Section 6) or <a href="consistent-hashing.html">consistent hashing</a>.</li>
+  <li>Hybrid used by Cassandra: <strong>hash the partition key</strong> to pick nodes, but keep <strong>rows sorted by clustering key inside the partition</strong> — so "posts of user X between dates" is still a range scan within one partition.</li>
+</ul>
+
+<h3>4.3 Directory (lookup-table) sharding</h3>
+<p>A <strong>directory service</strong> stores an explicit mapping <code>key (or key group) → shard</code>. Routing = look up the key, then go to that shard.</p>
+<ul>
+  <li>✅ <strong>Maximum flexibility</strong>: move one big tenant/user to a dedicated shard, place shards on heterogeneous hardware, rebalance one key at a time.</li>
+  <li>❌ <strong>Extra hop</strong> on every request (mitigate with aggressive caching in each app server); the directory must be highly available and consistent — it becomes critical infrastructure (often stored in ZooKeeper/etcd or a replicated DB).</li>
+  <li>Common in multi-tenant SaaS (tenant → shard) and as the "logical → physical" map in Instagram's design, where the directory is tiny because it maps thousands of <em>logical shards</em>, not billions of keys.</li>
+</ul>
+
+<h3>4.4 Geographic sharding</h3>
+<p>Place each user's data in a shard located in (or near) their region: EU users in Frankfurt, Indian users in Mumbai.</p>
+<ul>
+  <li>✅ <strong>Low latency</strong> for the user's own data; <strong>data-residency compliance</strong> (GDPR, national data laws).</li>
+  <li>❌ <strong>Uneven</strong> (one region may have 10× the users); people <strong>travel and move</strong> (home region must be migratable); social interactions <strong>cross regions</strong> constantly (a Brazilian liking a Japanese post), so many operations become cross-shard and cross-continent anyway. Usually combined with hash sharding <em>within</em> each region. See <a href="multi-region.html">Multi-Region Architecture</a>.</li>
+</ul>
+
+<pre class="ascii">
+ RANGE  (key = user_id)                 HASH  (shard = hash(user_id) mod 4)
+   [1 ……… 100M]   → shard A               user 17   → h=…3A → shard 2
+   [100M … 200M]  → shard B               user 18   → h=…F1 → shard 1   (neighbours scatter)
+   [200M … 300M]  → shard C  ← all new    user 19   → h=…07 → shard 3
+                               signups!   user 20   → h=…C4 → shard 0
+
+ DIRECTORY (lookup table)               GEO (by home region)
+   tenant "acme"   → shard 7              user in Germany  → EU shard group
+   tenant "globex" → shard 2              user in India    → APAC shard group
+   user 42 (celebrity) → dedicated shard  user in Brazil   → LATAM shard group
+</pre>
+
+<div class="table-wrap"><table>
+  <tr><th>Strategy</th><th>Distribution</th><th>Range queries</th><th>Routing cost</th><th>Resharding</th><th>Hotspot risk</th><th>Typical users</th></tr>
+  <tr><td><b>Range</b></td><td>Can be skewed</td><td>✅ Excellent</td><td>Small boundary table</td><td>Easy splits of a single range</td><td>High for sequential keys</td><td>HBase, Bigtable, Spanner, CockroachDB, MongoDB ranged</td></tr>
+  <tr><td><b>Hash</b></td><td>✅ Uniform</td><td>❌ Scatter to all shards</td><td>Pure computation</td><td>Painful with mod N; easy with fixed partitions/consistent hashing</td><td>Only per-key (celebrities)</td><td>Cassandra, DynamoDB, Redis Cluster, MongoDB hashed, Vitess</td></tr>
+  <tr><td><b>Directory</b></td><td>Whatever you choose</td><td>Depends on mapping</td><td>Extra lookup (cached)</td><td>✅ Most flexible — move any key/group</td><td>Can isolate hot keys</td><td>Multi-tenant SaaS, logical→physical maps</td></tr>
+  <tr><td><b>Geo</b></td><td>Follows population — uneven</td><td>Within region only</td><td>User → region map</td><td>Moving users between regions is costly</td><td>Big regions</td><td>Compliance-driven systems, multi-region apps</td></tr>
+</table></div>
+
+<h2>5. Hotspots and the celebrity problem</h2>
+<p>Even with a perfect hash, sharding balances <em>keys</em>, not <em>traffic per key</em>. A single key can be orders of magnitude hotter than average — and a key always lives on one shard. Instagram's extreme case: accounts with <strong>hundreds of millions of followers</strong>.</p>
+<pre><code>Assume a celebrity posts and the post gets 10 M likes in the first hour.
+  10,000,000 / 3,600 s  ≈ 2,800 like-writes/s — all with the same post_id → one shard.
+  Peak in the first minutes may be 10× that: ~28,000 writes/s on ONE shard,
+  while the average shard handles a few hundred. Meanwhile 50 M viewers read the
+  post's like count and comments → hundreds of thousands of reads/s on the same shard.</code></pre>
+<p>Mitigations, usually combined:</p>
+<ul>
+  <li><strong>Cache hot reads.</strong> The post, its counts and top comments go into Redis/Memcached (and media into the <a href="cdn.html">CDN</a>); the shard sees a tiny fraction of reads. See <a href="caching.html">Caching</a>.</li>
+  <li><strong>Split hot keys ("salting").</strong> Write likes for a hot post to <code>post_id#0 … post_id#15</code>, chosen randomly or by <code>hash(user_id) % 16</code>, so they spread over up to 16 shards; reads aggregate the sub-keys. Do this only for keys detected as hot — it multiplies read cost.</li>
+  <li><strong>Counter aggregation.</strong> Don't increment a row per like: buffer increments in memory or a stream processor and apply <code>+N</code> once per second. See <a href="likes-comments.html">Likes &amp; Counters</a>.</li>
+  <li><strong>Change the algorithm for whales.</strong> The <a href="news-feed.html">feed</a> uses fan-out-on-write for normal users but <strong>fan-out-on-read</strong> for celebrities, so one post doesn't trigger 600M timeline writes.</li>
+  <li><strong>Isolate.</strong> Use the directory to move the hottest accounts' logical shards onto dedicated, beefier servers.</li>
+  <li><strong>Rate-limit and queue</strong> non-urgent writes (notifications about the likes can be batched: "Alice and 9,999 others liked your post"). See <a href="rate-limiting.html">Rate Limiting</a>.</li>
+</ul>
+
+<h2>6. Logical vs physical shards, and resharding</h2>
+
+<h3>6.1 Why naive resharding hurts</h3>
+<p>Suppose you start with 4 database servers and route with <code>user_id mod 4</code>. A year later you need 5. Under <code>mod 5</code>, a key stays put only if <code>id mod 4 == id mod 5</code>, which is true for just 4 of every 20 consecutive IDs — <strong>80% of all rows must move</strong>, while the system is serving traffic. Doubling from 4 to 8 is kinder (exactly 50% move), but still means copying half your data at once. The <a href="consistent-hashing.html">consistent hashing</a> lesson works through this arithmetic in detail.</p>
+
+<h3>6.2 The fix: many logical shards, few physical servers</h3>
+<p>Decouple the two concerns:</p>
+<ul>
+  <li><strong>Logical shards</strong> — a large, <strong>fixed</strong> number of buckets (e.g. 4,096) chosen once and never changed. Keys map to logical shards with a function that therefore never changes: <code>logical = user_id mod 4096</code>.</li>
+  <li><strong>Physical shards</strong> — the actual database servers. A small <strong>mapping table</strong> assigns logical shards to servers: with 8 servers, each hosts 512 logical shards.</li>
+</ul>
+<p>To grow, you <strong>move whole logical shards</strong> from crowded servers to new ones and update the mapping. No key ever changes logical shard, so nothing is re-hashed; you only move as many logical shards as needed to balance the new server. Data movement is also simple, because a logical shard is a self-contained unit (a schema, a database, a set of files).</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 340" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-sh-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <text x="195" y="22" text-anchor="middle" font-weight="700">Before: 2 physical servers</text>
+  <text x="615" y="22" text-anchor="middle" font-weight="700">After: 4 physical servers</text>
+  <g fill="#fff8e1" stroke="#f9a825">
+    <rect x="20" y="40" width="170" height="160" rx="10"/>
+    <rect x="205" y="40" width="170" height="160" rx="10"/>
+  </g>
+  <g text-anchor="middle" font-weight="600"><text x="105" y="62">pg-db-01</text><text x="290" y="62">pg-db-02</text></g>
+  <g fill="#e8f5e9" stroke="#2e7d32">
+    <rect x="35" y="75" width="65" height="26" rx="5"/><rect x="110" y="75" width="65" height="26" rx="5"/>
+    <rect x="35" y="110" width="65" height="26" rx="5"/><rect x="110" y="110" width="65" height="26" rx="5"/>
+    <rect x="220" y="75" width="65" height="26" rx="5"/><rect x="295" y="75" width="65" height="26" rx="5"/>
+    <rect x="220" y="110" width="65" height="26" rx="5"/><rect x="295" y="110" width="65" height="26" rx="5"/>
+  </g>
+  <g text-anchor="middle" font-size="12">
+    <text x="67" y="93">L0</text><text x="142" y="93">L1</text><text x="67" y="128">L2</text><text x="142" y="128">L3</text>
+    <text x="252" y="93">L4</text><text x="327" y="93">L5</text><text x="252" y="128">L6</text><text x="327" y="128">L7</text>
+  </g>
+  <g text-anchor="middle" font-size="11" fill="#555"><text x="105" y="165">4 logical shards</text><text x="290" y="165">4 logical shards</text><text x="105" y="183">(PG schemas)</text><text x="290" y="183">(PG schemas)</text></g>
+  <path d="M390,120 L425,120" stroke="#555" stroke-width="2" marker-end="url(#ar-sh-2)"/>
+  <g fill="#fff8e1" stroke="#f9a825">
+    <rect x="435" y="40" width="88" height="120" rx="10"/><rect x="530" y="40" width="88" height="120" rx="10"/>
+    <rect x="625" y="40" width="88" height="120" rx="10"/><rect x="720" y="40" width="88" height="120" rx="10"/>
+  </g>
+  <g text-anchor="middle" font-weight="600" font-size="12"><text x="479" y="62">db-01</text><text x="574" y="62">db-03 🆕</text><text x="669" y="62">db-02</text><text x="764" y="62">db-04 🆕</text></g>
+  <g fill="#e8f5e9" stroke="#2e7d32">
+    <rect x="447" y="75" width="64" height="26" rx="5"/><rect x="447" y="110" width="64" height="26" rx="5"/>
+    <rect x="637" y="75" width="64" height="26" rx="5"/><rect x="637" y="110" width="64" height="26" rx="5"/>
+  </g>
+  <g fill="#f3e5f5" stroke="#6a1b9a">
+    <rect x="542" y="75" width="64" height="26" rx="5"/><rect x="542" y="110" width="64" height="26" rx="5"/>
+    <rect x="732" y="75" width="64" height="26" rx="5"/><rect x="732" y="110" width="64" height="26" rx="5"/>
+  </g>
+  <g text-anchor="middle" font-size="12">
+    <text x="479" y="93">L0</text><text x="479" y="128">L1</text><text x="574" y="93">L2</text><text x="574" y="128">L3</text>
+    <text x="669" y="93">L4</text><text x="669" y="128">L5</text><text x="764" y="93">L6</text><text x="764" y="128">L7</text>
+  </g>
+  <rect x="20" y="225" width="790" height="100" rx="8" fill="#eceff1" stroke="#455a64"/>
+  <text x="35" y="250" font-weight="600">Routing never changes:  logical = user_id mod 8   (in production: thousands of logical shards)</text>
+  <text x="35" y="275" font-size="12.5">Mapping table changes:  {L0,L1 → db-01, L2,L3 → db-03, L4,L5 → db-02, L6,L7 → db-04}</text>
+  <text x="35" y="300" font-size="12.5">Only the purple logical shards moved (50% of data, to brand-new servers) — no key was re-hashed.</text>
+</svg>
+<div class="caption">Logical vs physical shards. Keys map to a fixed set of logical shards; a small mapping assigns logical shards to servers. Adding servers means moving whole logical shards and editing the mapping.</div>
+</div>
+
+<h3>6.3 Instagram's publicly described approach</h3>
+<div class="callout instagram"><span class="callout-title">📸 Instagram's PostgreSQL sharding</span>
+Instagram's engineering blog post on sharding and IDs (2012) describes the design that this lesson's diagram is based on:
+<ul>
+  <li>Data is split into <strong>several thousand logical shards</strong>, which are <strong>mapped in code to far fewer physical database servers</strong>.</li>
+  <li>Each logical shard is a <strong>PostgreSQL schema</strong> (a namespace of tables inside a database), so one physical server hosts many logical shards as separate schemas, each with its own tables and its own ID sequence.</li>
+  <li>To add capacity, logical shards are <strong>moved between servers</strong> rather than re-bucketing data. A convenient technique with PostgreSQL is to bring up a streaming replica of a crowded server, promote it, re-point half of that server's logical shards to it, and then drop the now-unused schemas on each side.</li>
+  <li>Every ID embeds its logical shard: <strong>41 bits of milliseconds since a custom epoch + 13 bits of logical shard ID + 10 bits of per-shard auto-increment sequence</strong>. 13 bits allow up to 8,192 logical shards; 10 bits allow 1,024 IDs per shard per millisecond. Given any post ID, you can extract its shard with bit operations — no lookup needed. See <a href="id-generation.html">Unique ID Generation</a>.</li>
+</ul></div>
+
+<pre><code>NUM_LOGICAL_SHARDS = 4096                 # fixed forever (13-bit field allows up to 8192)
+
+# Small mapping table: cached in every app server, stored in a config service (ZooKeeper/etcd)
+LOGICAL_TO_PHYSICAL = {}                  # logical shard -&gt; database host
+for ls in range(NUM_LOGICAL_SHARDS):
+    LOGICAL_TO_PHYSICAL[ls] = f"pg-db-{ls // 512 + 1:02d}"   # 8 servers × 512 logical shards
+
+def shard_for_user(user_id: int) -&gt; int:
+    return user_id % NUM_LOGICAL_SHARDS
+
+def shard_for_object(obj_id: int) -&gt; int:
+    # Instagram-style ID: [41 bits time][13 bits shard][10 bits sequence]
+    return (obj_id &gt;&gt; 10) &amp; 0x1FFF
+
+def connection_for_user(user_id: int):
+    ls = shard_for_user(user_id)
+    host = LOGICAL_TO_PHYSICAL[ls]
+    return get_pool(host), f"shard_{ls:04d}"   # query tables inside schema shard_NNNN
+
+# A new post by user 42 is created on shard_for_user(42); its ID embeds that shard,
+# so later "GET /p/&lt;post_id&gt;" routes with shard_for_object(post_id) — no directory lookup.</code></pre>
+
+<h3>6.4 How many logical shards?</h3>
+<p>Enough that you'll never need more physical servers than logical shards (e.g. if you might one day run 1,000 servers, choose ≥ 4,000 logical shards so each server can still hold several and you can balance finely), but not so many that per-shard overhead (connections, schemas, file handles, monitoring) explodes. Thousands is the common sweet spot. Elasticsearch, Riak and Couchbase (1,024 vBuckets) and Redis Cluster (16,384 hash slots) all use this "fixed number of partitions" approach.</p>
+
+<h2>7. Cross-shard queries, scatter-gather and joins</h2>
+<p>A query that includes the shard key goes to one shard — fast and isolated. A query that doesn't must be sent to <strong>every</strong> shard and the results merged: <strong>scatter-gather</strong>.</p>
+<pre class="ascii">
+ "Find posts with caption containing #sunset created in the last hour"  (no shard key!)
+
+                       +--------------------+
+   client ----------&gt;  | query router /     |
+                       | coordinator        |
+                       +--------------------+
+            scatter  /     |      |      \   (same query to all N shards, in parallel)
+                    v      v      v       v
+               shard 1  shard 2  shard 3 … shard N
+                    \      |      |       /
+            gather   v     v      v      v   (each returns its top-k; coordinator merges,
+                       +--------------------+   re-sorts, applies LIMIT)
+                       |  merge + sort + k  |
+                       +--------------------+
+ Latency = the SLOWEST shard.  Load = N × (one query).  Availability = all N must answer.
+</pre>
+<p>Why it's expensive:</p>
+<ul>
+  <li><strong>Load multiplies.</strong> With 1,000 shards, one query becomes 1,000 queries. 1,000 such requests per second = a million shard queries per second.</li>
+  <li><strong>Tail latency dominates.</strong> If each shard is slow (above its p99) 1% of the time, the chance that <em>at least one</em> of 100 shards is slow is <code>1 − 0.99<sup>100</sup> ≈ 63%</code>. Your median scatter-gather query is as slow as a single shard's p99.</li>
+  <li><strong>Pagination and sorting</strong> are awkward: for "top 20 overall" each shard must return its top 20, and deep pages get expensive.</li>
+</ul>
+<p>Strategies:</p>
+<ol>
+  <li><strong>Design so hot queries include the shard key.</strong> This is the whole point of choosing the key from your access patterns.</li>
+  <li><strong>Denormalise / duplicate by another key</strong> — store likes by <code>post_id</code> <em>and</em> by <code>user_id</code>.</li>
+  <li><strong>Use a purpose-built secondary system</strong> for queries that inherently span everything: search goes to <a href="search.html">Elasticsearch</a>, analytics to the <a href="analytics-ml.html">data warehouse</a>.</li>
+  <li><strong>Precompute</strong> — maintain aggregates (counts, leaderboards) incrementally from events instead of computing them across shards on request.</li>
+  <li><strong>Bound fan-out</strong> — scatter to only the shards that can contain matches (e.g. range sharding by time), use timeouts and return partial results when acceptable.</li>
+</ol>
+
+<h3>7.1 Joins across shards</h3>
+<p>A SQL join between rows on different servers can't be executed by either database alone. Options:</p>
+<ul>
+  <li><strong>Co-location</strong>: shard related tables by the <em>same</em> key so joins are shard-local — posts and media both sharded by the author's <code>user_id</code> (Citus calls these <em>co-located tables</em>; Vitess uses keyspace IDs).</li>
+  <li><strong>Reference (broadcast) tables</strong>: small, rarely-changing tables (countries, hashtag categories, feature flags) are copied to every shard.</li>
+  <li><strong>Application-side joins</strong>: fetch post IDs from shard A, then batch-fetch authors from their shards (<code>multiget</code>), and stitch in code — typically with a cache in front. This is how feeds are "hydrated".</li>
+  <li><strong>Denormalisation</strong>: copy the author's name/avatar into the data you read.</li>
+</ul>
+
+<h2>8. Secondary indexes in a sharded database: local vs global</h2>
+<p>The shard key decides where a row lives. But what about lookups by another column — e.g. "find user by <code>username</code>" when users are sharded by <code>user_id</code>? There are two ways to index a non-shard-key column:</p>
+<div class="cards">
+  <div class="card"><h4>📍 Local (document-partitioned) index</h4><p>Each shard indexes <em>only its own rows</em>. Writes are simple and transactional (row and index entry on the same shard). But a lookup by the indexed column doesn't know which shard holds the match, so it must <strong>scatter-gather to every shard</strong>.</p></div>
+  <div class="card"><h4>🌐 Global (term-partitioned) index</h4><p>The index is itself sharded <em>by the indexed value</em>: e.g. a <code>usernames</code> table sharded by <code>hash(username)</code> storing <code>username → user_id</code>. A lookup hits <strong>one index shard</strong>, then one data shard. But a write now touches <strong>two shards</strong> (data + index), so the index is usually updated <strong>asynchronously</strong> (eventually consistent) or via a distributed transaction.</p></div>
+</div>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Local secondary index</th><th>Global secondary index</th></tr>
+  <tr><td><b>Read by indexed column</b></td><td>Scatter to all shards</td><td>1 index shard (+ 1 data shard)</td></tr>
+  <tr><td><b>Write cost</b></td><td>Same shard, same transaction</td><td>Extra cross-shard write</td></tr>
+  <tr><td><b>Consistency</b></td><td>Immediately consistent</td><td>Usually eventually consistent (lag)</td></tr>
+  <tr><td><b>Good when</b></td><td>Queries also include the shard key, or are rare</td><td>Frequent lookups by a non-shard-key column</td></tr>
+  <tr><td><b>Examples</b></td><td>MongoDB, Elasticsearch, Cassandra secondary indexes, DynamoDB LSI</td><td>DynamoDB GSI (async), Vitess lookup vindexes, Spanner/CockroachDB (transactional)</td></tr>
+</table></div>
+<p><strong>Instagram example:</strong> login by username and @mention resolution happen constantly, so a <strong>global index</strong> — a <code>username → user_id</code> mapping sharded by username — is the right call. Claiming a username is a single-row insert on that index shard with a uniqueness constraint (the single authority for that value), followed by creating the user row. "Posts tagged at location X" is rarer and fits better in the search/discovery system than as a global index on the posts shards.</p>
+
+<h2>9. Distributed transactions: two-phase commit, and why to avoid it</h2>
+<p>Within one shard you have ordinary ACID transactions. An operation that must atomically change rows on <em>two</em> shards needs a <strong>distributed transaction</strong>. The classic protocol is <strong>two-phase commit (2PC)</strong>:</p>
+<pre class="ascii">
+ Coordinator                 Shard A (follower list)        Shard B (following list)
+     | ---- PREPARE (tx 77) ----&gt;|                                |
+     | ---- PREPARE (tx 77) ----------------------------------------&gt;|
+     |                           | write intent, lock rows,       | write intent, lock rows,
+     |                           | fsync, vote YES                | fsync, vote YES
+     | &lt;-------- YES ------------|                                |
+     | &lt;-------- YES -------------------------------------------------|
+     | (log decision: COMMIT)    |                                |
+     | ---- COMMIT -------------&gt;|  apply, release locks          |
+     | ---- COMMIT -------------------------------------------------&gt;| apply, release locks
+ Any NO or timeout in phase 1 → coordinator sends ABORT to all.
+ Coordinator crashes after PREPARE? Shards are stuck holding locks ("in doubt") until it recovers.
+</pre>
+<p>Why large systems avoid 2PC on hot paths:</p>
+<ul>
+  <li><strong>Blocking.</strong> A participant that voted YES can't decide on its own — if the coordinator dies, rows stay locked until it comes back.</li>
+  <li><strong>Latency.</strong> At least two round trips plus forced log writes on every participant; across regions that's hundreds of ms.</li>
+  <li><strong>Availability multiplies down.</strong> The transaction needs <em>every</em> participant up; with 3 shards each 99.9% available, the transaction is ~99.7% available.</li>
+  <li><strong>Throughput.</strong> Locks are held across network round trips, so contention rises sharply.</li>
+</ul>
+<p>(Consensus-replicated systems like Spanner and CockroachDB make 2PC non-blocking by making each participant a replicated Raft/Paxos group, but the latency cost remains.)</p>
+<p><strong>What to do instead:</strong></p>
+<ol>
+  <li><strong>Design operations to be single-shard</strong> — the main reason for co-locating data by shard key.</li>
+  <li><strong>Sagas</strong>: a sequence of local transactions, each publishing an event that triggers the next; if a later step fails, run <strong>compensating</strong> actions (e.g. release a reserved username).</li>
+  <li><strong>Transactional outbox</strong>: in the <em>same local transaction</em> as the business change, insert an event row into an <code>outbox</code> table; a relay publishes it to Kafka. This guarantees "the DB change and the event either both happen or neither", without 2PC between the DB and Kafka.</li>
+  <li><strong>Idempotent, retryable consumers</strong> so at-least-once delivery converges to the right state.</li>
+</ol>
+<div class="callout tip"><span class="callout-title">💡 Example: Alice follows Bob</span>
+Alice's <code>following</code> list lives on Alice's shard; Bob's <code>followers</code> list lives on Bob's shard. Instead of 2PC: (1) a local transaction on Alice's shard inserts <code>(alice → bob)</code> and an outbox event <code>FollowCreated</code>; (2) a consumer inserts <code>(bob ← alice)</code> on Bob's shard with an idempotent upsert, increments Bob's follower count, and triggers a notification. For a few hundred ms Bob's follower list may not include Alice yet — an acceptable inconsistency.</div>
+
+<h2>10. Rebalancing</h2>
+<p><strong>Rebalancing</strong> moves data and load between nodes when nodes are added, removed or overloaded. Goals: afterwards load is fair; during the move the database keeps serving reads and writes; and no more data moves than necessary.</p>
+<div class="table-wrap"><table>
+  <tr><th>Approach</th><th>How it works</th><th>Used by</th></tr>
+  <tr><td><b>Fixed number of partitions</b></td><td>Create many more partitions than nodes up front; move whole partitions to new nodes.</td><td>Instagram logical shards, Elasticsearch, Riak, Couchbase vBuckets, Redis Cluster slots</td></tr>
+  <tr><td><b>Dynamic splitting</b></td><td>A partition that exceeds a size threshold splits in two; halves can move. Partition count grows with data.</td><td>HBase regions, Bigtable tablets, MongoDB chunks, CockroachDB ranges (~512 MB)</td></tr>
+  <tr><td><b>Proportional to nodes</b></td><td>Each node owns a fixed number of token ranges (virtual nodes); a new node steals some ranges from existing ones.</td><td>Cassandra, ScyllaDB (vnodes) — see <a href="consistent-hashing.html">Consistent Hashing</a></td></tr>
+</table></div>
+<h3>10.1 Moving a shard without downtime</h3>
+<ol class="steps">
+  <li><strong>Copy:</strong> snapshot the logical shard to the target server (or start a streaming replica of the source).</li>
+  <li><strong>Catch up:</strong> stream ongoing changes (replication or CDC) until the target lags by only milliseconds.</li>
+  <li><strong>Cut over:</strong> briefly block writes to that shard (seconds), let the target apply the final changes, flip the mapping in the config service, and let routers pick it up.</li>
+  <li><strong>Verify and clean up:</strong> compare row counts/checksums, then delete the shard from the source.</li>
+</ol>
+<p>Practical concerns: throttle copies so they don't starve production traffic; prefer <strong>human-approved</strong> rebalancing plans (fully automatic rebalancing combined with automatic failure detection can cascade — a slow node is declared dead, its data is moved onto other nodes, which become overloaded…); and make sure routers handle "shard moved" errors by refreshing their mapping.</p>
+<h3>10.2 Request routing</h3>
+<p>Someone must know the mapping: (a) <strong>smart clients</strong> that cache the map (Instagram-style app-level routing, Cassandra drivers, Redis Cluster clients following <code>MOVED</code> redirects); (b) a <strong>routing tier</strong> (MongoDB <code>mongos</code>, Vitess <code>vtgate</code>, Citus coordinator); or (c) <strong>any node</strong> that forwards to the right one (Cassandra coordinators, gossip). The authoritative map usually lives in a consensus store (ZooKeeper, etcd, a config server).</p>
+
+<h2>11. How Instagram uses sharding</h2>
+<div class="callout instagram"><span class="callout-title">📸 Sharding across Instagram's data layer</span>
+<ul>
+  <li><strong>User DB (PostgreSQL)</strong>: thousands of logical shards (schemas) keyed by <code>user_id</code>, mapped onto a much smaller set of physical servers, each with <a href="replication.html">replicas</a> — the publicly described design from Section 6.3.</li>
+  <li><strong>Object IDs encode the shard</strong>: posts, comments and other objects get 64-bit IDs containing their logical shard, so any service can route a <code>post_id</code> to the right database with two bit operations.</li>
+  <li><strong>Cassandra</strong> (feeds, activity, other high-write data) shards automatically by hashing the partition key onto its token ring — partition keys like <code>user_id</code> or <code>(user_id, bucket)</code> play the role of shard keys.</li>
+  <li><strong>Caches</strong> (Memcached/Redis) are sharded with <a href="consistent-hashing.html">consistent hashing</a> on the cache key; <strong>Kafka</strong> topics are partitioned by key (e.g. <code>user_id</code>) so events for one entity stay ordered.</li>
+</ul></div>
+
+<h3>11.1 A request through the shards</h3>
+<ol class="steps">
+  <li><strong>Open profile @bob.</strong> The global <code>usernames</code> index (sharded by username) resolves <code>bob → user_id 1872…</code>.</li>
+  <li><code>logical = user_id mod 4096 = 1337</code>; mapping says logical shard 1337 lives on <code>pg-db-27</code>; a nearby read replica of <code>pg-db-27</code> serves Bob's profile row and his newest 12 posts from schema <code>shard_1337</code> — one shard, one index range scan.</li>
+  <li><strong>Tap a post.</strong> The post ID's middle 13 bits say shard 1337 → same server. Like count and comments come from <code>post_id</code>-partitioned stores and caches.</li>
+  <li><strong>Alice likes it.</strong> The like is written to the shard of the <em>post</em>; a copy keyed by Alice's <code>user_id</code> ("posts I liked") is written asynchronously via an event.</li>
+  <li><strong>Feed.</strong> Bob's new post is fanned out by workers to each follower's timeline, keyed by the follower's <code>user_id</code> — touching many shards, but asynchronously and in batches.</li>
+</ol>
+
+<h3>Rough numbers (assumptions)</h3>
+<pre><code>Assume 2 B users, ~1 KB of user row + indexes each       → ~2 TB of user data
+Logical shards: 4,096                                      → ~490,000 users and ~0.5 GB per logical shard
+Physical servers: 64 primaries (each + 2 replicas)          → 64 logical shards / server, ~32 GB / server
+Peak user-DB writes 40,000/s ÷ 64 primaries                 → ~625 writes/s per primary (comfortable)
+Growth to 128 servers: move 32 logical shards off each server (~16 GB each), no re-hashing.
+
+Scatter-gather tax: a query without the shard key at 4,096 logical shards
+  = up to 64 physical queries per request; at 1,000 req/s → 64,000 queries/s just for that feature.</code></pre>
+
+<h2>12. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ What sharding gives you</h4><ul>
+    <li>Near-linear scaling of storage and <strong>write throughput</strong></li>
+    <li>Smaller datasets per server: indexes fit in RAM, faster backups and rebuilds</li>
+    <li>Fault isolation — a failed shard affects a small fraction of users</li>
+    <li>Ability to place data near users or in required jurisdictions</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ What it costs</h4><ul>
+    <li>Cross-shard queries, joins and aggregations become hard or expensive</li>
+    <li>No cheap multi-shard transactions; foreign keys only within a shard</li>
+    <li>Hot shards from skewed keys; rebalancing operations</li>
+    <li>Global uniqueness and secondary lookups need global indexes</li>
+    <li>Much more operational complexity (routing, migrations, schema changes × N shards)</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Sharding too early.</strong> Vertical scaling, read replicas, caching and query tuning go a long way. Shard when a single primary's write load or data size is truly the bottleneck — but <em>design</em> IDs and keys so sharding later is possible.</li>
+  <li><strong>Sharding too late.</strong> Migrating a live, overloaded monolith database is far harder than sharding a healthy one.</li>
+  <li><strong>A shard key that doesn't match the hot queries</strong> → everything becomes scatter-gather.</li>
+  <li><strong>Sequential keys with range sharding</strong> → all writes on one shard.</li>
+  <li><strong><code>hash mod N</code> on physical servers</strong> → adding a server moves most of the data. Use logical shards or consistent hashing.</li>
+  <li><strong>Auto-increment IDs per shard</strong> → collisions across shards. Use globally unique IDs (shard-embedded or Snowflake-style).</li>
+  <li><strong>Ignoring per-key hotspots</strong> — celebrities, viral posts, default/empty keys (<code>user_id = 0</code> for anonymous events all landing on one shard).</li>
+  <li><strong>2PC everywhere</strong> to preserve monolith-style transactions → latency and availability collapse.</li>
+  <li><strong>Schema migrations</strong> forgotten on a few shards → shards drift. Automate migrations across all shards and verify.</li>
+</ul>
+
+<h2>13. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Tool</th><th>What it shards</th><th>How</th><th>When to use</th></tr>
+  <tr><td><b>Vitess</b></td><td>MySQL</td><td>Keyspaces split into shards by "vindexes" (hash, lookup, range); <code>vtgate</code> routes and scatter-gathers; online resharding workflows. Born at YouTube; used by Slack, GitHub, PlanetScale.</td><td>Scaling a MySQL application horizontally while keeping MySQL.</td></tr>
+  <tr><td><b>Citus</b></td><td>PostgreSQL (extension)</td><td>Distributed tables hash-sharded by a distribution column; co-located and reference tables; coordinator pushes down queries; parallel scatter-gather for analytics.</td><td>Multi-tenant SaaS and real-time analytics on PostgreSQL.</td></tr>
+  <tr><td><b>MongoDB sharding</b></td><td>Documents</td><td>Ranged or hashed shard keys; data in chunks; balancer migrates chunks; <code>mongos</code> routers; config servers hold metadata. Shard keys can be refined/resharded in newer versions.</td><td>Document workloads outgrowing a replica set.</td></tr>
+  <tr><td><b>Cassandra / ScyllaDB</b></td><td>Partitions</td><td>Murmur3 hash of partition key on a token ring with vnodes; automatic placement and replication; streaming on node add/remove.</td><td>High-write, key-access workloads (Instagram feeds/activity).</td></tr>
+  <tr><td><b>DynamoDB</b></td><td>Items</td><td>Fully managed hash partitioning on partition key; automatic splits for size and heat ("adaptive capacity").</td><td>Serverless key-value at any scale on AWS.</td></tr>
+  <tr><td><b>Spanner / CockroachDB / TiDB / YugabyteDB</b></td><td>SQL tables</td><td>Automatic range splitting + consensus replication + distributed transactions.</td><td>When you want sharding to be invisible to the app.</td></tr>
+  <tr><td><b>Redis Cluster</b></td><td>Keys</td><td>16,384 hash slots (CRC16 mod 16384) assigned to nodes; hash tags <code>{user42}</code> co-locate keys.</td><td>Sharded caches and timelines.</td></tr>
+  <tr><td><b>Application-level sharding</b></td><td>Anything</td><td>Your code maps keys → logical shards → servers (Instagram's original approach).</td><td>Full control, simple access patterns, team willing to own the tooling.</td></tr>
+</table></div>
+
+<h2>14. Interview corner</h2>
+<details class="qa"><summary>How would you shard Instagram's data? What's the shard key for each table?</summary>
+<p>Users, posts and timelines by <code>user_id</code> (author for posts, viewer for timelines), because the hottest queries — profile, profile grid, my feed — are per user and become single-shard. Likes and comments by <code>post_id</code> since they're read per post; a secondary copy of likes by <code>user_id</code> for "posts I liked". Follows stored twice: following by follower, followers by followee. DMs by <code>conversation_id</code>. Usernames in a global index sharded by username. Use thousands of fixed logical shards mapped to physical servers, and IDs that embed the logical shard so any object routes without a lookup.</p></details>
+<details class="qa"><summary>Range vs hash sharding — when would you choose each?</summary>
+<p>Range when queries scan contiguous key ranges (time-series, ordered listings) and keys aren't sequentially written — or when the system auto-splits ranges (Bigtable, CockroachDB). Hash when access is by exact key and you need even write distribution, accepting that range queries scatter. Cassandra combines them: hash the partition key for placement, sort by clustering key within the partition. For Instagram's per-user data, hash (or modulo over logical shards) of <code>user_id</code> is natural, with time ordering inside each user's data.</p></details>
+<details class="qa"><summary>How do you add capacity without moving most of the data?</summary>
+<p>Never route with <code>hash mod (number of servers)</code>. Either (1) pre-split into a large fixed number of logical shards (e.g. 4,096) and map them to servers via a small table, moving whole logical shards to new servers — Instagram's approach — or (2) use consistent hashing with virtual nodes so a new node takes ~1/N of the keys. Move data online: snapshot, stream changes to catch up, brief write freeze, flip the mapping, verify, delete the old copy.</p></details>
+<details class="qa"><summary>A celebrity's posts overload one shard. What do you do?</summary>
+<p>First, cache: serve the post, counts and top comments from Redis/Memcached and media from the CDN so reads barely touch the shard. For writes (likes), aggregate counter increments and split the hot key across sub-keys (<code>post_id#0..15</code>) so writes spread across shards. For the feed, use fan-out-on-read for celebrity posts instead of pushing to hundreds of millions of timelines. If an account is persistently hot, move its logical shard to dedicated hardware via the mapping table.</p></details>
+<details class="qa"><summary>How do you look up a user by username when users are sharded by user_id?</summary>
+<p>Build a global secondary index: a <code>username → user_id</code> table sharded by (hash of) username. Lookup = one index shard + one user shard. Usernames are unique, so the index shard is also the single authority that enforces uniqueness (an insert that fails on conflict). Because the index and the user row are on different shards, write the index first as a "reservation", then the user row, and clean up the reservation if sign-up fails (saga-style), rather than 2PC. A local index would require querying all shards on every login.</p></details>
+<details class="qa"><summary>Why avoid two-phase commit, and what do you use instead?</summary>
+<p>2PC blocks if the coordinator fails after participants vote yes (locks held "in doubt"), adds multiple round trips and forced log writes, needs every participant available (availability multiplies down) and holds locks across the network, killing throughput. Instead: co-locate data so operations are single-shard; use sagas with compensating actions; use the transactional outbox to publish events atomically with local changes; make consumers idempotent. For follow/unfollow, write locally plus an outbox event; the other shard is updated asynchronously.</p></details>
+<details class="qa"><summary>What's the difference between sharding and replication? Do you need both?</summary>
+<p>Replication keeps <em>copies</em> of the same data on several nodes — for availability, durability and read scaling; it doesn't scale writes. Sharding <em>splits</em> data so each node owns a subset — for data size and write scaling, and it reduces blast radius but doesn't by itself provide redundancy. Production systems combine them: each shard is a small replicated group (a primary + replicas, or RF=3 in Cassandra).</p></details>
+
+<h2>15. Check your understanding</h2>
+<details class="quiz"><summary>You route with <code>user_id mod 10</code> across 10 servers and add 1 server (<code>mod 11</code>). Roughly what fraction of users move?</summary>
+<p>A key stays only if <code>id mod 10 == id mod 11</code>, which happens for 10 of every 110 consecutive IDs ≈ 9%. So <strong>~91% of users move</strong>. With 4,096 logical shards on 10 servers, adding an 11th means moving only ~1/11 ≈ 9% of the data (the logical shards assigned to the new server).</p></details>
+<details class="quiz"><summary>Why is <code>created_at</code> a bad shard key with range sharding but less bad with hash sharding? Why is it still a poor choice for Instagram?</summary>
+<p>With range sharding every new write goes to the latest time range → one hot shard. Hashing spreads writes evenly. But Instagram's hot queries are "by user" or "by post", not "by timestamp", so with either scheme almost every query becomes scatter-gather. The shard key must match the access pattern.</p></details>
+<details class="quiz"><summary>A scatter-gather query hits 50 shards; each shard independently exceeds 200 ms with probability 2%. What's the probability the whole query exceeds 200 ms?</summary>
+<p><code>1 − 0.98<sup>50</sup> ≈ 1 − 0.364 = 0.636</code> → about <strong>64%</strong>. Fan-out turns a rare per-shard slowdown into the common case — one reason to keep hot queries single-shard.</p></details>
+<details class="quiz"><summary>Instagram IDs are [41 bits time][13 bits shard][10 bits sequence]. How many logical shards and how many IDs per shard per millisecond can this support? How do you extract the shard?</summary>
+<p>2<sup>13</sup> = <strong>8,192 logical shards</strong>; 2<sup>10</sup> = <strong>1,024 IDs per shard per ms</strong> (~1M/s per shard). Shard = <code>(id &gt;&gt; 10) &amp; 0x1FFF</code>. The 41-bit millisecond timestamp covers about 69 years from the custom epoch.</p></details>
+<details class="quiz"><summary>Users are sharded by user_id. Which is single-shard: (a) load Alice's settings, (b) find user by email, (c) Alice's 12 latest posts, (d) count all users who joined today?</summary>
+<p><strong>(a) and (c)</strong> include the shard key (posts are co-located by author). (b) needs a global email index (or scatter-gather). (d) is an aggregate across all shards — compute it from an event stream or in the data warehouse.</p></details>
+<details class="quiz"><summary>What's the difference between a local and a global secondary index, and which would DynamoDB's GSI be?</summary>
+<p>A local index lives on each shard and covers only that shard's rows (cheap consistent writes, scatter-gather reads). A global index is partitioned by the indexed value (single-shard reads, cross-shard writes, usually async). DynamoDB's Global Secondary Index is a <strong>global</strong> index, updated asynchronously, so its reads are eventually consistent.</p></details>
+<details class="quiz"><summary>Your shard map lives in every app server's memory. A logical shard is moved, but a few app servers still have the old map. What prevents corrupted writes?</summary>
+<p>During cut-over the source shard is made read-only (or the schema dropped/fenced) before the map flips, so stale writers get errors instead of silently writing to the old location; the error makes them refresh the map (like Redis Cluster's <code>MOVED</code> redirect). Maps should be versioned, and routers should re-fetch on version mismatch.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Shard when data size, <strong>write throughput</strong> or blast radius outgrows one primary; replication alone can't fix writes.</li>
+    <li>The <strong>shard key</strong> must be high-cardinality, evenly loaded, immutable and present in hot queries. For Instagram: <code>user_id</code> (and <code>post_id</code> for per-post data).</li>
+    <li>Know <strong>range, hash, directory and geo</strong> sharding and their trade-offs; handle <strong>hot keys</strong> with caching, key splitting and special paths for celebrities.</li>
+    <li>Use <strong>many fixed logical shards on fewer physical servers</strong> (Instagram: PostgreSQL schemas, shard ID inside every ID) so growth moves shards instead of re-hashing data.</li>
+    <li>Expect <strong>scatter-gather</strong>, no cross-shard joins, <strong>local vs global indexes</strong>; replace 2PC with single-shard design, sagas and the outbox pattern.</li>
+    <li>Rebalance online: copy → catch up → brief cut-over → verify — and prefer tools (Vitess, Citus, MongoDB, Cassandra) when they fit.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="consistent-hashing.html">Consistent Hashing</a> — the other way to add nodes without moving most keys</li>
+  <li><a href="replication.html">Replication</a> — each shard is itself a replicated group</li>
+  <li><a href="id-generation.html">Unique ID Generation</a> — Instagram's shard-embedding 64-bit IDs</li>
+  <li><a href="databases.html">Databases</a> — PostgreSQL vs Cassandra partitioning models</li>
+  <li><a href="indexing.html">Indexing</a> — how secondary indexes work inside a shard</li>
+  <li><a href="news-feed.html">News Feed</a> — fan-out across shards and the celebrity problem</li>
+  <li><a href="social-graph.html">Social Graph</a> — storing both directions of follow edges on different shards</li>
+  <li><a href="message-queues.html">Message Queues &amp; Kafka</a> — events and the outbox pattern instead of 2PC</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

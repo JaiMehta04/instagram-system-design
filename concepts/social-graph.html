@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Social Graph &amp; Follow Service — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="social-graph">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>Instagram's follow graph is a <strong>directed graph</strong>: users are nodes, "A follows B" is an edge A→B. There are hundreds of billions of edges, read far more often than written.</li>
+    <li>Store each edge <strong>twice</strong>: in A's <strong>following</strong> list (sharded by A) and B's <strong>followers</strong> list (sharded by B), so both directions are single-shard reads. Keep the two in sync with an outbox/async repair (dual writes).</li>
+    <li>Facebook's <strong>TAO</strong> (public paper) is the canonical design: <em>objects + associations</em> in sharded MySQL behind a massive, region-aware <strong>write-through cache</strong>, with typed inverse edges and cached counts.</li>
+    <li>Core queries: following/followers lists (cursor-paginated), "does A follow B" (point lookup), mutuals (set intersection), counts (denormalised), and <strong>suggestions</strong> (friends-of-friends, computed offline).</li>
+    <li>Hard parts: <strong>celebrities</strong> with hundreds of millions of followers (wide partitions, fan-out), <strong>count consistency</strong>, <strong>private accounts/requests</strong>, <strong>blocking</strong>, close friends — and feeding the <strong>fan-out workers</strong>.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why does "who follows whom" need its own service?</h2>
+<p>Almost every Instagram feature asks the graph a question:</p>
+<ul>
+  <li><strong>Feed</strong>: "who follows the author of this new post?" (to fan it out) and "whom do I follow?" (to pull celebrity posts).</li>
+  <li><strong>Profile</strong>: follower/following counts, "Followed by alice, bob and 12 others", the Follow/Following/Requested button.</li>
+  <li><strong>Privacy</strong>: "may this viewer see this private account's posts?", "has either blocked the other?".</li>
+  <li><strong>Stories</strong>: tray membership and close-friends audiences. <strong>Search</strong> and <strong>Explore</strong>: rank accounts you're connected to higher. <strong>DMs</strong>: requests vs inbox depending on whether you follow each other.</li>
+</ul>
+<p>That makes graph reads one of the highest-QPS workloads in the system — every profile view, comment and feed refresh triggers several — while follows/unfollows are comparatively rare. And the data is <strong>skewed</strong>: a typical user follows a few hundred accounts, but the largest accounts have <strong>hundreds of millions of followers</strong>.</p>
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  Think of every user carrying two address books: <strong>"People I follow"</strong> and <strong>"People who follow me"</strong>. When Alice follows Bob, she writes Bob in her first book <em>and</em> Bob must write Alice in his second book. Keeping two books means either question is answered by opening one book — but the two must be kept in agreement, and a celebrity's "people who follow me" book is a library of 600 million pages that nobody can read in one go.
+</div>
+
+<h2>2. Modelling the graph</h2>
+<p>A <strong>graph</strong> is a set of <strong>nodes</strong> (vertices) connected by <strong>edges</strong>. Instagram's follow graph is <strong>directed</strong> (Alice following Bob doesn't mean Bob follows Alice — unlike Facebook friendship, which is undirected/symmetric) and edges carry a little data: creation time, state (active/pending), maybe a close-friends flag.</p>
+<div class="diagram">
+<svg viewBox="0 0 820 260" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-sg-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g text-anchor="middle" font-weight="600">
+    <circle cx="90" cy="70" r="34" fill="#e1f5fe" stroke="#0277bd"/><text x="90" y="75">Alice</text>
+    <circle cx="290" cy="70" r="34" fill="#e1f5fe" stroke="#0277bd"/><text x="290" y="75">Bob</text>
+    <circle cx="90" cy="200" r="34" fill="#e1f5fe" stroke="#0277bd"/><text x="90" y="205">Carol</text>
+    <circle cx="290" cy="200" r="34" fill="#e1f5fe" stroke="#0277bd"/><text x="290" y="205">Dan</text>
+    <circle cx="490" cy="135" r="44" fill="#fff3e0" stroke="#ef6c00"/><text x="490" y="132">⭐ Celeb</text><text x="490" y="150" font-size="11" font-weight="400">600M followers</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-sg-1)">
+    <path d="M124,64 L254,64"/><path d="M256,78 L126,78"/>
+    <path d="M90,104 L90,164"/>
+    <path d="M124,200 L254,200"/>
+    <path d="M318,88 L448,118"/><path d="M122,88 C250,140 350,150 446,138"/><path d="M318,190 L450,150"/>
+  </g>
+  <g font-size="11" fill="#333">
+    <text x="190" y="56" text-anchor="middle">follows</text><text x="190" y="95" text-anchor="middle">follows back</text>
+    <text x="96" y="140">follows</text>
+  </g>
+  <g font-size="11">
+    <rect x="555" y="30" width="260" height="200" rx="8" fill="#ffffff" stroke="#999"/>
+    <text x="568" y="52" font-weight="700" font-size="12">Adjacency lists</text>
+    <text x="568" y="76">following(Alice) = {Bob, Carol, Celeb}</text>
+    <text x="568" y="96">followers(Alice) = {Bob}</text>
+    <text x="568" y="120">following(Bob) = {Alice, Celeb}</text>
+    <text x="568" y="140">followers(Bob) = {Alice}</text>
+    <text x="568" y="164">followers(Celeb) =</text>
+    <text x="568" y="182">{Alice, Bob, Dan, … 600M}</text>
+    <text x="568" y="206" fill="#2e7d32">Alice ⇄ Bob: mutual follow</text>
+  </g>
+</svg>
+<div class="caption">A directed follow graph and its adjacency lists. Each edge appears in one user's "following" list and another's "followers" list.</div>
+</div>
+<ul>
+  <li><strong>Out-degree</strong> of a node = how many accounts it follows (Instagram caps this at 7,500 to curb spam). <strong>In-degree</strong> = follower count — unbounded, and extremely skewed (a power-law distribution).</li>
+  <li><strong>Adjacency list</strong>: the list of neighbours for each node — the natural storage form for sparse graphs (an adjacency <em>matrix</em> of 2B × 2B would be absurd).</li>
+</ul>
+<h3>2.1 Rough numbers (assumptions)</h3>
+<pre><code>Accounts with edges        ~1.5B
+Average following          ~200            → 300B directed edges
+Stored in both directions  600B rows × ~25 B ≈ 15 TB  (× 3 replicas ≈ 45 TB, plus indexes)
+Follow + unfollow writes   500M DAU × 0.2/day ≈ 100M/day ≈ 1,200/s avg
+Graph reads                feed fan-out, profile views, permission checks, mutuals
+                           → easily several hundred thousand to millions of lookups/s
+Read : write               ≈ 1,000 : 1 (or more)</code></pre>
+<p>The data fits comfortably on a sharded cluster; the challenge is <strong>read throughput, latency and skew</strong>, which is why caching dominates graph design.</p>
+
+<h2>3. Storage options</h2>
+<h3>3.1 One relational table with two indexes</h3>
+<pre><code>CREATE TABLE follows (
+  follower_id  BIGINT NOT NULL,
+  followee_id  BIGINT NOT NULL,
+  state        SMALLINT NOT NULL,            -- 1 = active, 2 = pending request
+  created_at   TIMESTAMP NOT NULL,
+  PRIMARY KEY (follower_id, followee_id)     -- "whom does A follow?", "does A follow B?"
+);
+CREATE INDEX follows_by_followee ON follows (followee_id, created_at DESC);  -- "who follows B?"</code></pre>
+<p>On a single database this is perfect: one row per edge, both directions indexed, follow/unfollow is one transaction, counts are a query (or a trigger-maintained column). It's how most apps start; early Instagram scaling talks describe a follow graph that began as essentially this kind of simple <code>(source_id, target_id, status)</code> table in PostgreSQL.</p>
+<p>It breaks when you <strong><a href="sharding.html">shard</a></strong>: if the table is sharded by <code>follower_id</code>, "whom does A follow" hits one shard, but "who follows B" must ask <em>every</em> shard (scatter-gather), because B's followers are spread everywhere. One of the two directions always becomes a cross-shard query.</p>
+
+<h3>3.2 Two tables, each sharded by its own user (dual writes)</h3>
+<p>The standard fix is to store the edge <strong>twice</strong>, each copy sharded by the user it "belongs" to:</p>
+<div class="diagram">
+<svg viewBox="0 0 820 270" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-sg-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g text-anchor="middle">
+    <rect x="20" y="105" width="150" height="56" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="95" y="128" font-weight="600">Alice follows Bob</text><text x="95" y="146" font-size="11">POST /follow</text>
+    <rect x="220" y="105" width="150" height="56" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="295" y="128" font-weight="600">Graph service</text><text x="295" y="146" font-size="11">validate, write</text>
+    <rect x="440" y="20" width="360" height="100" rx="8" fill="#fff8e1" stroke="#f9a825"/>
+    <text x="620" y="42" font-weight="600">Shard of Alice (hash(alice) % N)</text>
+    <text x="620" y="66" font-size="12">following: (alice, bob, created_at)</text>
+    <text x="620" y="86" font-size="12">following: (alice, carol, …)</text>
+    <text x="620" y="106" font-size="11" fill="#555">PK (user_id, created_at, target_id)</text>
+    <rect x="440" y="150" width="360" height="100" rx="8" fill="#fff8e1" stroke="#f9a825"/>
+    <text x="620" y="172" font-weight="600">Shard of Bob (hash(bob) % N)</text>
+    <text x="620" y="196" font-size="12">followers: (bob, alice, created_at)</text>
+    <text x="620" y="216" font-size="12">followers: (bob, dan, …)</text>
+    <text x="620" y="236" font-size="11" fill="#555">PK (user_id, created_at, source_id)</text>
+  </g>
+  <g stroke="#555" stroke-width="1.4" fill="none" marker-end="url(#ar-sg-2)">
+    <path d="M170,133 L218,133"/>
+    <path d="M370,125 L438,75"/>
+    <path d="M370,141 L438,195" stroke-dasharray="5 3"/>
+  </g>
+  <text x="400" y="88" font-size="11" fill="#333" text-anchor="middle">① sync</text>
+  <text x="392" y="190" font-size="11" fill="#333" text-anchor="middle">② async</text>
+</svg>
+<div class="caption">Each edge is written to the follower's "following" list and the followee's "followers" list, on different shards. Both directions become single-shard reads.</div>
+</div>
+<ul>
+  <li><strong>Reads are always local</strong>: following(A) lives on A's shard; followers(B) on B's shard.</li>
+  <li><strong>Writes touch two shards</strong> with no shared transaction (a <em>dual write</em>). If the second write fails, the copies disagree. Strategies:
+    <ul>
+      <li>Treat one side as the <strong>source of truth</strong> (usually <code>following</code>, the side the user controls), and write it together with an <a href="microservices.html">outbox</a> event in one local transaction; a consumer applies the inverse edge idempotently, retrying until done.</li>
+      <li>Or write both synchronously and run an <strong>anti-entropy/repair job</strong> that scans for edges missing their inverse — the approach TAO takes.</li>
+    </ul>
+  </li>
+  <li><strong>Storage doubles</strong> — a cheap price for halving the fan-out of every read.</li>
+</ul>
+<p>Wide-column stores like Cassandra fit this naturally: partition key = user_id, clustering key = (created_at DESC, other_id), giving newest-first paged lists per user.</p>
+
+<h3>3.3 Graph databases</h3>
+<p>A <strong>graph database</strong> (Neo4j, Amazon Neptune, JanusGraph, TigerGraph) stores nodes and relationships natively, using <em>index-free adjacency</em> (each node points directly at its edges), and offers query languages like Cypher or Gremlin for multi-hop traversals:</p>
+<pre><code>// Cypher: accounts followed by people I follow, that I don't follow yet, ranked by overlap
+MATCH (me:User {id: 1001})-[:FOLLOWS]-&gt;(f)-[:FOLLOWS]-&gt;(s)
+WHERE NOT (me)-[:FOLLOWS]-&gt;(s) AND s &lt;&gt; me
+RETURN s.id, count(f) AS mutuals ORDER BY mutuals DESC LIMIT 20</code></pre>
+<p>Great for <strong>deep traversals</strong>, fraud rings and knowledge graphs. But Instagram's online queries are almost all <strong>one hop</strong> (lists, edge checks, counts), at enormous QPS; general-purpose graph databases are hard to shard across hundreds of machines (a traversal crosses partitions constantly), and the multi-hop analyses (suggestions) can run offline in batch systems instead. That's why the largest social networks built <strong>sharded key-value/relational stores with graph-shaped APIs</strong> rather than using a graph database online.</p>
+
+<h3>3.4 Facebook's TAO: objects and associations</h3>
+<p>TAO ("The Associations and Objects", USENIX ATC 2013) is Meta's publicly described graph store serving Facebook's social graph — billions of reads per second, overwhelmingly reads. Its model:</p>
+<ul>
+  <li><strong>Objects</strong>: <code>id → (otype, key-value data)</code> — users, posts, comments, places.</li>
+  <li><strong>Associations</strong>: <code>(id1, atype, id2) → (time, key-value data)</code> — typed, directed edges such as FOLLOWS, LIKES, AUTHORED. An <em>association list</em> is all edges of one type from id1, ordered newest-first.</li>
+  <li><strong>Inverse types</strong>: FOLLOWS (A→B) can be configured with an inverse FOLLOWED_BY (B→A); TAO writes both. The two writes aren't atomic; a background job repairs "hanging" one-sided edges.</li>
+  <li><strong>A small API</strong>: <code>assoc_add</code>, <code>assoc_delete</code>, <code>assoc_get(id1, atype, id2set)</code> (edge check), <code>assoc_count(id1, atype)</code>, <code>assoc_range(id1, atype, pos, limit)</code>, <code>assoc_time_range(id1, atype, high, low, limit)</code>.</li>
+</ul>
+<div class="diagram">
+<svg viewBox="0 0 820 300" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-sg-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="700" text-anchor="middle" font-size="12"><text x="200" y="18">Leader region</text><text x="620" y="18">Follower region</text></g>
+  <line x1="410" y1="8" x2="410" y2="292" stroke="#ccc" stroke-dasharray="4 4"/>
+  <g text-anchor="middle">
+    <rect x="30" y="35" width="150" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="105" y="60">Web servers</text>
+    <rect x="30" y="110" width="150" height="46" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="105" y="130" font-weight="600">Follower caches</text><text x="105" y="147" font-size="11">serve reads</text>
+    <rect x="230" y="110" width="150" height="46" rx="8" fill="#fff3e0" stroke="#ef6c00" stroke-width="2"/><text x="305" y="130" font-weight="600">Leader cache</text><text x="305" y="147" font-size="11">per shard, writes</text>
+    <rect x="230" y="210" width="150" height="50" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="305" y="232" font-weight="600">MySQL shards</text><text x="305" y="249" font-size="11">primary</text>
+    <rect x="440" y="35" width="150" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="515" y="60">Web servers</text>
+    <rect x="440" y="110" width="150" height="46" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="515" y="130" font-weight="600">Follower caches</text><text x="515" y="147" font-size="11">serve reads</text>
+    <rect x="640" y="110" width="160" height="46" rx="8" fill="#fff3e0" stroke="#ef6c00" stroke-width="2"/><text x="720" y="130" font-weight="600">Leader cache</text><text x="720" y="147" font-size="11">reads miss here</text>
+    <rect x="640" y="210" width="160" height="50" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="720" y="232" font-weight="600">MySQL replicas</text><text x="720" y="249" font-size="11">async replication</text>
+  </g>
+  <g stroke="#555" stroke-width="1.4" fill="none" marker-end="url(#ar-sg-3)">
+    <path d="M105,75 L105,108"/><path d="M180,133 L228,133"/><path d="M305,156 L305,208"/>
+    <path d="M515,75 L515,108"/><path d="M590,133 L638,133"/><path d="M720,156 L720,208"/>
+    <path d="M380,235 L638,235" stroke-dasharray="5 3"/>
+    <path d="M640,120 C520,70 430,75 382,118" stroke-dasharray="5 3"/>
+  </g>
+  <text x="510" y="228" font-size="11" fill="#555" text-anchor="middle">replication (+ cache invalidation)</text>
+  <text x="525" y="185" font-size="11" fill="#555" text-anchor="middle">writes forwarded to leader region (dashed)</text>
+</svg>
+<div class="caption">TAO (simplified): reads are served by follower cache tiers in every region; writes go through the shard's leader cache to the primary MySQL database, then replicate to other regions.</div>
+</div>
+<ul>
+  <li><strong>Storage</strong>: sharded MySQL; an object's ID encodes its shard, and an association is stored on the shard of <code>id1</code>, so association lists are single-shard.</li>
+  <li><strong>Caching</strong>: two cache layers. <em>Follower</em> tiers absorb reads; on a miss they ask the shard's <em>leader</em> cache, which reads the database. Writes go through the leader (write-through), which updates the DB and invalidates/refreshes followers. Counts (<code>assoc_count</code>) are cached alongside lists.</li>
+  <li><strong>Regions</strong>: one region holds each shard's primary DB; other regions hold replicas and forward writes to the primary region. Reads are eventually consistent across regions, with read-after-write for your own writes in practice.</li>
+  <li><strong>Why it works</strong>: the workload is &gt;99% reads, associations are small, and most queries hit recent edges — so caching achieves very high hit rates.</li>
+</ul>
+
+<h3>3.5 Comparison</h3>
+<div class="table-wrap"><table>
+  <tr><th>Option</th><th>Strengths</th><th>Weaknesses</th><th>Use when</th></tr>
+  <tr><td><b>Single follows table + 2 indexes</b></td><td>Simple; atomic follow; easy counts</td><td>One direction is cross-shard once sharded</td><td>Up to the limits of one (replicated) DB</td></tr>
+  <tr><td><b>Following + followers tables, each sharded by own user</b></td><td>Both directions single-shard; scales horizontally</td><td>Dual writes need repair; 2× storage</td><td>Large scale, simple one-hop queries</td></tr>
+  <tr><td><b>Graph database</b></td><td>Expressive multi-hop traversals</td><td>Hard to shard; lower throughput for simple lookups at extreme QPS</td><td>Analytics, fraud, recommendation research, moderate scale</td></tr>
+  <tr><td><b>TAO-style association store</b></td><td>Graph API + massive cache + regions; typed edges for many features</td><td>Big engineering investment; eventual consistency</td><td>Planet-scale social products</td></tr>
+</table></div>
+
+<h2>4. The queries the graph must answer</h2>
+<div class="table-wrap"><table>
+  <tr><th>Query</th><th>Where it's used</th><th>How (two-table / TAO model)</th><th>Cost</th></tr>
+  <tr><td><b>Following list of A</b></td><td>"Following" screen, feed pull for celebrities, tray</td><td>Range scan on A's shard: <code>following WHERE user=A ORDER BY created_at DESC LIMIT 50</code> / <code>assoc_range</code></td><td>1 shard, cached</td></tr>
+  <tr><td><b>Followers list of B</b></td><td>"Followers" screen, fan-out workers</td><td>Range scan on B's shard with a cursor</td><td>1 shard (bucketed for celebrities)</td></tr>
+  <tr><td><b>Does A follow B?</b></td><td>Follow button, private-account access, DM inbox vs requests, comment permissions</td><td>Point lookup <code>following(A, B)</code> / <code>assoc_get(A, FOLLOWS, {B})</code></td><td>O(1), very hot → cache incl. negative results</td></tr>
+  <tr><td><b>Mutuals</b></td><td>"Followed by alice, bob + 12 others" on B's profile</td><td>Intersect following(viewer) with followers(B) (below)</td><td>Bounded by viewer's following size</td></tr>
+  <tr><td><b>Counts</b></td><td>Profile header</td><td>Denormalised counters / <code>assoc_count</code></td><td>O(1)</td></tr>
+  <tr><td><b>Suggestions</b></td><td>"Suggested for you", People You May Know</td><td>Offline friends-of-friends + ML, served from a precomputed store</td><td>Batch compute; O(1) serve</td></tr>
+</table></div>
+
+<h3>4.1 Mutuals: "Followed by …"</h3>
+<p>When Alice views Bob's profile, Instagram shows which of the people <em>Alice follows</em> also <em>follow Bob</em>: <code>following(Alice) ∩ followers(Bob)</code>. Bob may have 50M followers, Alice ~300 followings — so <strong>iterate the small set and probe the big one</strong>:</p>
+<pre><code>def followed_by(viewer, profile, limit=3):
+    mine = graph.following_ids(viewer)                       # ~300 IDs, cached list
+    # one batched probe on profile's shard: which of these follow `profile`?
+    hits = graph.followers_contains(profile, candidates=mine) # SELECT ... WHERE user=profile AND src IN (...)
+    ranked = rank_by_closeness(viewer, hits)                  # show closest friends first
+    return ranked[:limit], len(hits)                          # "Followed by a, b, c + N others"</code></pre>
+<p>Cost: one multi-get of ~300 keys on a single shard instead of reading 50M rows. "Mutual follow" (A follows B <em>and</em> B follows A) is just two point lookups.</p>
+
+<h3>4.2 Suggestions: friends-of-friends and People You May Know</h3>
+<p>The classic signal is <strong>triadic closure</strong>: if many people you follow follow X, you probably know or would like X. Computing it online is too expensive — 300 followings × 300 followings each = 90,000 candidate edges per request — so it's done <strong>offline</strong> (Spark/batch over a graph snapshot in the data warehouse, see <a href="analytics-ml.html">Analytics &amp; ML</a>) and served from a precomputed store:</p>
+<ol class="steps">
+  <li><strong>Candidate generation</strong>: friends-of-friends (2-hop), uploaded contacts (with consent), accounts that follow you but you don't follow back, co-follow similarity ("people who follow X also follow Y"), location/school signals, embeddings + approximate nearest neighbours.</li>
+  <li><strong>Scoring</strong>: number of mutual connections, weighted so that mutual friends with few connections count more — e.g. <em>Adamic–Adar</em> <code>score(u, x) = Σ<sub>z ∈ mutuals</sub> 1 / log(degree(z))</code> — plus an ML model predicting follow-back and long-term engagement.</li>
+  <li><strong>Filtering</strong>: remove already-followed, blocked, previously dismissed, private-policy violations, spam accounts.</li>
+  <li><strong>Serving</strong>: store the top ~100 per user in a key-value store; refresh daily; add <strong>real-time</strong> suggestions after a follow ("similar accounts to the one you just followed") from a co-follow index.</li>
+</ol>
+
+<h2>5. Celebrity accounts</h2>
+<p>The largest Instagram accounts have <strong>over 600 million followers</strong>. Everything that's trivial for a normal user becomes an engineering problem:</p>
+<ul>
+  <li><strong>Wide partitions</strong>: a followers partition keyed only by user_id would hold 600M rows × ~25 B ≈ 15 GB on one replica set — far beyond what Cassandra-style stores handle well (partitions are best kept well under ~100 MB). Fix: <strong>bucket</strong> the key, e.g. <code>(user_id, bucket)</code> where bucket is a time range of follow date or <code>hash(follower_id) % N</code>, with N chosen per account size.</li>
+  <li><strong>Pagination only</strong>: nobody (human or service) may load the whole list. The UI pages 50 at a time with an opaque cursor <code>(bucket, created_at, follower_id)</code>, and offers search within followers instead of endless scrolling.</li>
+  <li><strong>Fan-out</strong>: pushing a celebrity's post into 600M timelines would take 600M writes — the <a href="news-feed.html">news feed</a> switches to <strong>pull</strong> for such authors (section 8).</li>
+  <li><strong>Hot counters</strong>: a celebrity gains thousands of followers per minute; their follower count is a hot counter (section 6).</li>
+  <li><strong>Hot edge checks</strong>: "does viewer follow Celeb?" is asked by millions of profile views — but it's keyed by (viewer, Celeb) on the <em>viewer's</em> following list, so the load is naturally spread. Good key design matters.</li>
+</ul>
+
+<h2>6. Follower count consistency</h2>
+<p>Counting <code>followers(B)</code> on each profile view would scan millions of rows, so counts are <strong>denormalised</strong>: <code>follower_count</code> and <code>following_count</code> stored per user and updated on follow/unfollow. Problems and fixes:</p>
+<ul>
+  <li><strong>Hot counter</strong>: a celebrity gaining 5,000 followers/minute serialises on one row — use the same tricks as <a href="likes-comments.html">like counters</a>: stream aggregation of FollowCreated/FollowRemoved deltas, sharded counters, Redis INCR + flush.</li>
+  <li><strong>Drift</strong>: retries, partial dual writes and bugs make counters disagree with the edge lists. Derive deltas only from actual state transitions, and run periodic <strong>reconciliation</strong> (recount edges for accounts whose counters look suspicious, or sample-check).</li>
+  <li><strong>Eventual consistency</strong>: the public count may lag by seconds; large counts are shown rounded ("612M"). The user's own following count should reflect their action immediately (read-your-writes via optimistic UI).</li>
+  <li><strong>Spam cleanup</strong>: purging fake accounts removes their edges in bulk, so counts drop in batches — another reason to aggregate deltas rather than lock rows.</li>
+</ul>
+
+<h2>7. Private accounts, follow requests, blocking and close friends</h2>
+<h3>7.1 Follow requests</h3>
+<p>For a <strong>private account</strong>, following is a two-step handshake. Model the request as its own edge type with a small state machine:</p>
+<pre class="ascii">
+ STATE        EVENT                                  NEXT STATE   EDGES WRITTEN
+ ──────────   ────────────────────────────────────   ──────────   ─────────────────────────────────────
+ NONE         follow (public account)                FOLLOWING    + FOLLOWS(A→B), FOLLOWED_BY(B←A)
+ NONE         follow (private account)               REQUESTED    + FOLLOW_REQUEST(A→B), INCOMING_REQ(B←A)
+ REQUESTED    owner accepts                          FOLLOWING    − request edges, + follow edges
+ REQUESTED    owner declines / requester cancels     NONE         − request edges
+ FOLLOWING    unfollow / owner removes follower      NONE         − follow edges
+ any          block (either direction)               NONE         − all follow/request edges, + BLOCKS
+</pre>
+<ul>
+  <li><strong>Accepting</strong> deletes the request edges and adds the follow edges (plus counts and a <code>FollowCreated</code> event) — a small saga across shards, made idempotent so a double-tap on "Confirm" is harmless.</li>
+  <li><strong>Switching private → public</strong> auto-approves pending requests (a background job, since there may be thousands).</li>
+  <li><strong>Access checks</strong>: a private account's posts, stories and follower lists are visible only if <code>does_follow(viewer, owner)</code> is true and active (not pending).</li>
+</ul>
+<h3>7.2 Blocking</h3>
+<p>A <strong>block</strong> (A blocks B) is a strong, symmetric-in-effect relationship stored as its own edge type (<code>BLOCKS</code> with inverse <code>BLOCKED_BY</code>):</p>
+<ul>
+  <li>On block: remove follow edges <em>in both directions</em>, remove pending requests, adjust counts, and emit events so feeds/trays drop each other's content.</li>
+  <li>On every read path (feed, profile, search, comments, likes lists, stories, DMs) check <code>blocked(A, B) OR blocked(B, A)</code>. These checks are extremely frequent, so block lists are small, cached per user, and loaded once per request.</li>
+  <li>Blocking must win races: if B's post was already fanned into A's timeline, the read-time filter hides it.</li>
+</ul>
+<h3>7.3 Close friends, mute and restrict</h3>
+<div class="table-wrap"><table>
+  <tr><th>Relationship</th><th>Visible to the other person?</th><th>Effect</th></tr>
+  <tr><td><b>Close friends</b> (owner → friend)</td><td>No (owner-private list; the friend just sees a green ring)</td><td>Audience for close-friends <a href="stories.html">stories</a></td></tr>
+  <tr><td><b>Mute</b> posts/stories</td><td>No</td><td>Excluded from the muter's feed/tray; still following</td></tr>
+  <tr><td><b>Restrict</b></td><td>No</td><td>Their comments visible only to themselves unless approved; DMs go to requests</td></tr>
+  <tr><td><b>Block</b></td><td>Effectively yes (content disappears)</td><td>Severs follows both ways; hides everything</td></tr>
+</table></div>
+<p>All are just more <strong>typed edges</strong> in the same store — which is exactly why a TAO-style "associations with types" model is so convenient: one system, one API, many relationship kinds.</p>
+
+<h2>8. How fan-out workers read the graph</h2>
+<p>When a <code>PostCreated</code> event arrives, the <a href="news-feed.html">feed fan-out workers</a> must insert the post ID into every follower's timeline. The graph is their main input:</p>
+<div class="flow">
+  <div class="fnode async">PostCreated<small>author = B</small></div><div class="farrow">→</div>
+  <div class="fnode svc">Fan-out coordinator<small>follower count check</small></div><div class="farrow">→<small>pages of 1,000</small></div>
+  <div class="fnode store">followers(B)<small>cursor scan</small></div><div class="farrow">→<small>batch jobs</small></div>
+  <div class="fnode async">Fan-out workers<small>filter + group by shard</small></div><div class="farrow">→<small>ZADD pipelines</small></div>
+  <div class="fnode store">Redis timelines</div>
+</div>
+<ol>
+  <li><strong>Check size</strong>: if B's follower count exceeds a threshold (say 1M), skip push entirely — B is a "celebrity" and followers will <strong>pull</strong> B's recent posts at read time (the feed service calls following(viewer) to find which celebrities to merge).</li>
+  <li><strong>Page through followers</strong>: read followers(B) in pages of ~1,000 via cursor; each page becomes an independent job on a queue, so a 500k-follower fan-out is parallelised across many workers and resumable if one crashes.</li>
+  <li><strong>Filter</strong>: skip inactive followers (no login in 30 days — they'll get a rebuilt feed on return), muted relationships, blocks, audience restrictions.</li>
+  <li><strong>Batch writes</strong>: group follower IDs by timeline cache shard and pipeline <code>ZADD</code>s; trim timelines to the latest N entries. ZADD is idempotent, so retries are safe.</li>
+</ol>
+<p>Rough load: 100M posts/day × ~200 followers ≈ <strong>20B timeline inserts/day</strong> ≈ 230k/s — which is why follower reads for fan-out are served from cache or bulk-scanned efficiently, and why the celebrity cut-off matters.</p>
+
+<h2>9. Follow / unfollow event flow</h2>
+<pre class="ascii">
+ App (Alice)        Graph service              Alice's shard        Kafka               Consumers
+   | POST /follow Bob   |                            |                  |                      |
+   |------------------->| check: blocked? private?   |                  |                      |
+   |                    | rate limit (anti-spam)     |                  |                      |
+   |                    |-- tx: following(alice,bob) |                  |                      |
+   |                    |       + outbox FollowCreated -->|             |                      |
+   |&lt;-- 200 following --|                            |-- relay ------->|                      |
+   |  (optimistic UI)   |                            |                  |-- inverse writer: followers(bob, alice)
+   |                    |                            |                  |-- counters: alice.following+1, bob.followers+1
+   |                    |                            |                  |-- notifications: "alice started following you"
+   |                    |                            |                  |-- feed backfill: bob's recent posts → alice's timeline
+   |                    |                            |                  |-- PYMK / search affinity / analytics
+</pre>
+<ul>
+  <li><strong>Feed backfill</strong>: after following, the new followee's recent posts should appear in your feed. A consumer inserts B's last few posts into A's timeline (or the feed simply merges them at read time).</li>
+  <li><strong>Unfollow</strong> mirrors it: delete the edge (+ outbox <code>FollowRemoved</code>); consumers remove the inverse edge, decrement counts, and remove B's posts from A's timeline — or, more cheaply, the feed filters them out at read time against the current following list.</li>
+  <li><strong>Idempotency</strong>: following someone you already follow creates no new edge and emits no event; consumers dedupe on event ID.</li>
+  <li><strong>Abuse</strong>: follow/unfollow churn is a classic spam tactic, so the API enforces per-account rate limits and follow caps (see <a href="rate-limiting.html">Rate limiting</a>).</li>
+</ul>
+
+<h2>10. Sharding and caching the graph</h2>
+<h3>10.1 Sharding</h3>
+<ul>
+  <li><strong>Shard key = the owning user's ID</strong> for each adjacency list: following(A) on shard(A), followers(B) on shard(B). Instagram's 64-bit IDs embed a logical shard number (<a href="id-generation.html">ID generation</a>), and logical shards map onto physical databases, so data can be rebalanced by moving logical shards.</li>
+  <li><strong>Co-location</strong>: keeping all of one user's edge types (follows, blocks, close friends, requests) on that user's shard means a request about one user's relationships touches one shard.</li>
+  <li><strong>Celebrity buckets</strong>: very large follower lists are split into sub-partitions (section 5).</li>
+  <li><strong>Consistent hashing</strong> or a directory of logical → physical shards makes adding capacity cheap (<a href="consistent-hashing.html">Consistent hashing</a>).</li>
+</ul>
+<h3>10.2 Caching</h3>
+<div class="table-wrap"><table>
+  <tr><th>What</th><th>Shape</th><th>Notes</th></tr>
+  <tr><td>Following ID list</td><td><code>following:{A}</code> → ~200 IDs (≈ 1.6 KB)</td><td>Small and read constantly (feed pull, mutuals); cache whole list</td></tr>
+  <tr><td>Edge existence</td><td><code>edge:{A}:{B}</code> → yes/no</td><td><strong>Negative caching</strong> matters: most "does A follow B" answers are "no"</td></tr>
+  <tr><td>Counts</td><td><code>counts:{B}</code> → followers, following</td><td>Updated by the aggregator; no per-follow invalidation for hot accounts</td></tr>
+  <tr><td>Followers list pages</td><td>First page(s) only</td><td>Never cache 600M-entry lists whole</td></tr>
+  <tr><td>Block list</td><td><code>blocks:{A}</code> → small set</td><td>Loaded once per request for read-time filtering</td></tr>
+</table></div>
+<p>Writes use <strong>write-through or invalidate-on-write</strong> to the owner's cache entries (TAO's leader cache serialises writes per shard to keep caches coherent). Across regions, caches are eventually consistent; a user's own follow is reflected immediately on their device via optimistic UI and, server-side, by routing their reads to fresh data for a short window after a write. See <a href="caching.html">Caching</a> and <a href="replication.html">Replication</a>.</p>
+
+<h2>11. How Instagram uses the social graph</h2>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+In the architecture diagram, the <strong>Follow/Graph Service</strong> owns the <strong>Social Graph store</strong> and publishes <code>FollowCreated</code>/<code>FollowRemoved</code> events to <strong>Kafka</strong>. Its biggest client is the <strong>Feed Fan-out Workers</strong>, which read follower lists to push post IDs into Redis timelines (with pull for celebrities); the <strong>Feed</strong>, <strong>Stories</strong>, <strong>Search</strong> and <strong>DM</strong> services call it for following lists, edge checks, blocks and close-friends audiences; the <strong>Notification Service</strong> sends "X started following you"; and <strong>Analytics &amp; ML</strong> uses graph snapshots for suggestions and ranking. Instagram's early scaling talks describe a follow graph stored in a simple relational table on sharded PostgreSQL; at Meta, the publicly documented reference design for social-graph data is <strong>TAO</strong> — objects and typed associations in sharded MySQL behind a huge, region-aware cache. Whatever the exact store behind a given feature today, the diagram's "Social Graph store" is best understood as a TAO-like system: adjacency lists keyed by user, stored in both directions, served almost entirely from cache.</div>
+<ul>
+  <li><strong>Scale</strong> (assumed): hundreds of billions of edges; graph reads in the millions per second across all features; follows/unfollows in the low thousands per second.</li>
+  <li><strong>Limits</strong>: Instagram caps how many accounts one user can follow (7,500), bounding out-degree for fan-in reads and mutuals — while in-degree (followers) is unbounded and handled with bucketing and pull-based fan-out.</li>
+  <li><strong>Privacy</strong>: private accounts, requests, blocks, restrict, mute and close friends are all typed edges checked on every read path.</li>
+</ul>
+
+<h2>12. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Two-direction, user-sharded adjacency lists give you</h4><ul>
+    <li>Single-shard reads for both "following" and "followers"</li>
+    <li>Horizontal scaling to hundreds of billions of edges</li>
+    <li>Simple, cacheable one-hop queries at huge QPS</li>
+    <li>A uniform model for many relationship types (follow, block, close friends)</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ At the cost of</h4><ul>
+    <li>Dual writes that can diverge and need repair</li>
+    <li>2× storage</li>
+    <li>Eventually consistent counts and cross-region views</li>
+    <li>Multi-hop queries (suggestions) pushed to offline pipelines</li>
+    <li>Special handling for celebrity-sized lists</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Sharding one follows table by follower only</strong> → every "who follows B" query is a scatter-gather across all shards.</li>
+  <li><strong><code>COUNT(*)</code> for follower counts</strong> on profile views.</li>
+  <li><strong>Unbucketed celebrity partitions</strong> → 15 GB partitions, slow compactions, timeouts.</li>
+  <li><strong>Loading entire follower lists</strong> into memory in fan-out or "export" features.</li>
+  <li><strong>Checking blocks/privacy only at write time</strong> → content leaks after relationships change.</li>
+  <li><strong>No negative caching</strong> for edge checks → most lookups ("no, A doesn't follow B") hit the database.</li>
+  <li><strong>Computing friends-of-friends online</strong> per request.</li>
+</ul>
+
+<h2>13. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>When to use it</th></tr>
+  <tr><td>Sharded PostgreSQL / MySQL</td><td>Follows tables with composite keys; strong per-shard consistency; the base under TAO</td></tr>
+  <tr><td>Cassandra / ScyllaDB</td><td>Wide-row adjacency lists partitioned by user, newest-first clustering</td></tr>
+  <tr><td>Facebook TAO (paper)</td><td>Reference design: objects + associations + write-through, region-aware cache</td></tr>
+  <tr><td>Twitter FlockDB (historical, open-sourced)</td><td>An earlier example of a sharded adjacency-list store for follow graphs</td></tr>
+  <tr><td>LinkedIn's graph services (publicly described, e.g. LIquid)</td><td>In-memory graph serving for connections and degree-of-separation queries</td></tr>
+  <tr><td>Neo4j, Amazon Neptune, JanusGraph, TigerGraph</td><td>Multi-hop traversals, fraud/abuse rings, moderate-scale graph apps</td></tr>
+  <tr><td>Redis / Memcached</td><td>Caching following lists, edge checks (incl. negative), counts, block lists</td></tr>
+  <tr><td>Spark GraphX / GraphFrames, Apache Giraph</td><td>Offline graph analytics: friends-of-friends, PageRank-style scores, PYMK candidates</td></tr>
+</table></div>
+
+<h2>14. Interview corner</h2>
+<details class="qa"><summary>How would you store the follow graph for 2 billion users?</summary>
+<p>As adjacency lists stored in both directions: <code>following(user_id, created_at, target_id)</code> sharded by user_id, and <code>followers(user_id, created_at, source_id)</code> sharded by user_id. Each direction is a single-shard, newest-first range scan; "does A follow B" is a point lookup in following(A). Writes are dual: write following(A,B) plus an outbox event in one local transaction, and an idempotent consumer writes followers(B,A), counts and notifications; a repair job fixes any one-sided edges. Put a large cache in front (following lists, edge checks with negative caching, counts) — essentially the TAO design.</p></details>
+<details class="qa"><summary>Why not just use a graph database like Neo4j?</summary>
+<p>Online queries are almost all one hop (lists, edge checks, counts) at millions of QPS with strict latency; that's a sharded key-value/relational access pattern, best served by partitioned adjacency lists plus caching. General graph databases shine at deep traversals but are hard to partition at hundreds of billions of edges, since traversals constantly cross partitions. Multi-hop work like friends-of-friends runs offline in Spark over graph snapshots instead. A graph DB is still a fine choice for analytics or abuse investigations.</p></details>
+<details class="qa"><summary>An account has 600 million followers. What changes?</summary>
+<p>Storage: bucket the followers partition (time or hash buckets) to avoid a 15 GB partition. Reads: cursor pagination only, no full loads; search within followers in the UI. Feed: skip push fan-out; followers pull this account's recent posts at read time. Counters: stream-aggregated or sharded, shown rounded. Notifications: aggregate instead of one per follow. Caches: never cache the full list; cache counts and first pages. Edge checks remain cheap because they're keyed on the viewer's following list.</p></details>
+<details class="qa"><summary>How do you compute "Followed by alice, bob and 12 others" on a profile?</summary>
+<p>It's following(viewer) ∩ followers(profile). Take the viewer's cached following list (bounded, ≤7,500, typically hundreds), and do one batched membership probe against followers(profile) on the profile's shard — a multi-get of a few hundred keys rather than scanning millions of followers. Rank the hits by closeness to the viewer and show the top few plus a count. Cache the result briefly per (viewer, profile).</p></details>
+<details class="qa"><summary>How do you keep the following and followers copies consistent?</summary>
+<p>Choose a source of truth (following, which the actor controls). Write it and an outbox event atomically on the actor's shard; a consumer applies the inverse edge idempotently (upsert/delete) with retries, so they converge. Events are keyed by the edge pair so follow/unfollow for the same pair stay ordered. A periodic anti-entropy job scans for edges lacking their inverse (TAO calls these hanging associations) and repairs them. Reads that require authority (e.g. private-account access) consult the source-of-truth side.</p></details>
+<details class="qa"><summary>How would you build "People You May Know"?</summary>
+<p>Offline candidate generation over a graph snapshot: friends-of-friends (2-hop), contacts (with consent), follow-backs, co-follow similarity and embedding neighbours. Score with features like mutual-count and Adamic–Adar, plus an ML model predicting follow and engagement; filter out existing follows, blocks, dismissed and spammy accounts. Store the top ~100 per user in a key-value store refreshed daily, and add real-time "similar accounts" suggestions after each follow from a co-follow index.</p></details>
+<details class="qa"><summary>Walk through what happens when Alice blocks Bob.</summary>
+<p>The Graph service writes BLOCKS(Alice→Bob) and its inverse, deletes follow edges in both directions and any pending requests (idempotently, as a small saga), and emits events: counters decrement, timelines/trays drop each other's content, notifications and DMs are suppressed, search hides profiles. Because fan-out may already have placed content, every read path also filters with cached block lists (checked in both directions), so the block takes effect immediately regardless of async cleanup.</p></details>
+
+<h2>15. Check your understanding</h2>
+<details class="quiz"><summary>If the follows table is sharded by follower_id across 256 shards, how many shards does "list B's followers" touch? How does the two-table design change that?</summary>
+<p>Up to <strong>all 256</strong> (scatter-gather), because B's followers are spread by their own IDs. With a followers table sharded by followee (B), it's <strong>1 shard</strong>.</p></details>
+<details class="quiz"><summary>1.5B accounts follow 200 accounts each on average. How many rows exist in the two-table design, and roughly how much raw storage at 25 bytes per row?</summary>
+<p>300B edges × 2 directions = <strong>600B rows</strong>; × 25 B ≈ <strong>15 TB</strong> raw (≈ 45 TB with 3× replication, before indexes) — modest for a sharded cluster, so the real challenge is read throughput.</p></details>
+<details class="quiz"><summary>Why is negative caching important for "does A follow B?"</summary>
+<p>Most such checks (profile views of strangers, comment permission checks, DM routing) return "no". Without caching negatives, every "no" misses the cache and hits the database, so the cache barely helps. Caching "no" (and invalidating on follow) keeps those lookups in memory.</p></details>
+<details class="quiz"><summary>A celebrity's follower count is shown as "612M" while the true number changes by thousands per minute. Is that a bug?</summary>
+<p>No. The count is a denormalised, eventually consistent value (aggregated from follow/unfollow deltas and reconciled periodically) and is displayed rounded. Exactness at that scale is neither perceivable nor worth the write contention.</p></details>
+<details class="quiz"><summary>Scenario: Bob unfollows Carol, but Carol's post was already fanned out into Bob's timeline. What should Bob see, and how?</summary>
+<p>Bob shouldn't see new content from Carol. The FollowRemoved consumer removes Carol's entries from Bob's timeline asynchronously, and, to be correct immediately, the feed read path filters timeline entries against Bob's current following list (and blocks) before rendering.</p></details>
+<details class="quiz"><summary>Compute the Adamic–Adar contribution of two mutual connections with 50 and 5,000 followers respectively (use natural log).</summary>
+<p>1/ln(50) ≈ 1/3.91 ≈ <strong>0.256</strong>; 1/ln(5000) ≈ 1/8.52 ≈ <strong>0.117</strong>. Total ≈ 0.373. A mutual connection with few connections is stronger evidence that you know the candidate than a mutual "hub" account that follows everyone.</p></details>
+<details class="quiz"><summary>Why does Instagram's cap of 7,500 followings help the system?</summary>
+<p>It bounds out-degree, so following lists stay small enough to cache whole, mutuals computations (iterate following(viewer)) stay cheap, feed pull-merges are bounded, and spam bots can't follow millions of accounts. Followers (in-degree) remain unbounded, which is where bucketing and pull fan-out come in.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>The follow graph is a huge, skewed, <strong>read-dominated directed graph</strong>; almost all online queries are <strong>one hop</strong>.</li>
+    <li>Store edges <strong>in both directions</strong>, each sharded by its owning user, and keep them in sync via outbox-driven dual writes plus repair — or use a <strong>TAO-style</strong> association store.</li>
+    <li>Answer edge checks with point lookups and <strong>negative caching</strong>; compute mutuals by probing the big set with the small one; generate suggestions <strong>offline</strong>.</li>
+    <li>Handle celebrities with <strong>bucketed partitions</strong>, cursor pagination, pull-based fan-out and aggregated counters.</li>
+    <li>Private accounts, requests, blocks, mute, restrict and close friends are <strong>typed edges</strong>, enforced on every read path.</li>
+    <li>Follow/unfollow events drive the inverse edge, counts, notifications, feed backfill and recommendations.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="news-feed.html">News Feed</a> — the main consumer of follower lists; push vs pull for celebrities</li>
+  <li><a href="sharding.html">Sharding</a> — shard keys, wide partitions and scatter-gather</li>
+  <li><a href="caching.html">Caching</a> — write-through caches, negative caching and hot keys</li>
+  <li><a href="databases.html">Databases</a> — relational vs wide-column vs graph databases</li>
+  <li><a href="likes-comments.html">Likes &amp; Counters</a> — the same counter techniques for follower counts</li>
+  <li><a href="stories.html">Stories</a> — close-friends audiences and tray fan-out</li>
+  <li><a href="microservices.html">Microservices</a> — the outbox pattern behind dual writes</li>
+  <li><a href="analytics-ml.html">Analytics &amp; ML</a> — offline graph processing for suggestions</li>
+  <li><a href="security.html">Security &amp; Privacy</a> — blocking, private accounts and abuse prevention</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

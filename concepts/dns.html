@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DNS: The Internet's Phone Book — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="dns">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li><strong>DNS (Domain Name System)</strong> turns names like <code>i.instagram.com</code> into IP addresses. It is a globally distributed, hierarchical, heavily cached database.</li>
+    <li>A <strong>recursive resolver</strong> (your ISP's, or 8.8.8.8 / 1.1.1.1) walks the hierarchy — <strong>root → TLD (.com) → authoritative</strong> name servers — and caches every answer for its <strong>TTL</strong>.</li>
+    <li>Know the record types: <strong>A</strong> (IPv4), <strong>AAAA</strong> (IPv6), <strong>CNAME</strong> (alias), <strong>NS</strong> (delegation), <strong>MX</strong> (mail), <strong>TXT</strong> (verification/policy), <strong>SOA</strong> (zone metadata).</li>
+    <li>DNS is also a <strong>traffic-steering tool</strong>: GeoDNS/latency routing sends users to nearby PoPs, weighted routing shifts traffic gradually, health-checked failover removes dead regions. <strong>Anycast</strong> makes DNS servers fast and DDoS-resistant.</li>
+    <li><strong>TTL is a trade-off</strong>: short TTL = fast failover but more queries; long TTL = resilience and speed but slow changes.</li>
+    <li>DNS is a classic <strong>single point of failure</strong>: the 2016 Dyn DDoS took down major sites, and in October 2021 a BGP withdrawal made Meta's DNS servers unreachable, taking Facebook, Instagram and WhatsApp offline for about six hours.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why do we need DNS?</h2>
+<p>Computers route packets using IP addresses like <code>157.240.22.174</code> or <code>2a03:2880:f12f:83:face:b00c:0:25de</code>. Humans and apps use names like <code>instagram.com</code>. Something has to translate — and it has to do so for billions of devices, millions of times per second, in a few milliseconds, without one central server that could fail or be overwhelmed.</p>
+<p>Names also give system designers a crucial layer of <strong>indirection</strong>. If the Instagram app had a hard-coded IP address baked into it:</p>
+<ul>
+  <li>Instagram could never move servers, add data centers or change cloud providers without breaking every installed app.</li>
+  <li>Every user worldwide would hit the same IP, no matter whether they were in Mumbai or Montreal — no way to send them to a nearby edge.</li>
+  <li>If that IP's data center failed, there'd be no way to send users somewhere else.</li>
+</ul>
+<p>With DNS, the app asks "where is <code>i.instagram.com</code> <em>right now, for me</em>?" and Instagram's name servers can answer differently depending on the user's location, server health and load. DNS is therefore the <strong>very first hop</strong> in Instagram's architecture diagram and the first lever for global traffic management.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  DNS is like finding someone's phone number through a chain of directories. You (the app) ask your <strong>personal assistant</strong> (the recursive resolver). If the assistant doesn't already know, they ask the <strong>international directory</strong> (root), which says "for .com numbers, ask the .com directory". The <strong>.com directory</strong> (TLD) says "for instagram.com, ask Instagram's own receptionist". <strong>Instagram's receptionist</strong> (authoritative server) gives the actual number — maybe a different branch office depending on which city you're calling from. Your assistant writes the number in a notebook (cache) with a "valid until" date (TTL), so next time they answer instantly.
+</div>
+
+<h2>2. The DNS hierarchy</h2>
+<h3>2.1 Anatomy of a name</h3>
+<p>Read a domain name <strong>right to left</strong>. The fully qualified name <code>i.instagram.com.</code> has an invisible trailing dot representing the <strong>root</strong>:</p>
+<pre><code>i   .   instagram   .   com   .   (root)
+│        │               │        └── root zone: managed by IANA, served by root servers
+│        │               └─────────── top-level domain (TLD): .com, run by Verisign
+│        └─────────────────────────── second-level domain: instagram.com, owned by Meta
+└──────────────────────────────────── subdomain / hostname inside Meta's zone</code></pre>
+<p>Each level is responsible only for <strong>delegating</strong> to the next. The root doesn't know Instagram's IP; it only knows who runs <code>.com</code>. The <code>.com</code> servers don't know it either; they know which name servers are <strong>authoritative</strong> for <code>instagram.com</code>. A <strong>zone</strong> is the slice of the namespace one organisation administers, and <strong>NS records</strong> are the signposts that delegate a sub-zone to other servers.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 330" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <g stroke="#90a4ae" stroke-width="1.5">
+    <path d="M410,65 L220,105"/><path d="M410,65 L490,105"/><path d="M410,65 L710,105"/>
+    <path d="M220,155 L105,200"/><path d="M220,155 L295,200"/><path d="M490,155 L490,200"/><path d="M710,155 L710,200"/>
+    <path d="M105,250 L105,280"/><path d="M295,250 L295,280"/>
+  </g>
+  <text x="20" y="45" font-size="11" fill="#455a64" font-weight="600">ROOT</text>
+  <text x="20" y="135" font-size="11" fill="#455a64" font-weight="600">TLD</text>
+  <rect x="335" y="15" width="150" height="50" rx="8" fill="#eceff1" stroke="#455a64"/>
+  <text x="410" y="36" text-anchor="middle" font-weight="600">Root  ( . )</text>
+  <text x="410" y="53" text-anchor="middle" font-size="11">13 names, 1,000+ sites</text>
+  <rect x="150" y="105" width="140" height="50" rx="8" fill="#eceff1" stroke="#455a64"/>
+  <text x="220" y="126" text-anchor="middle" font-weight="600">.com</text>
+  <text x="220" y="143" text-anchor="middle" font-size="11">TLD servers</text>
+  <rect x="420" y="105" width="140" height="50" rx="8" fill="#eceff1" stroke="#455a64"/>
+  <text x="490" y="126" text-anchor="middle" font-weight="600">.org</text>
+  <text x="490" y="143" text-anchor="middle" font-size="11">TLD servers</text>
+  <rect x="640" y="105" width="140" height="50" rx="8" fill="#eceff1" stroke="#455a64"/>
+  <text x="710" y="126" text-anchor="middle" font-weight="600">.in</text>
+  <text x="710" y="143" text-anchor="middle" font-size="11">country-code TLD</text>
+  <rect x="20" y="200" width="170" height="50" rx="8" fill="#fff3e0" stroke="#ef6c00"/>
+  <text x="105" y="221" text-anchor="middle" font-weight="600">instagram.com</text>
+  <text x="105" y="238" text-anchor="middle" font-size="11">Meta's authoritative NS</text>
+  <rect x="210" y="200" width="170" height="50" rx="8" fill="#fff3e0" stroke="#ef6c00"/>
+  <text x="295" y="221" text-anchor="middle" font-weight="600">cdninstagram.com</text>
+  <text x="295" y="238" text-anchor="middle" font-size="11">media / CDN zone</text>
+  <rect x="420" y="200" width="140" height="50" rx="8" fill="#fff3e0" stroke="#ef6c00"/>
+  <text x="490" y="221" text-anchor="middle" font-weight="600">wikipedia.org</text>
+  <text x="490" y="238" text-anchor="middle" font-size="11">another zone</text>
+  <rect x="640" y="200" width="140" height="50" rx="8" fill="#fff3e0" stroke="#ef6c00"/>
+  <text x="710" y="221" text-anchor="middle" font-weight="600">gov.in</text>
+  <text x="710" y="238" text-anchor="middle" font-size="11">another zone</text>
+  <rect x="20" y="280" width="170" height="36" rx="8" fill="#e8f5e9" stroke="#2e7d32"/>
+  <text x="105" y="303" text-anchor="middle" font-size="12">i.instagram.com (API)</text>
+  <rect x="210" y="280" width="170" height="36" rx="8" fill="#e8f5e9" stroke="#2e7d32"/>
+  <text x="295" y="303" text-anchor="middle" font-size="12">scontent-bom1-1…</text>
+  <text x="420" y="300" font-size="11" fill="#555">Each level only delegates (NS records) to the next;</text>
+  <text x="420" y="316" font-size="11" fill="#555">only the authoritative zone holds the actual IPs.</text>
+</svg>
+<div class="caption">The DNS namespace is a tree. Root servers delegate to TLD servers, which delegate to each domain's authoritative servers, which hold the final records for hostnames like i.instagram.com.</div>
+</div>
+
+<h3>2.2 The three kinds of servers in the hierarchy</h3>
+<div class="cards">
+  <div class="card"><h4>🌳 Root servers</h4><p>13 logical root server names (<code>a.root-servers.net</code> … <code>m.root-servers.net</code>), run by 12 independent organisations, but replicated via anycast to well over 1,000 physical sites worldwide. They only answer "who runs this TLD?".</p></div>
+  <div class="card"><h4>🏷️ TLD servers</h4><p>Serve one top-level domain: generic (<code>.com</code>, <code>.org</code>, <code>.app</code>) or country-code (<code>.in</code>, <code>.uk</code>). They hold NS records for every registered domain under them — hundreds of millions for <code>.com</code>.</p></div>
+  <div class="card"><h4>📖 Authoritative servers</h4><p>Hold the actual records for a zone (A, AAAA, CNAME, MX…). Run by the domain owner or a managed DNS provider. For big platforms, they also run the routing logic (GeoDNS, health checks).</p></div>
+</div>
+<p>You don't talk to these servers directly from your phone. That's the job of a <strong>resolver</strong>.</p>
+
+<h2>3. Resolvers and the full resolution walkthrough</h2>
+<h3>3.1 Stub resolvers vs recursive resolvers</h3>
+<ul>
+  <li>The <strong>stub resolver</strong> is the tiny DNS client in your phone's OS. It doesn't walk the hierarchy; it sends one question ("A record for <code>i.instagram.com</code>?") to a configured recursive resolver and waits for the final answer. This is a <em>recursive query</em>: "please do all the work for me".</li>
+  <li>The <strong>recursive resolver</strong> (also called a caching or full-service resolver) does the walking. It's typically run by your ISP or mobile carrier, or a public service such as Google Public DNS (8.8.8.8), Cloudflare (1.1.1.1) or Quad9 (9.9.9.9), or by your company. It sends <em>iterative queries</em> to root, TLD and authoritative servers — each of which answers with either the final answer or a referral ("I don't know, ask these servers") — and caches everything it learns.</li>
+</ul>
+
+<h3>3.2 Full resolution, step by step (cold caches)</h3>
+<pre class="ascii">
+ Phone app/OS        Recursive resolver        Root server        .com TLD server     instagram.com auth NS
+ (stub resolver)     (ISP / 8.8.8.8)
+     |                      |                       |                    |                      |
+ (1) | A? i.instagram.com   |                       |                    |                      |
+     |--------------------&gt; |  cache miss           |                    |                      |
+     |                      | (2) A? i.instagram.com|                    |                      |
+     |                      |---------------------&gt; |                    |                      |
+     |                      | (3) referral: ".com is served by a.gtld-servers.net …" (NS + glue IPs)|
+     |                      | &lt;-------------------- |                    |                      |
+     |                      | (4) A? i.instagram.com                     |                      |
+     |                      |------------------------------------------&gt;|                      |
+     |                      | (5) referral: "instagram.com NS = Meta's name servers" (+ glue)   |
+     |                      | &lt;------------------------------------------|                      |
+     |                      | (6) A? i.instagram.com                                            |
+     |                      |-----------------------------------------------------------------&gt;|
+     |                      | (7) answer: i.instagram.com A 157.240.x.x  TTL 60                 |
+     |                      |     (chosen for THIS resolver's location / client subnet)         |
+     |                      | &lt;-----------------------------------------------------------------|
+     |                      | (8) cache: root/TLD referrals for days, the A record for 60 s     |
+ (9) | &lt;-- 157.240.x.x ---- |                                                                   |
+     | OS + app cache it; now open a connection (TCP/TLS or QUIC) to 157.240.x.x            |
+</pre>
+<ol class="steps">
+  <li>The app calls the OS resolver (e.g. <code>getaddrinfo</code>), usually asking for both A (IPv4) and AAAA (IPv6) records. The OS checks its own cache first.</li>
+  <li>On a miss, the stub sends a UDP packet (port 53) — or an encrypted DoH/DoT query — to the recursive resolver.</li>
+  <li>The resolver checks <em>its</em> cache. It almost always already knows the root and <code>.com</code> servers (their NS records have TTLs of days), so steps 2–5 are usually skipped. It starts at the closest ancestor it knows.</li>
+  <li>The root answers with a <strong>referral</strong>: NS records for <code>.com</code>, plus <strong>glue records</strong> (the IPs of those name servers, needed to avoid a chicken-and-egg lookup).</li>
+  <li>The <code>.com</code> TLD server answers with another referral: the NS records for <code>instagram.com</code> (Meta's own name servers) and their glue.</li>
+  <li>Meta's <strong>authoritative</strong> server answers with the final record. This is where the intelligence lives: the IP returned depends on where the query appears to come from and which PoPs/regions are healthy.</li>
+  <li>The resolver caches the answer for its TTL and returns it to the phone; the OS and the app may cache it too.</li>
+  <li>Only now can the app start the TCP/TLS or QUIC handshake (see <a href="networking-basics.html">Networking basics</a>).</li>
+</ol>
+<p><strong>Timing:</strong> a fully cold lookup needs up to four network round trips from the resolver (root, TLD, authoritative, plus the phone ⇄ resolver hop) — easily 100–300&nbsp;ms if any of those servers is far away. A warm lookup answered from the resolver's cache costs one phone ⇄ resolver round trip (5–50&nbsp;ms; more on a 3G radio), and an OS/app cache hit costs ~0&nbsp;ms. Because root and TLD answers are cached for days and popular names like <code>i.instagram.com</code> are queried constantly, most lookups at big ISPs are cache hits.</p>
+<p>DNS mostly uses <strong>UDP</strong> because a query and answer each fit in a single packet — no handshake needed, which keeps lookups to one round trip. Responses that are too large (e.g. big DNSSEC answers) fall back to TCP; <strong>EDNS(0)</strong> extensions allow larger UDP payloads and extra options such as Client Subnet.</p>
+
+<h2>4. Caching layers and TTLs</h2>
+<p>DNS works at planetary scale only because of <strong>caching</strong>. Every answer carries a <strong>TTL (time to live)</strong> in seconds, set by the zone owner: "you may reuse this answer for this long without asking again". Caches exist at several layers:</p>
+<div class="table-wrap"><table>
+  <tr><th>Layer</th><th>Who</th><th>Notes</th></tr>
+  <tr><td>App / browser cache</td><td>Chrome's host cache, the app's HTTP library (OkHttp, Cronet)</td><td>Often caps TTLs at about a minute; some apps pre-resolve hostnames at launch</td></tr>
+  <tr><td>OS cache</td><td>iOS/Android/Windows/macOS resolver, <code>systemd-resolved</code></td><td>Shared by all apps on the device</td></tr>
+  <tr><td>Home router / CPE</td><td>Small forwarding cache in your Wi-Fi router</td><td>Optional; sometimes buggy (ignores TTLs)</td></tr>
+  <tr><td>Recursive resolver</td><td>ISP, carrier, Google/Cloudflare/Quad9, corporate</td><td>The big one — shared by millions of users, so popular names are almost always hot</td></tr>
+  <tr><td>Negative cache</td><td>Resolvers</td><td>"This name does NOT exist" (NXDOMAIN) is cached too, for a duration derived from the zone's SOA record</td></tr>
+</table></div>
+<p>Each cache counts the TTL down from when <em>it</em> received the answer. If the authoritative TTL is 300&nbsp;s and the resolver got the answer 200&nbsp;s ago, it hands your phone the record with TTL 100.</p>
+<h3>4.1 How much load does caching save?</h3>
+<pre><code>Assume 500M daily users, each device resolving the API hostname 20×/day (app opens, network changes)
+  device-level lookups = 10 billion/day ≈ 116,000 per second
+Assume those devices sit behind ~100,000 recursive resolver instances and the TTL is 60 s
+  worst case at the authoritative = 100,000 resolvers × 1 query / 60 s ≈ 1,700 QPS
+→ resolver caching cuts authoritative load by ~70× even with a short 60 s TTL.
+  With TTL = 3600 s it would be ~28 QPS — but changes would take up to an hour to propagate.</code></pre>
+<div class="callout warn"><span class="callout-title">⚠️ "DNS propagation" is really cache expiry</span>
+When people say a DNS change "takes 24 hours to propagate", nothing is being pushed anywhere. The new record is live on the authoritative servers immediately; caches around the world simply keep serving the <em>old</em> answer until their TTL runs out. Some resolvers and clients also ignore or clamp TTLs (e.g. enforce a minimum), and long-lived processes (old Java versions famously cached DNS forever by default) may never re-resolve. Always plan for stragglers.</div>
+
+<h2>5. Record types</h2>
+<p>A zone is a list of <strong>resource records</strong>: <em>name, TTL, class (almost always IN), type, value</em>. The ones every engineer should know:</p>
+<div class="table-wrap"><table>
+  <tr><th>Type</th><th>Purpose</th><th>Example</th><th>Notes</th></tr>
+  <tr><td><b>A</b></td><td>Name → IPv4 address</td><td><code>i.instagram.com. 60 IN A 203.0.113.10</code></td><td>Multiple A records = several IPs (client picks one); the core record type</td></tr>
+  <tr><td><b>AAAA</b></td><td>Name → IPv6 address</td><td><code>i.instagram.com. 60 IN AAAA 2001:db8::10</code></td><td>"Quad-A". Clients race IPv6 and IPv4 ("Happy Eyeballs") and use whichever connects first</td></tr>
+  <tr><td><b>CNAME</b></td><td>Alias: "this name is really that name"</td><td><code>www.example.com. 300 IN CNAME example.cdnprovider.net.</code></td><td>Resolver follows the chain. A CNAME can't coexist with other records at the same name, so it can't be used at the zone apex (<code>example.com</code> itself) — providers offer ALIAS/ANAME "flattening" instead. Each hop may cost an extra lookup</td></tr>
+  <tr><td><b>NS</b></td><td>Which servers are authoritative for a zone (delegation)</td><td><code>instagram.com. 172800 IN NS a.ns.example.net.</code></td><td>Lives in the parent (TLD) and in the zone itself; long TTLs (often 2 days)</td></tr>
+  <tr><td><b>MX</b></td><td>Mail servers for the domain, with priority</td><td><code>example.com. 3600 IN MX 10 mx1.example.com.</code></td><td>Lower number = preferred. Only used for email</td></tr>
+  <tr><td><b>TXT</b></td><td>Arbitrary text</td><td><code>example.com. 300 IN TXT "v=spf1 include:_spf.example.net -all"</code></td><td>Domain ownership verification, email security (SPF, DKIM, DMARC), other policies</td></tr>
+  <tr><td><b>SOA</b></td><td>Start of Authority: zone metadata</td><td><code>example.com. IN SOA ns1.example.com. dns-admin.example.com. 2026102301 7200 900 1209600 300</code></td><td>Primary server, admin contact, serial number (version of the zone), refresh/retry/expire timers for secondaries, and the negative-caching TTL</td></tr>
+  <tr><td>PTR</td><td>Reverse lookup: IP → name</td><td><code>10.113.0.203.in-addr.arpa. PTR edge1.example.com.</code></td><td>Used by mail servers, logging, traceroute</td></tr>
+  <tr><td>SRV</td><td>Service location: host + port + priority/weight</td><td><code>_sip._tcp.example.com. SRV 10 60 5060 sip1.example.com.</code></td><td>Used in some service-discovery setups (e.g. Kubernetes, Consul)</td></tr>
+  <tr><td>CAA</td><td>Which CAs may issue certificates for the domain</td><td><code>example.com. CAA 0 issue "letsencrypt.org"</code></td><td>Security hardening for TLS certificates</td></tr>
+</table></div>
+<p>Here is a tiny, illustrative zone (documentation IP ranges, not Instagram's real records):</p>
+<pre><code>$ORIGIN example-photos.com.
+@        3600  IN SOA  ns1.example-photos.com. hostmaster.example-photos.com. (
+                       2026102301 ; serial (bump on every change)
+                       7200       ; refresh: secondaries check every 2 h
+                       900        ; retry
+                       1209600    ; expire: secondaries give up after 14 days
+                       300 )      ; negative-cache TTL
+@        172800 IN NS   ns1.example-photos.com.
+@        172800 IN NS   ns2.other-provider.net.     ; second provider = no single point of failure
+api        60   IN A    203.0.113.10                ; short TTL: steered dynamically
+api        60   IN AAAA 2001:db8::10
+www       300   IN CNAME web.example-photos.com.
+media     300   IN CNAME photos.cdn-provider.example.  ; hand media off to a CDN
+@        3600   IN MX   10 mail.example-photos.com.
+@         300   IN TXT  "v=spf1 -all"</code></pre>
+<p>Use <code>dig</code> to explore real DNS: <code>dig i.instagram.com A</code>, <code>dig +trace instagram.com</code> (shows the root → TLD → authoritative walk), <code>dig instagram.com NS</code>.</p>
+
+<h2>6. DNS as a traffic-steering tool</h2>
+<p>A simple authoritative server returns the same static records to everyone. A <strong>smart authoritative server</strong> (sometimes called a <em>Global Server Load Balancer</em>, GSLB) computes the answer per query. This is the first layer of global load balancing in Instagram's architecture (see <a href="load-balancer.html">Load balancing</a>).</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 305" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-dns-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <rect x="300" y="12" width="220" height="62" rx="8" fill="#fff3e0" stroke="#ef6c00"/>
+  <text x="410" y="36" text-anchor="middle" font-weight="600">Authoritative DNS</text>
+  <text x="410" y="54" text-anchor="middle" font-size="11">geo + latency + health checks</text>
+  <g font-weight="600">
+    <rect x="20" y="110" width="170" height="46" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="105" y="138" text-anchor="middle">📱 User in Mumbai</text>
+    <rect x="20" y="180" width="170" height="46" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="105" y="208" text-anchor="middle">📱 User in Berlin</text>
+    <rect x="20" y="250" width="170" height="46" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="105" y="278" text-anchor="middle">📱 User in São Paulo</text>
+    <rect x="630" y="110" width="170" height="46" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="715" y="138" text-anchor="middle">Mumbai PoP</text>
+    <rect x="630" y="180" width="170" height="46" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="715" y="208" text-anchor="middle">Frankfurt PoP</text>
+    <rect x="630" y="250" width="170" height="46" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="715" y="278" text-anchor="middle">São Paulo PoP</text>
+  </g>
+  <g stroke="#ef6c00" stroke-width="1.3" stroke-dasharray="5 4" fill="none" marker-end="url(#ar-dns-1)">
+    <path d="M190,115 L330,76"/><path d="M190,185 L360,76"/><path d="M190,255 L390,76"/>
+  </g>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-dns-1)">
+    <path d="M190,140 L628,140"/><path d="M190,210 L628,210"/><path d="M190,280 L628,280"/>
+  </g>
+  <g font-size="11" fill="#333" text-anchor="middle">
+    <text x="520" y="133">connects to 203.0.113.10</text>
+    <text x="520" y="203">connects to 198.51.100.20</text>
+    <text x="520" y="273">connects to 192.0.2.30</text>
+  </g>
+  <text x="560" y="95" font-size="11" fill="#ef6c00">same question, different answers</text>
+</svg>
+<div class="caption">GeoDNS: three users ask the same question (A record for the API host) and receive the IP of the PoP nearest to them (illustrative documentation IPs). Health checks remove a PoP from answers if it fails.</div>
+</div>
+
+<h3>6.1 GeoDNS and latency-based routing</h3>
+<ul>
+  <li><strong>Geolocation routing</strong> maps the query's source IP to a country/region using a GeoIP database and returns the PoP or region assigned to that area. Also used for <strong>data residency</strong> rules (e.g. keep EU users on EU infrastructure — see <a href="multi-region.html">Multi-region</a>).</li>
+  <li><strong>Latency-based routing</strong> goes further: the provider continuously measures real latency from networks to each PoP (from probes or from real-user measurements in the app/browser) and returns the endpoint with the lowest measured latency for that network — which isn't always the geographically closest one.</li>
+</ul>
+<p>The catch: the authoritative server sees the <strong>resolver's</strong> IP, not the user's. If a user in Chennai uses a public resolver whose nearest instance is in Singapore, a naive GeoDNS might send them to a Singapore PoP. The fix is <strong>EDNS Client Subnet (ECS)</strong>: the resolver forwards a truncated prefix of the client's IP (e.g. a /24) so the authoritative server can geolocate the actual user. (Some privacy-focused resolvers deliberately don't send ECS.) Anycast resolvers with instances in many cities also mitigate the problem.</p>
+
+<h3>6.2 Weighted routing</h3>
+<p>Return different answers in configured proportions: 90% of responses point at the old cluster, 10% at the new one. Uses: <strong>canary releases</strong> of a new region or load balancer, <strong>gradual migrations</strong> between data centers or clouds, and balancing between regions of different capacity. Because resolvers cache answers and share them among many users, weights are approximate — one resolver serving 1M users who got the "10%" answer moves a big chunk of traffic at once.</p>
+
+<h3>6.3 DNS failover with health checks</h3>
+<p>The DNS provider continuously <strong>health-checks</strong> each endpoint (e.g. an HTTPS request to <code>/healthz</code> every 10 s from several vantage points). If a region fails N consecutive checks, it's removed from answers; traffic shifts to the remaining healthy endpoints. Variants: <em>active-passive</em> (return the primary unless it's unhealthy, then the secondary) and <em>active-active</em> (return all healthy endpoints).</p>
+<pre><code>worst-case failover time ≈ detection time + TTL + client stickiness
+  detection: 3 failed checks × 10 s           = 30 s
+  TTL                                          = 60 s
+  clients that keep existing connections open  = until those connections fail
+  → ~1.5 minutes for most users, longer for stragglers that ignore TTLs</code></pre>
+<p>That's why DNS failover is good for <em>region-level</em> disasters but too slow and coarse for individual server failures — those are handled by <a href="load-balancer.html">load balancer</a> health checks in seconds.</p>
+
+<div class="table-wrap"><table>
+  <tr><th>Routing policy</th><th>Answer depends on</th><th>Use it for</th><th>Watch out for</th></tr>
+  <tr><td>Simple / round-robin</td><td>Nothing — return all IPs (often rotated)</td><td>Spreading load across a few equal servers</td><td>No health awareness; clients may stick to the first IP</td></tr>
+  <tr><td>Geolocation</td><td>Client/resolver location</td><td>Nearest PoP, data residency, localized content</td><td>Resolver location ≠ user location (use ECS)</td></tr>
+  <tr><td>Latency-based</td><td>Measured network latency</td><td>Lowest-latency region for each network</td><td>Needs good measurement data</td></tr>
+  <tr><td>Weighted</td><td>Configured percentages</td><td>Canary, migration, capacity balancing</td><td>Coarse because resolvers aggregate many users</td></tr>
+  <tr><td>Failover</td><td>Health checks</td><td>Region / data-center disaster recovery</td><td>Bounded by TTL and client caching</td></tr>
+  <tr><td>Multi-value</td><td>Health — returns several healthy IPs</td><td>Client-side retry across endpoints</td><td>Clients must actually try alternatives</td></tr>
+</table></div>
+
+<h2>7. Anycast DNS</h2>
+<p><strong>Anycast</strong> means announcing the <strong>same IP address</strong> from many locations via BGP. Internet routing then delivers each packet to the "closest" location in network terms. (Contrast with <em>unicast</em>, where one IP = one machine.) DNS is the perfect anycast workload: a query and its answer are each a single UDP packet, so there is no long-lived connection that could break if routing shifts mid-conversation.</p>
+<ul>
+  <li><strong>Speed</strong>: users automatically reach the nearest DNS server instance — all 13 root server names are anycast, and so are major public resolvers (8.8.8.8, 1.1.1.1) and big authoritative providers.</li>
+  <li><strong>Resilience</strong>: if one site fails, it stops announcing the route and traffic flows to the next-closest site — no TTLs involved.</li>
+  <li><strong>DDoS absorption</strong>: an attack is split across every site instead of concentrating on one; each site only absorbs the attack traffic originating near it.</li>
+</ul>
+<p>GeoDNS and anycast are often combined: anycast gets the <em>DNS query</em> to a nearby DNS server, and GeoDNS logic in that server picks a nearby <em>PoP</em> for the actual traffic. Anycast is also used directly for HTTP edges and L4 load balancers — see <a href="load-balancer.html">Load balancing</a> and <a href="cdn.html">CDN</a>.</p>
+<div class="callout warn"><span class="callout-title">⚠️ The flip side of anycast</span>
+Anycast DNS servers usually stop announcing their prefix when they detect they are unhealthy — sensible for one bad site. But if <em>every</em> site decides it's unhealthy at the same time, the whole service vanishes from the internet. That is exactly what happened to Meta in October 2021 (section 9.2).</div>
+
+<h2>8. TTL trade-offs</h2>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Short TTL (30–300 s)</th><th>Long TTL (1 h – 2 days)</th></tr>
+  <tr><td><b>Failover / change speed</b></td><td>Fast — minutes</td><td>Slow — hours</td></tr>
+  <tr><td><b>Traffic steering precision</b></td><td>Can react to load and health continuously</td><td>Coarse, static</td></tr>
+  <tr><td><b>Query volume on authoritative servers</b></td><td>High</td><td>Low</td></tr>
+  <tr><td><b>User latency</b></td><td>More cache misses → more lookups (each 10–100+ ms)</td><td>Almost always cached</td></tr>
+  <tr><td><b>Resilience if your DNS is down</b></td><td>Poor — caches empty within minutes</td><td>Good — cached answers keep working for hours</td></tr>
+  <tr><td><b>Typical use</b></td><td>Dynamically steered endpoints: API and CDN hostnames, GSLB records</td><td>NS and glue records, MX, static hosts, TXT verification</td></tr>
+</table></div>
+<p>Practical rules:</p>
+<ul>
+  <li>Use <strong>short TTLs</strong> (e.g. 30–300 s) on hostnames you steer dynamically, and <strong>long TTLs</strong> on NS records and anything static.</li>
+  <li><strong>Before a planned migration</strong>, lower the TTL (e.g. from 1 day to 60 s) at least one old-TTL period in advance, make the change, verify, then raise it again.</li>
+  <li>Don't rely on DNS alone to drain traffic: some clients and resolvers cache longer than you asked. Keep old endpoints serving (or redirecting) for a while.</li>
+  <li>Remember the resilience paradox: very short TTLs make you <em>more</em> dependent on your DNS servers being reachable every minute.</li>
+</ul>
+
+<h2>9. DNS as a single point of failure</h2>
+<p>Every request to Instagram starts with DNS. If clients can't resolve the hostname, it doesn't matter that every server, database and cache is perfectly healthy — <strong>to users, the service is down</strong>. And because DNS outages affect every hostname in a zone at once, they tend to be total rather than partial. Caching softens the blow (answers already cached keep working until their TTL expires), but with short TTLs the grace period is minutes.</p>
+
+<h3>9.1 Case study: the 2016 Dyn DDoS</h3>
+<p>On <strong>21 October 2016</strong>, Dyn — a major managed DNS provider serving as the authoritative DNS for many large websites — was hit by a series of massive distributed denial-of-service attacks. The traffic came from the <strong>Mirai botnet</strong>: a large army of compromised Internet-of-Things devices (cameras, DVRs, home routers with default passwords) flooding Dyn's servers with DNS queries.</p>
+<ul>
+  <li>For several hours, especially on the US East Coast and in Europe, resolvers couldn't get answers from Dyn's name servers.</li>
+  <li>As cached records expired, sites such as Twitter, GitHub, Reddit, Netflix, Spotify and many others became unreachable for large numbers of users — even though their own servers were fine.</li>
+  <li>Companies that used <strong>only Dyn</strong> had no fallback. Companies with a second DNS provider listed in their NS records stayed largely reachable, because resolvers retry other name servers when one doesn't answer.</li>
+</ul>
+<div class="callout tip"><span class="callout-title">💡 Lessons from Dyn</span>
+<ol>
+  <li><strong>Use multiple, independent authoritative DNS providers</strong> (or your own plus a provider) with records kept in sync — the NS set is your redundancy.</li>
+  <li><strong>Over-provision and anycast</strong> DNS infrastructure so attacks are spread out and absorbed.</li>
+  <li><strong>Don't make every TTL tiny</strong>: longer TTLs on stable records let caches carry you through a DNS outage.</li>
+  <li>Your availability includes your vendors' availability — DNS, CDN and certificate providers are part of your critical path.</li>
+</ol></div>
+
+<h3>9.2 Case study: the October 2021 Facebook / Instagram / WhatsApp outage</h3>
+<p>On <strong>4 October 2021</strong>, Facebook, Instagram, WhatsApp and Messenger disappeared from the internet for roughly <strong>six hours</strong> — one of the largest outages in internet history. Meta's public post-mortem explained the chain of events:</p>
+<pre class="ascii">
+ 1. Routine maintenance: an engineer runs a command intended to ASSESS global backbone capacity.
+        │  a bug in the audit tool that should have blocked it lets it through
+        ▼
+ 2. The command takes down ALL connections in Meta's backbone network
+    → data centers are disconnected from each other and from the edge PoPs.
+        ▼
+ 3. Meta's authoritative DNS servers (at the edge) run a safety check:
+    "If I can't reach the data centers, I'm unhealthy → stop advertising my anycast IPs via BGP."
+    Every DNS site reaches the same conclusion at the same time.
+        ▼
+ 4. BGP withdrawal: the internet's routers forget how to reach Meta's DNS server IP prefixes.
+    The DNS servers are RUNNING — but unreachable.
+        ▼
+ 5. Resolvers worldwide: "A? i.instagram.com" → no route to the name servers → SERVFAIL.
+    Cached answers expire within minutes; apps and users RETRY aggressively
+    → public resolvers see a big surge in queries for Meta's domains.
+        ▼
+ 6. Internal tools that depended on the same network/DNS are also down;
+    engineers must get PHYSICAL access to data-center hardware (behind strict security) to fix it.
+        ▼
+ 7. Backbone restored → BGP routes re-announced → DNS reachable → traffic returns.
+    Load is ramped back carefully: suddenly restoring all traffic risks power surges and cache stampedes.
+</pre>
+<div class="flow">
+  <div class="fnode ext">Bad command<small>backbone down</small></div><div class="farrow">→</div>
+  <div class="fnode edge">DNS health check fails<small>at every site</small></div><div class="farrow">→</div>
+  <div class="fnode ext">BGP withdrawal<small>no route to NS</small></div><div class="farrow">→</div>
+  <div class="fnode client">SERVFAIL everywhere<small>apps "offline"</small></div>
+</div>
+<p>Why this case study is so instructive for system design:</p>
+<ul>
+  <li><strong>A "safe" local rule caused a global failure.</strong> Withdrawing an unhealthy site from anycast is correct for one site; doing it everywhere simultaneously removed the whole service. Health-check logic needs a "don't all fail closed at once" safeguard (e.g. never withdraw the last N sites, or fail <em>open</em> when every site is affected).</li>
+  <li><strong>DNS + BGP sit beneath everything.</strong> Even perfectly healthy data centers are useless if nobody can find them.</li>
+  <li><strong>Shared fate between production and recovery tooling.</strong> When the network and DNS went down, so did the internal tools engineers would normally use to fix them. Out-of-band management access is critical.</li>
+  <li><strong>Retry storms amplify outages</strong> — for third parties too (public resolvers got hammered). Clients need backoff with jitter (see <a href="resilience-patterns.html">Resilience patterns</a>).</li>
+  <li><strong>Recovery is its own risk</strong>: restoring billions of users at once can overload power, caches and databases. Meta had rehearsed "storm" drills for exactly this kind of recovery.</li>
+  <li><strong>Change safety</strong>: audit tools, staged rollouts and blast-radius limits for network changes are as important as for code deploys.</li>
+</ul>
+
+<h2>10. DNS security and privacy</h2>
+<h3>10.1 Attacks</h3>
+<ul>
+  <li><strong>Spoofing / cache poisoning</strong>: classic DNS over UDP has no authentication. An attacker who guesses a query's ID and port can inject a forged answer into a resolver's cache, sending everyone using that resolver to a malicious IP. The 2008 "Kaminsky attack" made this practical; resolvers responded by randomising source ports and other hardening.</li>
+  <li><strong>Hijacking</strong>: compromise the domain's registrar account or DNS provider account and change the NS or A records. Mitigate with registrar locks, MFA and change alerts.</li>
+  <li><strong>DDoS</strong> on authoritative servers (Dyn) or reflection/amplification attacks that abuse open resolvers to flood a victim.</li>
+  <li><strong>Surveillance and tampering</strong>: plaintext DNS reveals every hostname you visit to anyone on the path, and some networks rewrite answers (censorship, ad injection).</li>
+</ul>
+<h3>10.2 Defences</h3>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>What it protects</th><th>How</th><th>Limits</th></tr>
+  <tr><td><b>DNSSEC</b></td><td>Authenticity &amp; integrity of answers</td><td>Zones are cryptographically signed; resolvers validate a chain of trust from the root</td><td>No privacy; operational complexity; partial adoption</td></tr>
+  <tr><td><b>DNS over TLS (DoT)</b></td><td>Privacy &amp; integrity between stub and resolver</td><td>DNS inside TLS on port 853</td><td>Dedicated port is easy to block/identify</td></tr>
+  <tr><td><b>DNS over HTTPS (DoH)</b></td><td>Privacy &amp; integrity between stub and resolver</td><td>DNS messages sent as HTTPS requests on port 443 (looks like normal web traffic); supported by major browsers and OSes</td><td>Centralises queries at a few big resolvers; bypasses enterprise DNS controls; resolver still sees queries</td></tr>
+  <tr><td><b>DNS over QUIC (DoQ)</b></td><td>Same as DoT, lower latency</td><td>DNS over QUIC streams</td><td>Newer, less deployed</td></tr>
+  <tr><td><b>Registrar lock, MFA, CAA records</b></td><td>Domain hijacking, rogue certificates</td><td>Organisational controls</td><td>Process discipline required</td></tr>
+</table></div>
+<p>For a mobile app, DoH has a practical bonus: the app (or OS) can resolve names over the same HTTPS stack it already uses, which avoids broken or hijacking ISP resolvers. Note that DoH protects the hop to the resolver — the TLS SNI field and the destination IP can still reveal which site you're connecting to (Encrypted Client Hello is the emerging fix). See also <a href="security.html">Security</a>.</p>
+
+<h2>11. How Instagram uses DNS</h2>
+<p>Instagram's DNS has two jobs: tell clients <em>where</em> to connect, and steer them to the <em>right nearby place</em> — for two very different kinds of traffic.</p>
+<div class="table-wrap"><table>
+  <tr><th>Hostname (publicly observable)</th><th>Purpose</th><th>Where DNS points it</th></tr>
+  <tr><td><code>i.instagram.com</code></td><td>Mobile app API (feed, likes, uploads, etc.)</td><td>A nearby Meta edge PoP running L4 + L7 (Proxygen) load balancers, which forward to a data-center region</td></tr>
+  <tr><td><code>www.instagram.com</code></td><td>Web app</td><td>Similar edge infrastructure as the API</td></tr>
+  <tr><td><code>scontent-xxx#-#.cdninstagram.com</code> (and <code>*.fbcdn.net</code>)</td><td>Photos, video segments, thumbnails</td><td>A specific CDN cache cluster — the hostname itself often encodes the location, e.g. an airport code like <code>bom</code> (Mumbai)</td></tr>
+  <tr><td>Real-time / chat endpoints</td><td>Persistent DM/notification connections</td><td>Edge endpoints that terminate long-lived connections (see <a href="direct-messaging.html">Direct messaging</a>)</td></tr>
+</table></div>
+<h3>11.1 Why separate hostnames for API and media?</h3>
+<ul>
+  <li><strong>Different infrastructure</strong>: media goes to CDN cache servers optimised for throughput and disk; API calls go to proxies that forward to application servers. Separate names let DNS send each to the right fleet.</li>
+  <li><strong>Different routing and TTL policies</strong>: media hostnames can be pinned to a specific cache cluster to maximise cache hit ratio; API hostnames are steered to the best region for that user.</li>
+  <li><strong>Cookieless, isolated domain</strong>: putting user-generated media on a separate registrable domain (<code>cdninstagram.com</code>, not <code>instagram.com</code>) means browsers never attach Instagram login cookies to image requests (saving bytes on every request) and isolates any malicious uploaded content from the main site's security origin.</li>
+  <li><strong>Independent scaling and failure domains</strong>: a CDN problem doesn't have to break the API, and vice versa.</li>
+</ul>
+<h3>11.2 Steering users to nearby PoPs and regions</h3>
+<ol class="steps">
+  <li>The app asks for <code>i.instagram.com</code>. The query reaches one of Meta's anycast authoritative DNS servers — a nearby one, thanks to anycast.</li>
+  <li>That server looks up the resolver's network (and the client subnet via ECS, if provided) in a <strong>mapping</strong> computed centrally from latency measurements, PoP capacity and health. Meta engineers have publicly described such a system (named <em>Cartographer</em>) that computes which edge PoP each client network should use and pushes the map to the DNS servers.</li>
+  <li>The answer — the VIP (virtual IP) of the best nearby PoP — comes back with a short TTL, so the mapping can change quickly when a PoP is overloaded, drained for maintenance, or fails.</li>
+  <li>The app connects to that PoP. From there, Meta's own L4/L7 load balancers and backbone take over (see <a href="load-balancer.html">Load balancing</a>).</li>
+  <li>The feed response contains media URLs on CDN hostnames, which the app resolves the same way — landing on a nearby cache. See <a href="cdn.html">CDN</a>.</li>
+</ol>
+<div class="callout instagram"><span class="callout-title">📸 Instagram specifics</span>
+Meta runs its <strong>own authoritative DNS</strong> for its domains (the 2021 outage revealed that its name servers are deployed at its edge sites and anycast-announced via BGP). DNS is the first stage of Meta's global traffic management: it decides which of dozens of edge PoPs (plus caches embedded in ISPs) a user reaches. The mobile apps further reduce DNS cost by caching results and keeping long-lived connections, so on a typical day most requests don't need a fresh DNS lookup at all. The 2021 outage also showed the downside of this tight integration: when DNS became unreachable, all of Meta's apps went down together.</div>
+<h3>Rough numbers</h3>
+<pre><code>Assume 500M DAU, 20 lookups/device/day for the API host and ~5 distinct CDN hostnames
+  device lookups ≈ 500M × 20 × (1 + 5) = 60 billion/day ≈ 700K/s at the device level
+  most are answered by OS or resolver caches;
+  authoritative QPS ≈ (number of active resolvers × hostnames) / TTL
+                    ≈ (200,000 × 6) / 60 s ≈ 20,000 QPS — modest for an anycast fleet.
+  A cache miss adds ~20–150 ms to the first request; with a 60 s TTL and long-lived
+  connections, that cost is paid on only a small fraction of requests.</code></pre>
+
+<h2>12. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ What DNS gives you</h4><ul>
+    <li>Indirection: move, add or remove servers without changing clients</li>
+    <li>Cheap global traffic steering (geo, latency, weights, failover)</li>
+    <li>Massive scale through hierarchical delegation and caching</li>
+    <li>Anycast makes lookups fast and DDoS-resistant</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Limitations</h4><ul>
+    <li>Changes are only as fast as the TTL (and stragglers ignore it)</li>
+    <li>Coarse: steers resolvers, not individual users or requests</li>
+    <li>Adds latency to the first request on a cache miss</li>
+    <li>A critical dependency: a DNS outage = total outage</li>
+    <li>Plain DNS is unauthenticated and unencrypted</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Single DNS provider</strong> (Dyn 2016): add a second, independent provider or self-hosted secondary.</li>
+  <li><strong>Using DNS for fast failover of individual servers</strong>: use load balancer health checks for that; DNS is for region-level steering.</li>
+  <li><strong>Forgetting to lower the TTL before a migration</strong>, then waiting a day for caches to expire.</li>
+  <li><strong>Tiny TTLs everywhere</strong>: higher latency and query cost, and no cushion if DNS itself has problems.</li>
+  <li><strong>CNAME at the zone apex</strong> or long CNAME chains (each hop can add a lookup).</li>
+  <li><strong>Clients that cache DNS forever</strong> (long-running JVMs, connection pools that never re-resolve) and keep hitting decommissioned IPs.</li>
+  <li><strong>Health checks that can all fail together</strong> and withdraw every site (Meta 2021).</li>
+  <li><strong>Unprotected registrar accounts</strong>: domain hijacking via a phished password.</li>
+  <li><strong>Ignoring resolver geography</strong>: GeoDNS without ECS sends some users to far-away PoPs.</li>
+</ul>
+
+<h2>13. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Product / tool</th><th>Type</th><th>When to use it</th></tr>
+  <tr><td>Amazon Route 53</td><td>Managed authoritative DNS with geo, latency, weighted, failover and health checks</td><td>AWS-hosted systems needing GSLB-style routing</td></tr>
+  <tr><td>Cloudflare DNS, NS1, Akamai Edge DNS, UltraDNS</td><td>Anycast managed authoritative DNS, traffic steering, DDoS protection</td><td>High-availability public domains; often used in pairs for redundancy</td></tr>
+  <tr><td>Google Cloud DNS, Azure DNS / Traffic Manager</td><td>Cloud-native authoritative DNS (+ traffic management)</td><td>Systems on those clouds</td></tr>
+  <tr><td>BIND, PowerDNS, Knot, NSD</td><td>Self-hosted authoritative (and recursive) DNS servers</td><td>Running your own DNS at scale (as Meta does with in-house systems)</td></tr>
+  <tr><td>Unbound, Knot Resolver, dnsmasq</td><td>Recursive / caching resolvers</td><td>Corporate or data-center internal resolution</td></tr>
+  <tr><td>Google Public DNS (8.8.8.8), Cloudflare (1.1.1.1), Quad9 (9.9.9.9)</td><td>Public anycast recursive resolvers with DoH/DoT</td><td>End users; fallback resolvers in apps</td></tr>
+  <tr><td>CoreDNS, Consul DNS</td><td>DNS-based service discovery inside clusters</td><td>Kubernetes / microservices (see <a href="microservices.html">Microservices</a>)</td></tr>
+  <tr><td><code>dig</code>, <code>nslookup</code>, <code>dig +trace</code></td><td>Debugging tools</td><td>Inspecting records, TTLs and delegation paths</td></tr>
+</table></div>
+
+<h2>14. Interview corner</h2>
+<details class="qa"><summary>What happens, step by step, when the app resolves i.instagram.com for the first time?</summary>
+<p>The OS stub resolver checks its cache, then asks the configured recursive resolver (ISP or public) over UDP 53 or DoH. The resolver checks its cache; on a miss it asks a root server (usually skipped because the <code>.com</code> referral is cached), gets a referral to the <code>.com</code> TLD servers, asks them and gets a referral (NS + glue) to Meta's authoritative name servers, then asks those. Meta's anycast authoritative server picks a nearby healthy edge PoP for that resolver/client subnet and returns its A/AAAA record with a short TTL. The resolver caches every answer for its TTL and returns the IP; the OS and app cache it; the app then opens a QUIC or TCP+TLS connection.</p></details>
+<details class="qa"><summary>How would you use DNS to route users to the nearest data center, and what are the limitations?</summary>
+<p>Use GeoDNS or latency-based routing at the authoritative layer (a GSLB): map the resolver/client subnet to the best region based on geography or measured latency, filtered by health checks and capacity, and return that region's VIP with a short TTL. Limitations: the authoritative sees the resolver, not the user (mitigated by EDNS Client Subnet); changes are bounded by TTL and resolvers/clients that ignore it; granularity is per resolver, not per user; and it can't react to per-request conditions. Inside the region, L4/L7 load balancers do fine-grained balancing; anycast can complement DNS for faster failover.</p></details>
+<details class="qa"><summary>What TTL would you pick for the API hostname, and why?</summary>
+<p>Short — around 30–300 s (e.g. 60 s) — because we steer it dynamically and want region failover within minutes. That raises authoritative query volume, but resolver caching aggregates millions of users, so the load is modest for an anycast fleet. NS records and static records get long TTLs (hours to days) for resilience. Before a planned migration, lower TTLs in advance. And because short TTLs increase dependence on DNS availability, use multiple anycast sites and ideally redundant providers.</p></details>
+<details class="qa"><summary>Explain the October 2021 Facebook outage. What would you change in the design?</summary>
+<p>A maintenance command meant to assess backbone capacity accidentally took down Meta's entire backbone; an audit tool that should have blocked it had a bug. Meta's edge DNS servers, unable to reach the data centers, marked themselves unhealthy and withdrew their BGP anycast announcements — all of them at once — so the name servers became unreachable and every Meta domain failed to resolve worldwide for about six hours. Internal tools were affected too, requiring on-site access. Design changes: health-check logic that never withdraws all sites simultaneously (fail open / keep a minimum set announced); stronger change safety (staged network changes, independent verification, smaller blast radius); out-of-band management networks independent of production DNS/backbone; possibly a secondary DNS presence; and client retry backoff to avoid query storms.</p></details>
+<details class="qa"><summary>Anycast vs GeoDNS — how do they differ and when would you use each?</summary>
+<p>GeoDNS returns different IPs to different resolvers; routing decisions are made by your DNS logic and are bounded by TTLs. Anycast advertises the same IP from many sites and lets BGP deliver packets to the nearest one; failover happens as fast as BGP converges (seconds to minutes) with no TTLs, and DDoS is naturally spread. Anycast suits stateless, short exchanges (DNS itself) and L4 edges with connection-aware LBs; GeoDNS gives explicit, policy-driven control (capacity, residency, weights). Large platforms combine them: anycast DNS servers running GeoDNS logic.</p></details>
+<details class="qa"><summary>Why does Instagram serve media from a different domain than its API?</summary>
+<p>Separate hostnames let DNS route media to CDN cache clusters and API calls to proxy/edge fleets with different policies; a separate registrable domain (cdninstagram.com) keeps login cookies off millions of image requests and isolates user-uploaded content from the main site's security origin; and it separates failure and scaling domains. Media URLs can even encode a specific cache cluster to maximise hit ratio.</p></details>
+<details class="qa"><summary>How do you make DNS not be a single point of failure?</summary>
+<p>Redundancy at every layer: multiple authoritative name servers on separate networks, anycast across many sites, ideally two independent providers with synchronised zones; sensible TTLs so caches carry you through short outages; DDoS capacity and rate limiting; health-check logic that can't take everything down at once; registrar locks and MFA; monitoring of resolution from many vantage points; and clients that cache last-known-good answers and back off on failure.</p></details>
+
+<h2>15. Check your understanding</h2>
+<details class="quiz"><summary>A resolver received an A record with TTL 300 s two minutes ago. A phone now asks it. What TTL does the phone see, and when will the resolver next contact the authoritative server for this name?</summary>
+<p>The phone sees TTL ≈ <strong>180 s</strong> (300 − 120). The resolver re-queries the authoritative server only after those 180 s expire and someone asks again.</p></details>
+<details class="quiz"><summary>You switch a hostname's A record to a new data center. The old TTL was 86,400 s. What's the worst case before all well-behaved resolvers use the new IP, and how should you have done it?</summary>
+<p>Up to <strong>24 hours</strong>. Better: at least a day before the move, lower the TTL to ~60 s; once the old 24 h TTL has expired everywhere, switch the record (most traffic moves within a minute or two), keep the old site serving for stragglers, then raise the TTL again.</p></details>
+<details class="quiz"><summary>Which record type would you use for each: (a) point <code>photos.example.com</code> at a CDN's hostname, (b) prove domain ownership to a vendor, (c) give the IPv6 address of the API, (d) delegate <code>eu.example.com</code> to a different set of name servers?</summary>
+<p>(a) <strong>CNAME</strong>, (b) <strong>TXT</strong>, (c) <strong>AAAA</strong>, (d) <strong>NS</strong> records for <code>eu.example.com</code> in the parent zone (plus glue A/AAAA records if the name servers are inside that subdomain).</p></details>
+<details class="quiz"><summary>A user in Chennai using a public resolver gets sent to a Singapore PoP instead of the Chennai one. Why might that happen and what fixes it?</summary>
+<p>The authoritative GeoDNS only sees the <strong>resolver's</strong> IP, and the resolver instance answering the user may be located (or geolocated) in Singapore. Fixes: EDNS Client Subnet so the authoritative sees the user's prefix; resolvers with anycast instances in India; latency-based mapping built from real-user measurements; or anycast for the PoP addresses themselves.</p></details>
+<details class="quiz"><summary>Health checks run every 10 s, a region is removed after 3 failures, and the record TTL is 60 s. Roughly how long until most users move off a dead region?</summary>
+<p>Detection ≈ 3 × 10 = 30 s, plus up to 60 s of cached answers ≈ <strong>~90 seconds</strong> for most users — longer for clients that ignore TTLs or keep existing connections to the dead region until they time out.</p></details>
+<details class="quiz"><summary>In October 2021, were Meta's DNS servers down? Explain precisely what failed.</summary>
+<p>Mostly <strong>no — they were running but unreachable</strong>. After the backbone failure, they withdrew their BGP route advertisements (because they couldn't reach the data centers), so the internet had no route to their IP prefixes. Resolvers couldn't reach any authoritative server for Meta's domains and returned SERVFAIL, so the apps couldn't resolve any hostname.</p></details>
+<details class="quiz"><summary>DNSSEC or DoH — which one stops your ISP from seeing which sites you look up? Which one stops a forged answer from being accepted?</summary>
+<p><strong>DoH</strong> (or DoT/DoQ) encrypts the query between your device and the resolver, hiding it from the ISP (though the resolver still sees it). <strong>DNSSEC</strong> signs records so a validating resolver can reject forged answers — but it doesn't encrypt anything. They solve different problems and can be used together.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>DNS maps names to IPs through a hierarchy — <strong>root → TLD → authoritative</strong> — walked by <strong>recursive resolvers</strong> on behalf of stub resolvers.</li>
+    <li><strong>Caching with TTLs</strong> at app, OS and resolver layers makes it scale; "propagation" is just cache expiry.</li>
+    <li>Know <strong>A, AAAA, CNAME, NS, MX, TXT, SOA</strong> (plus PTR, SRV, CAA).</li>
+    <li>DNS is the first global load balancer: <strong>GeoDNS / latency, weighted, health-checked failover</strong>, with <strong>anycast</strong> for speed and DDoS resilience.</li>
+    <li><strong>TTL is a trade-off</strong> between agility and resilience/latency; lower it before migrations.</li>
+    <li>DNS is a critical <strong>single point of failure</strong> — Dyn 2016 and Meta 2021 show why you need redundancy, safe health-check logic and independent recovery paths.</li>
+    <li>Instagram uses <strong>separate API and media hostnames</strong>, steered by its own anycast DNS to nearby edge PoPs and CDN caches.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="networking-basics.html">Networking basics</a> — IP, BGP, UDP and what happens after the IP is known</li>
+  <li><a href="cdn.html">CDN</a> — how DNS steers media requests to nearby PoPs</li>
+  <li><a href="load-balancer.html">Load balancing</a> — GSLB vs local load balancing and anycast L4 edges</li>
+  <li><a href="clients.html">Clients</a> — DNS caching, pre-connecting and the client's view of the first hop</li>
+  <li><a href="multi-region.html">Multi-region</a> — DNS-based regional failover and data residency</li>
+  <li><a href="security.html">Security</a> — DDoS protection, DNSSEC, DoH and domain hijacking</li>
+  <li><a href="resilience-patterns.html">Resilience patterns</a> — retries with backoff to avoid DNS query storms</li>
+  <li><a href="core-principles.html">Core principles</a> — single points of failure and availability math</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

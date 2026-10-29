@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Likes, Comments &amp; Counters at Scale — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="likes-comments">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>Likes and comments are Instagram's highest-volume <strong>writes</strong>: billions per day. Store each like as a row keyed by <code>(post_id, user_id)</code> — that row is the <strong>source of truth</strong> and makes likes naturally <strong>idempotent</strong>.</li>
+    <li>The naive counter <code>UPDATE posts SET likes = likes + 1</code> serialises on a <strong>row lock</strong>; a viral post saturates it. Use <strong>sharded counters</strong>, <strong>stream aggregation</strong> (Kafka → batched deltas), or <strong>Redis INCR + periodic flush</strong>, and display <strong>approximate</strong> counts.</li>
+    <li>Displayed counts are <strong>eventually consistent</strong>; the viewer's own like is shown instantly via optimistic UI and their own like row.</li>
+    <li>"Has the viewer liked each of these 20 posts?" must be one <strong>batched lookup</strong> (plus caching), not 20 queries.</li>
+    <li>Comments need <strong>cursor pagination</strong>, <strong>ranking</strong> (top comments), shallow <strong>threading</strong> via <code>parent_id</code>, and <strong>moderation</strong>. Engagement events feed notifications, ranking and analytics; viral posts need <strong>hot-key</strong> protection.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why are likes and counters hard?</h2>
+<p>A like is the smallest action in Instagram — a double-tap. But it is performed <strong>billions of times a day</strong>, often concentrated on a handful of posts: when a global celebrity posts, tens of thousands of people may like it <em>every second</em> for the first minutes. Each like must:</p>
+<ul>
+  <li>be recorded exactly once per user (double-tapping twice isn't two likes),</li>
+  <li>update a visible counter that millions of people are reading at the same time,</li>
+  <li>tell the author (notification), feed ranking and analytics,</li>
+  <li>and be reflected in the "❤️ filled" state for that user on every device.</li>
+</ul>
+<p>Comments add text, threads, ranking and abuse. The core tension is that the <em>naive</em> model — one row per post with a <code>like_count</code> column — turns the most popular content into the most contended row in the database.</p>
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  Imagine counting the crowd entering a stadium with <strong>one clicker held by one steward</strong>. Every fan must queue to get clicked — the steward is the bottleneck (a row lock). Better: put a steward with a clicker at <strong>each of 64 gates</strong> and add up the clickers at half-time (sharded counters). Or have each gate jot tallies on paper and radio the total every 10 seconds (stream aggregation and batching). The scoreboard shows "≈ 52,000 fans" (approximate count) — nobody needs it exact to the person, as long as each <em>ticket</em> (the like row) is only scanned once.
+</div>
+
+<h2>2. Requirements and write volume</h2>
+<h3>2.1 Functional</h3>
+<ul>
+  <li>Like / unlike a post (and a comment); show like count and "liked by X and others".</li>
+  <li>Show whether the current viewer has liked each post they see.</li>
+  <li>Add, delete, like and reply to comments; show comment count, top comments and threads.</li>
+  <li>Notify the author; let users hide like counts; filter offensive comments.</li>
+</ul>
+<h3>2.2 Estimate (assumptions)</h3>
+<pre><code>Daily active users            500M
+Likes per user per day        10            → 5B likes/day   ≈ 58,000 likes/s avg, ~150k/s peak
+Comments per user per day     1             → 500M/day       ≈ 5,800 comments/s avg
+Posts viewed per user per day 200           → 100B post renders/day ≈ 1.2M/s
+  each render reads: like count, comment count, "viewer liked?", 1–2 preview comments
+Like row size                 ~30 B (post_id 8, user_id 8, ts 8, overhead)
+Like storage                  5B × 30 B ≈ 150 GB/day ≈ 55 TB/year (before replication)
+
+Viral post: 2M likes in the first 10 minutes  → ~3,300 likes/s on ONE post, spikes far higher</code></pre>
+<p>Public figures from around 2016 put Instagram at over <strong>4 billion likes per day</strong>, consistent with this order of magnitude. Note the ratios: engagement reads outnumber writes ~20:1 overall, but the <em>writes</em> are what break naive designs because they concentrate on hot rows. See <a href="capacity-estimation.html">capacity estimation</a>.</p>
+
+<h2>3. Data model</h2>
+<pre class="ascii">
+likes                PRIMARY KEY (post_id, user_id)          -- source of truth, one row per like
+  post_id | user_id | created_at
+
+user_likes           PRIMARY KEY (user_id, post_id)          -- reverse index: "what did I like?"
+  user_id | post_id | created_at                                (same data, other partition key)
+
+post_counters        post_id → like_count, comment_count       -- denormalised, eventually consistent
+                     (or sharded: (post_id, shard) → partial_count)
+
+comments             PRIMARY KEY (post_id, comment_id)        -- comment_id time-sortable
+  post_id | comment_id | author_id | parent_id (NULL = top-level) | text | status | like_count | created_at
+
+comment_likes        PRIMARY KEY (comment_id, user_id)
+</pre>
+<ul>
+  <li><strong>Composite key <code>(post_id, user_id)</code></strong> guarantees at most one like per user per post — the database enforces idempotency for free.</li>
+  <li><strong>Two access paths</strong>: "who liked post P" (partition by post) and "has user U liked these posts / what has U liked" (partition by user). In a sharded store each needs its own table (dual writes via the outbox or a CDC pipeline), or a TAO-style association store that keeps both directions (see <a href="social-graph.html">Social graph</a>).</li>
+  <li><strong>Counters are denormalised</strong>: never compute <code>SELECT COUNT(*) FROM likes WHERE post_id = ?</code> on the read path — for a post with 10M likes that scans 10M rows.</li>
+  <li><strong>Comments</strong> are partitioned by post so "comments of P, newest first" is a single-partition range scan; <code>parent_id</code> implements threading (section 9).</li>
+</ul>
+<p>Instagram's diagram places post/comment metadata in a Cassandra-style store sharded by ID, with counters cached in Redis. Earlier, Instagram ran likes in sharded PostgreSQL — the same model applies to either.</p>
+
+<h2>4. The counter problem</h2>
+<h3>4.1 Why <code>count = count + 1</code> breaks</h3>
+<pre><code>BEGIN;
+INSERT INTO likes (post_id, user_id) VALUES (42, 1001);
+UPDATE posts SET like_count = like_count + 1 WHERE post_id = 42;   -- takes a ROW LOCK on post 42
+COMMIT;                                                               -- lock released only here</code></pre>
+<p>In a relational database, the <code>UPDATE</code> takes an exclusive <strong>row lock</strong> on post 42 until the transaction commits. Every other transaction liking post 42 must <strong>wait in line</strong>. If a commit takes ~1–2 ms (WAL flush, synchronous replication), that row can absorb at most <strong>~500–1,000 increments per second</strong> — no matter how many servers you add, because they all queue for the same row.</p>
+<div class="diagram">
+<svg viewBox="0 0 820 250" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-lc-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="700" text-anchor="middle"><text x="200" y="20">Single counter row: everyone queues</text><text x="620" y="20">Sharded counter: writes spread out</text></g>
+  <line x1="410" y1="10" x2="410" y2="240" stroke="#ccc" stroke-dasharray="4 4"/>
+  <g text-anchor="middle">
+    <rect x="20" y="40" width="80" height="26" rx="5" fill="#e8f5e9" stroke="#2e7d32"/><text x="60" y="58" font-size="11.5">like tx 1</text>
+    <rect x="20" y="75" width="80" height="26" rx="5" fill="#e8f5e9" stroke="#2e7d32"/><text x="60" y="93" font-size="11.5">like tx 2</text>
+    <rect x="20" y="110" width="80" height="26" rx="5" fill="#e8f5e9" stroke="#2e7d32"/><text x="60" y="128" font-size="11.5">like tx 3</text>
+    <rect x="20" y="145" width="80" height="26" rx="5" fill="#e8f5e9" stroke="#2e7d32"/><text x="60" y="163" font-size="11.5">like tx …</text>
+    <rect x="200" y="85" width="170" height="60" rx="8" fill="#ffebee" stroke="#c62828"/><text x="285" y="108" font-weight="600">post 42 row</text><text x="285" y="126" font-size="11.5">🔒 like_count (locked)</text>
+    <text x="200" y="200" font-size="11.5" fill="#c62828">≤ ~1,000 increments/s, queue grows</text>
+  </g>
+  <g stroke="#c62828" stroke-width="1.3" fill="none" marker-end="url(#ar-lc-1)">
+    <path d="M100,53 L198,100"/><path d="M100,88 L198,110"/><path d="M100,123 L198,120"/><path d="M100,158 L198,130"/>
+  </g>
+  <g text-anchor="middle">
+    <rect x="430" y="40" width="80" height="26" rx="5" fill="#e8f5e9" stroke="#2e7d32"/><text x="470" y="58" font-size="11.5">like tx 1</text>
+    <rect x="430" y="75" width="80" height="26" rx="5" fill="#e8f5e9" stroke="#2e7d32"/><text x="470" y="93" font-size="11.5">like tx 2</text>
+    <rect x="430" y="110" width="80" height="26" rx="5" fill="#e8f5e9" stroke="#2e7d32"/><text x="470" y="128" font-size="11.5">like tx 3</text>
+    <rect x="430" y="145" width="80" height="26" rx="5" fill="#e8f5e9" stroke="#2e7d32"/><text x="470" y="163" font-size="11.5">like tx …</text>
+    <rect x="610" y="35" width="150" height="28" rx="5" fill="#fff8e1" stroke="#f9a825"/><text x="685" y="54" font-size="11.5">(42, shard 0): 1,204</text>
+    <rect x="610" y="72" width="150" height="28" rx="5" fill="#fff8e1" stroke="#f9a825"/><text x="685" y="91" font-size="11.5">(42, shard 1): 1,187</text>
+    <rect x="610" y="109" width="150" height="28" rx="5" fill="#fff8e1" stroke="#f9a825"/><text x="685" y="128" font-size="11.5">(42, shard 2): 1,240</text>
+    <rect x="610" y="146" width="150" height="28" rx="5" fill="#fff8e1" stroke="#f9a825"/><text x="685" y="165" font-size="11.5">… shard 63</text>
+    <text x="620" y="205" font-size="11.5" fill="#2e7d32">read = SUM(shards), cached</text>
+    <text x="620" y="222" font-size="11.5" fill="#2e7d32">throughput ≈ N × single row</text>
+  </g>
+  <g stroke="#2e7d32" stroke-width="1.3" fill="none" marker-end="url(#ar-lc-1)">
+    <path d="M510,53 L608,86"/><path d="M510,88 L608,49"/><path d="M510,123 L608,158"/><path d="M510,158 L608,123"/>
+  </g>
+</svg>
+<div class="caption">Left: one hot row serialises every like. Right: each like increments a random shard row, so N rows absorb N times the write rate.</div>
+</div>
+<p>Other side effects make it worse: in PostgreSQL every UPDATE writes a new row version (MVCC), so a hot counter produces dead tuples that need vacuuming; replicas replay every one of those updates; and the <em>same row</em> is also being read by everyone viewing the post, so cache invalidation fires constantly.</p>
+
+<h2>5. Counter solutions</h2>
+<h3>5.1 Sharded (distributed) counters</h3>
+<p>Split the counter into <strong>N sub-counters</strong> <code>(post_id, shard)</code>. Each like increments a random (or <code>hash(user_id) % N</code>) shard; reading sums the shards (and caches the sum).</p>
+<pre><code>def increment(post_id):
+    shard = random.randrange(N)               # N = 1 for normal posts, 64+ for hot ones
+    db.execute("UPDATE post_counter_shards SET c = c + 1 WHERE post_id=%s AND shard=%s", post_id, shard)
+
+def read(post_id):
+    return cache.get_or_load(f"likes:{post_id}", ttl=5s,
+        loader=lambda: db.scalar("SELECT SUM(c) FROM post_counter_shards WHERE post_id=%s", post_id))</code></pre>
+<p>Write throughput scales ~N×; reads cost N rows (hence caching). Google's Cloud Datastore/Firestore documentation recommends exactly this pattern. N can grow dynamically when a post gets hot.</p>
+
+<h3>5.2 Buffer and aggregate in a stream</h3>
+<p>Don't update the counter per like at all. The Like service writes the like row (the truth) and emits <code>LikeCreated</code>/<code>LikeRemoved</code> to <a href="message-queues.html">Kafka</a>, keyed by <code>post_id</code>. A counter-aggregator consumer sums deltas in memory for a short window and applies <strong>one batched update per post</strong>:</p>
+<div class="diagram">
+<svg viewBox="0 0 820 200" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-lc-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g text-anchor="middle">
+    <rect x="15" y="70" width="120" height="56" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="75" y="93" font-weight="600">Like service</text><text x="75" y="111" font-size="11">writes like row</text>
+    <rect x="175" y="70" width="140" height="56" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="245" y="93" font-weight="600">Kafka</text><text x="245" y="111" font-size="11">likes, key = post_id</text>
+    <rect x="355" y="70" width="170" height="56" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="440" y="93" font-weight="600">Counter aggregator</text><text x="440" y="111" font-size="11">Σ deltas per post / 2 s</text>
+    <rect x="565" y="20" width="240" height="50" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="685" y="41" font-weight="600">Counter DB</text><text x="685" y="58" font-size="11">count += 40,000 (one write)</text>
+    <rect x="565" y="125" width="240" height="50" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="685" y="146" font-weight="600">Redis counter cache</text><text x="685" y="163" font-size="11">read by every post render</text>
+  </g>
+  <g stroke="#555" stroke-width="1.4" fill="none" marker-end="url(#ar-lc-2)">
+    <path d="M135,98 L173,98"/><path d="M315,98 L353,98"/><path d="M525,90 L563,50"/><path d="M525,106 L563,148"/>
+  </g>
+  <text x="155" y="60" text-anchor="middle" font-size="11" fill="#555">20k events/s</text>
+  <text x="545" y="40" text-anchor="end" font-size="11" fill="#555">0.5 writes/s</text>
+</svg>
+<div class="caption">20,000 like events per second on one viral post become one counter write every two seconds.</div>
+</div>
+<ul>
+  <li><strong>Massive write reduction</strong>: 20k likes/s on one post → one <code>count += 40,000</code> every 2 s.</li>
+  <li><strong>Exactly-once-ish</strong>: commit the consumer offset and the counter delta atomically (store the last applied offset per partition in the same DB transaction), or accept tiny drift and reconcile periodically.</li>
+  <li><strong>Ordering</strong>: keying by post_id puts all of a post's like/unlike events on one partition, in order.</li>
+  <li><strong>Lag</strong>: counts trail reality by the window plus consumer lag (seconds) — acceptable for a display count.</li>
+</ul>
+
+<h3>5.3 Redis INCR + periodic flush</h3>
+<p>Keep the live counter in <a href="caching.html">Redis</a>: <code>INCR likes:42</code> is atomic, single-threaded and handles ~100k+ ops/s per shard. A background job periodically writes the values to durable storage. Fast and simple, but Redis is memory-first: a failover can lose recent increments (mitigated by AOF persistence and replicas), so run a <strong>reconciliation</strong> job that recounts from the like rows for drifted or hot posts. Many systems combine 5.2 and 5.3: the aggregator updates both the DB and the Redis cache.</p>
+
+<h3>5.4 Approximate counts</h3>
+<ul>
+  <li><strong>Display rounding</strong>: the UI shows "1.2M likes". Being off by a few hundred is invisible; only small numbers need to be exact.</li>
+  <li><strong>HyperLogLog</strong>: estimates <em>unique</em> counts (e.g. unique viewers) in ~12 KB with ~0.8% error, regardless of cardinality.</li>
+  <li><strong>Sampling / probabilistic counters</strong> (e.g. Morris counters) for analytics where exactness doesn't matter.</li>
+</ul>
+
+<h3>5.5 Comparison</h3>
+<div class="table-wrap"><table>
+  <tr><th>Approach</th><th>Write throughput</th><th>Read cost</th><th>Freshness</th><th>Durability / accuracy</th></tr>
+  <tr><td><b>Single row UPDATE</b></td><td>~1k/s per post</td><td>1 row</td><td>Immediate</td><td>Exact; collapses under hot posts</td></tr>
+  <tr><td><b>Sharded counters</b></td><td>~N × 1k/s</td><td>N rows (cache it)</td><td>Immediate</td><td>Exact</td></tr>
+  <tr><td><b>Stream aggregation</b></td><td>Very high (memory)</td><td>1 row/cache</td><td>Seconds behind</td><td>Exact with offset-atomic commits; else reconcile</td></tr>
+  <tr><td><b>Redis INCR + flush</b></td><td>Very high</td><td>1 key</td><td>Immediate in Redis</td><td>Small loss possible on failover; reconcile</td></tr>
+  <tr><td><b>Cassandra counters</b></td><td>High</td><td>1 row</td><td>Immediate</td><td>Not idempotent: a retried increment can double-count</td></tr>
+  <tr><td><b>Approximate (HLL, rounding)</b></td><td>Very high</td><td>Tiny</td><td>Immediate</td><td>Bounded error by design</td></tr>
+</table></div>
+<div class="callout tip"><span class="callout-title">💡 The golden rule</span>
+The <strong>like rows</strong> are the source of truth; the <strong>count</strong> is a derived, cached, possibly-approximate view of them. If the count ever drifts, you can always recompute it from the rows.</div>
+
+<h2>6. Eventual consistency of displayed counts</h2>
+<p>With any of the scalable techniques, the number shown under a post is <strong>eventually consistent</strong>: it may lag the true count by a few seconds, and two viewers may briefly see slightly different numbers (different cache replicas, different refresh times). That's an acceptable trade-off (<a href="cap-consistency.html">CAP &amp; consistency</a>) — with one important exception: <strong>the user's own action must be reflected immediately</strong> (read-your-writes).</p>
+<ul>
+  <li>The app uses <strong>optimistic UI</strong> (<a href="clients.html">Clients</a>): on double-tap it fills the heart and shows <code>count + 1</code> locally before the server responds, rolling back only if the request fails.</li>
+  <li>The "viewer has liked" flag comes from the viewer's own like row (or a per-user cache updated synchronously on write), not from the lagging counter — so refreshing the feed still shows the heart filled.</li>
+  <li>The author's own view of their counts can be refreshed more aggressively than everyone else's.</li>
+</ul>
+
+<h2>7. Idempotency: a like counts once</h2>
+<p>Mobile clients retry, users double-tap twice, and Kafka delivers at least once. Correctness rests on two rules:</p>
+<ol>
+  <li><strong>The like row is idempotent by key.</strong> Inserting <code>(post_id, user_id)</code> twice leaves one row.</li>
+  <li><strong>Counter deltas come from state <em>transitions</em>, not from requests.</strong> Emit +1 only when a row was actually created, −1 only when a row was actually deleted.</li>
+</ol>
+<pre><code>def like(user_id, post_id):
+    with db.transaction():
+        created = db.execute("""INSERT INTO likes (post_id, user_id, created_at)
+                                VALUES (%s, %s, now())
+                                ON CONFLICT (post_id, user_id) DO NOTHING
+                                RETURNING 1""", post_id, user_id)
+        if created:                                    # state changed: not-liked → liked
+            outbox.add("LikeCreated", post_id=post_id, user_id=user_id, delta=+1)
+    return {"liked": True}                             # same response for retries
+
+def unlike(user_id, post_id):
+    with db.transaction():
+        deleted = db.execute("DELETE FROM likes WHERE post_id=%s AND user_id=%s RETURNING 1",
+                             post_id, user_id)
+        if deleted:                                    # liked → not-liked
+            outbox.add("LikeRemoved", post_id=post_id, user_id=user_id, delta=-1)
+    return {"liked": False}</code></pre>
+<ul>
+  <li><strong>Retries and double-taps</strong>: the second insert does nothing and emits nothing → counted once.</li>
+  <li><strong>Like → unlike → like</strong> rapidly: each real transition emits ±1, so the net delta is +1, matching the final state. The client also <strong>debounces</strong> (sends only the final state after ~300 ms of inactivity) to avoid churn.</li>
+  <li><strong>Ordering</strong>: events are keyed by post_id, so a post's events stay in order; even if processed out of order, the sum of ±1 deltas is the same.</li>
+  <li><strong>In stores without conditional inserts</strong> (e.g. Cassandra upserts), check the user's like state first (read-before-write against a cache) or use a lightweight transaction — or let the aggregator compute counts from per-(post,user) state instead of blind increments.</li>
+  <li><strong>Consumer idempotency</strong>: the aggregator dedupes on event ID or commits offsets atomically with deltas.</li>
+</ul>
+<div class="callout danger"><span class="callout-title">🚨 The classic bug</span>
+<code>INSERT like; INCR counter</code> on every request, without checking whether the insert created a row. Retries then inflate counts, and an unlike after a retried like can drive the count negative. Always derive deltas from actual state changes.</div>
+
+<h2>8. "Has the viewer liked this?" for every post in the feed</h2>
+<p>Each feed page shows ~10–20 posts, and every one needs a filled or empty heart. At ~1.2M post renders/s, doing one query per post would be ~1.2M point lookups/s with 20× the round trips. The fix is <strong>batching plus caching</strong>:</p>
+<ol class="steps">
+  <li><strong>One batched lookup per page</strong> against the user-partitioned index: <code>SELECT post_id FROM user_likes WHERE user_id = :viewer AND post_id IN (:p1 … :p20)</code> — one partition, one round trip. (Or a multi-get of 20 <code>(post_id, viewer)</code> keys on the post-partitioned table, issued in parallel.)</li>
+  <li><strong>Cache the viewer's recent likes</strong>: most feed posts are recent, so a per-user cache of liked post IDs from the last ~30 days (a Redis set) answers most lookups in memory, updated on every like/unlike.</li>
+  <li><strong>Exploit that most answers are "no"</strong>: users like a small fraction of what they see. A per-user <strong>Bloom filter</strong> of liked post IDs answers "definitely not liked" without touching storage; only "maybe" answers go to the cache/DB.</li>
+  <li><strong>Assemble in parallel</strong> with other per-post data (counts, author profile, preview comments) when the <a href="news-feed.html">feed service</a> hydrates the page.</li>
+</ol>
+<p>Facebook's TAO exposes exactly this shape of query — <code>assoc_get(viewer, LIKES, [post ids])</code> — answered from its cache tier; see <a href="social-graph.html">Social graph</a>.</p>
+<pre class="ascii">
+Feed page (20 posts) hydration — all in parallel, one round trip each:
+  ├─ posts metadata          multi-get 20 post_ids             (cache → Cassandra)
+  ├─ like / comment counts   multi-get 20 counters             (Redis)
+  ├─ viewer liked?           user_likes(viewer) ∩ {20 ids}     (Bloom → Redis set → DB)
+  ├─ authors                 multi-get ~15 user_ids            (cache → User DB)
+  └─ preview comments        top-2 comments per post           (precomputed cache)
+</pre>
+
+<h2>9. Comments: pagination, ranking and threading</h2>
+<h3>9.1 Pagination</h3>
+<p>A popular post can have hundreds of thousands of comments; the app loads ~20 at a time. Use <strong>cursor (keyset) pagination</strong>, never <code>OFFSET</code>:</p>
+<pre><code>-- first page (newest first)
+SELECT * FROM comments WHERE post_id = 42 AND parent_id IS NULL ORDER BY comment_id DESC LIMIT 20;
+-- next page: cursor = last comment_id seen
+SELECT * FROM comments WHERE post_id = 42 AND parent_id IS NULL AND comment_id &lt; :cursor
+ORDER BY comment_id DESC LIMIT 20;</code></pre>
+<p><code>OFFSET 100000</code> forces the database to walk and discard 100,000 rows; the cursor version seeks directly via the clustering key. Cursors are also stable when new comments arrive (no duplicates or skips). See <a href="api-design.html">API design</a>.</p>
+
+<h3>9.2 Ranking: "top comments"</h3>
+<p>Chronological order on a celebrity post shows mostly spam and emoji. Instagram ranks comments, typically considering:</p>
+<ul>
+  <li><strong>Engagement</strong> on the comment: likes, replies — with time decay so new good comments can rise.</li>
+  <li><strong>Relationship to the viewer</strong>: comments from people you follow or interact with are boosted (personalisation).</li>
+  <li><strong>Author signals</strong>: the post owner's replies, verified accounts, account quality.</li>
+  <li><strong>Integrity classifiers</strong>: likely spam, bullying or low-quality comments are demoted or hidden.</li>
+  <li><strong>Pinned comments</strong>: the post owner can pin a few to the top.</li>
+</ul>
+<p>Implementation: a background job (triggered by comment/like events) maintains a precomputed <strong>top-K list per post</strong> (e.g. 200 comment IDs with scores) in cache; at read time the service lightly re-ranks it with viewer-specific boosts. The <em>first page</em> is ranked; deeper pages can fall back to chronological cursors.</p>
+
+<h3>9.3 Threading</h3>
+<p>Threads are modelled with <code>parent_id</code>. Instagram uses a <strong>shallow, two-level</strong> structure: top-level comments, and replies to a top-level comment (a reply to a reply attaches to the same top-level parent with an @mention). This keeps queries simple:</p>
+<pre><code>top-level:  WHERE post_id = 42 AND parent_id IS NULL          (ranked / paginated)
+replies:    WHERE post_id = 42 AND parent_id = :c ORDER BY comment_id ASC LIMIT 3   ("View 41 more replies")</code></pre>
+<ul>
+  <li>Store <code>reply_count</code> on the parent (a counter maintained like like_count) to render "View N more replies" without counting.</li>
+  <li>Arbitrarily deep trees (Reddit-style) need materialised paths (<code>path = '0001.0007.0003'</code>) or closure tables; Instagram's shallow model avoids that complexity.</li>
+  <li>Deleting a parent shows "comment deleted" placeholders or hides the thread, depending on policy.</li>
+</ul>
+
+<h2>10. Moderation and spam filtering</h2>
+<p>Comments are a major abuse vector (spam links, bots, harassment). Defence happens in layers:</p>
+<div class="table-wrap"><table>
+  <tr><th>Layer</th><th>When</th><th>Examples</th></tr>
+  <tr><td><b>Permission checks</b></td><td>Synchronous, before write</td><td>Commenter blocked by author? Comments turned off? Author limits comments to followers? <a href="rate-limiting.html">Rate limits</a> per user/IP/device</td></tr>
+  <tr><td><b>Author filters</b></td><td>Synchronous</td><td>Hidden-words / keyword lists; "Restrict" (restricted user's comments are visible only to themselves unless approved)</td></tr>
+  <tr><td><b>ML classifiers</b></td><td>Sync (fast model) + async (heavier models)</td><td>Spam, bullying and offensive-comment classifiers (Instagram publicly launched an automatic offensive-comment filter in 2017); duplicate-text detection across many posts (SimHash); link reputation</td></tr>
+  <tr><td><b>Account signals</b></td><td>Async</td><td>Account age, velocity, network of fake accounts</td></tr>
+  <tr><td><b>Human review</b></td><td>Async</td><td>User reports, appeals</td></tr>
+</table></div>
+<p>A comment therefore has a <strong>status</strong> (<code>VISIBLE</code>, <code>PENDING</code>, <code>HIDDEN_BY_FILTER</code>, <code>RESTRICTED</code>, <code>DELETED</code>). Hidden comments are often still visible to their own author ("shadow" visibility), which avoids tipping off spammers. Counts usually include only visible comments, which is another reason counts are maintained by a stream that sees status changes.</p>
+
+<h2>11. Emitting events for notifications and more</h2>
+<p>Every like, unlike and comment is published (via the <a href="microservices.html">outbox</a>) to Kafka. Consumers include:</p>
+<ul>
+  <li><strong><a href="notifications.html">Notification service</a></strong>: "alice liked your post". It <strong>aggregates</strong> ("alice and 23 others liked your post"), waits a few seconds so a quick unlike cancels the notification, rate-limits per recipient, and skips per-like notifications entirely for accounts that receive thousands per minute.</li>
+  <li><strong>Counter aggregator</strong> (section 5.2).</li>
+  <li><strong>Feed and Explore ranking</strong>: engagement is a key signal; real-time features ("this post is getting likes fast") come from the stream (<a href="analytics-ml.html">Analytics &amp; ML</a>).</li>
+  <li><strong>Integrity systems</strong>: detecting like-farms and bot rings by unusual patterns.</li>
+  <li><strong>Analytics / data warehouse</strong>: creator insights, A/B test metrics.</li>
+</ul>
+<pre><code>{ "event_id": "evt-7c1e...", "type": "LikeCreated", "post_id": 42, "post_author_id": 7,
+  "liker_id": 1001, "ts": "2026-10-23T09:20:11Z", "delta": 1 }</code></pre>
+<p>Including <code>post_author_id</code> lets the notification service act without looking the post up.</p>
+
+<h2>12. Viral posts and hot keys</h2>
+<p>A celebrity post creates hot spots on both the <strong>write</strong> and <strong>read</strong> paths:</p>
+<div class="table-wrap"><table>
+  <tr><th>Hot spot</th><th>Symptom</th><th>Mitigation</th></tr>
+  <tr><td>Counter row</td><td>Lock contention, replication lag</td><td>Stream aggregation, sharded counters</td></tr>
+  <tr><td>Likes partition <code>(post_id, …)</code></td><td>One partition gets tens of thousands of inserts/s and grows to tens of millions of rows</td><td>Bucket the key: <code>(post_id, hash(user_id) % N)</code> for hot posts; the user-partitioned index is naturally spread</td></tr>
+  <tr><td>Cache key for count / post</td><td>Millions of reads/s hit one cache server</td><td>Replicate hot keys across servers (<code>likes:42#r7</code>), short-TTL in-process caches on app servers, request coalescing</td></tr>
+  <tr><td>Cache invalidation stampede</td><td>Each update invalidates the key; thousands of readers miss and hit the DB at once</td><td>Don't invalidate per like — refresh on a timer; use leases / single-flight so one request refills</td></tr>
+  <tr><td>Comment list</td><td>Flood of comments and reads on one post</td><td>Precomputed top-K in cache; rate limits; ranking hides the flood</td></tr>
+</table></div>
+<p>Facebook's <em>Scaling Memcache</em> paper (NSDI 2013) describes <strong>leases</strong> for exactly the stampede problem, and Instagram engineers have publicly told the story of a celebrity's post whose likes caused cache-miss storms and expensive like-count queries — fixed by denormalising the count and using memcache leases so only one request recomputes it. See <a href="caching.html">Caching</a>.</p>
+
+<h2>13. Hiding like counts</h2>
+<p>Instagram tested hiding public like counts in several countries in 2019 and in 2021 gave everyone the option to hide like counts on others' posts and on their own posts. System implications:</p>
+<ul>
+  <li><strong>Counts are still computed</strong> — the author sees them, ranking uses them, analytics needs them. Hiding is purely a presentation decision.</li>
+  <li>The decision depends on <strong>two settings</strong>: the viewer's "hide counts on posts I see" preference and the author's per-post "hide like count" flag. The <strong>server</strong> applies them when building the response (omit the number, return "Liked by alice and others"), rather than sending the number and asking the client to hide it — otherwise anyone could read counts from the API response.</li>
+  <li>The setting must be cheap to evaluate per post render: the viewer preference is loaded once per request; the per-post flag lives in post metadata.</li>
+</ul>
+
+<h2>14. How Instagram uses all this</h2>
+<div class="flow">
+  <div class="fnode client">📱 Double-tap<small>optimistic ❤️</small></div><div class="farrow">→</div>
+  <div class="fnode svc">Like &amp; Comment service<small>insert row + outbox</small></div><div class="farrow">→<small>LikeCreated</small></div>
+  <div class="fnode async">Kafka<small>key = post_id</small></div><div class="farrow">→</div>
+  <div class="fnode async">Aggregator / notifications / ML</div><div class="farrow">→</div>
+  <div class="fnode store">Counters (Redis + DB)</div>
+</div>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+In the diagram, the <strong>Like &amp; Comment Service</strong> writes like and comment rows to the post/comment metadata store, keeps hot <strong>counters in the Redis feed cache</strong>, and publishes like/comment events to <strong>Kafka</strong>, consumed by the <strong>Notification Service</strong> and <strong>Analytics &amp; ML</strong>. Public engineering talks (e.g. "Scaling Instagram Infrastructure", QCon 2017) describe the practical lessons: like counts are <strong>denormalised</strong> rather than computed with <code>COUNT(*)</code>, and cache refills for very popular posts are protected with <strong>memcache leases</strong> so a celebrity post doesn't trigger a thundering herd on the database. With public figures of several billion likes per day, the techniques in this lesson are not optional at Instagram's scale.</div>
+<ul>
+  <li><strong>Truth</strong>: like rows keyed by (post, user), mirrored in a user-keyed index for "viewer liked?" lookups.</li>
+  <li><strong>Counts</strong>: derived, aggregated asynchronously, cached, shown rounded ("1.2M"), hidden per user/post settings.</li>
+  <li><strong>Comments</strong>: partitioned by post, cursor-paginated, top comments precomputed and personalised, two-level threads, layered moderation.</li>
+</ul>
+
+<h2>15. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ This design gives you</h4><ul>
+    <li>Write throughput independent of post popularity</li>
+    <li>Exactly-once semantics for the like itself (composite key)</li>
+    <li>Cheap reads: one cached counter, one batched "liked?" lookup per page</li>
+    <li>Decoupled side effects (notifications, ranking, analytics)</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ At the cost of</h4><ul>
+    <li>Counts that lag by seconds and differ slightly between viewers</li>
+    <li>Dual indexes (post- and user-keyed) to keep in sync</li>
+    <li>More moving parts: stream jobs, reconciliation, cache replication</li>
+    <li>Approximate numbers in some views</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong><code>COUNT(*)</code> on the read path</strong> for like or comment counts.</li>
+  <li><strong>Incrementing on every request</strong> instead of on state transitions → inflated or negative counts.</li>
+  <li><strong>Cassandra counters with retries</strong> → double counting (counter updates aren't idempotent).</li>
+  <li><strong>N+1 queries</strong> for "viewer liked?" across a feed page.</li>
+  <li><strong>OFFSET pagination</strong> for comments on huge posts.</li>
+  <li><strong>Invalidating the cached count on every like</strong> of a viral post → cache stampede.</li>
+  <li><strong>Hiding counts only in the client</strong> while the API still returns them.</li>
+  <li><strong>Notification spam</strong>: one push per like for a popular creator.</li>
+</ul>
+
+<h2>16. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>When to use it</th></tr>
+  <tr><td>PostgreSQL / MySQL (sharded) with <code>ON CONFLICT</code>/<code>INSERT IGNORE</code></td><td>Like rows with composite keys and transactional outbox; moderate scale per shard</td></tr>
+  <tr><td>Cassandra / ScyllaDB</td><td>Very high write rates for like and comment rows partitioned by post or user</td></tr>
+  <tr><td>Redis (INCR, sets, HyperLogLog)</td><td>Live counters, per-user liked-set caches, approximate uniques</td></tr>
+  <tr><td>Memcached with leases</td><td>Read-heavy caching of counts and comment lists with stampede protection</td></tr>
+  <tr><td>Apache Kafka + Flink / Kafka Streams / Spark Streaming</td><td>Aggregating like deltas, real-time engagement features</td></tr>
+  <tr><td>Facebook TAO (paper) / graph-style association stores</td><td>Likes as associations with counts and per-viewer lookups at massive scale</td></tr>
+  <tr><td>Firestore / Datastore sharded counters</td><td>Managed-cloud implementation of distributed counters</td></tr>
+  <tr><td>Perspective-style toxicity APIs, in-house classifiers</td><td>Comment moderation and spam detection</td></tr>
+</table></div>
+
+<h2>17. Interview corner</h2>
+<details class="qa"><summary>How would you store likes, and how do you make sure a user can't like a post twice?</summary>
+<p>One row per like with primary key <code>(post_id, user_id)</code> in a store sharded by post_id, plus a reverse table keyed by <code>(user_id, post_id)</code> for "what did I like / did I like these". The composite key makes the like idempotent: a retried or double-tapped like is an insert that does nothing. Only when an insert actually creates a row do we emit LikeCreated (+1); only when a delete actually removes a row do we emit LikeRemoved (−1). The count is derived from those transitions.</p></details>
+<details class="qa"><summary>A celebrity posts and gets 20,000 likes per second. How do you keep the like count working?</summary>
+<p>Don't update a single row per like — its row lock caps throughput around a thousand per second. Write the like rows (spread by a bucketed key for hot posts), publish events to Kafka keyed by post_id, and have an aggregator sum deltas in memory and apply one update every second or two (offsets committed atomically with the delta, or periodic reconciliation). Serve the count from a replicated hot cache key with short TTLs and no per-like invalidation; display it rounded. Alternatives: sharded counter rows (N sub-counters summed on read) or Redis INCR with periodic flush.</p></details>
+<details class="qa"><summary>How do you show whether the viewer liked each of the 20 posts in their feed?</summary>
+<p>One batched query per page against the user-partitioned index (<code>user_id = viewer AND post_id IN (…20…)</code>), executed in parallel with the other hydration calls. Back it with a per-user cache of recently liked post IDs (Redis set), and optionally a per-user Bloom filter, since the vast majority of answers are "not liked". The viewer's own writes update that cache synchronously, giving read-your-writes even though public counts are eventually consistent.</p></details>
+<details class="qa"><summary>How would you paginate and rank comments on a post with 500,000 comments?</summary>
+<p>Comments are partitioned by post_id and clustered by a time-sortable comment_id, with parent_id for two-level threads. Pagination uses cursors (<code>comment_id &lt; :cursor LIMIT 20</code>), never OFFSET. The first page shows "top comments": a background job maintains a scored top-K list per post (likes and replies with time decay, author quality, integrity scores, pinned comments), refreshed on engagement events; at read time it's re-ranked with viewer-specific boosts (comments from people the viewer follows). Replies are loaded lazily per parent with a stored reply_count.</p></details>
+<details class="qa"><summary>Why are displayed like counts eventually consistent, and is that acceptable?</summary>
+<p>Because the count is a derived value updated asynchronously (stream aggregation, cache refresh) to avoid write contention. Users can't perceive a few seconds of lag or a difference of a few likes on large numbers, and the UI rounds large numbers anyway. What must be consistent is the viewer's own action: optimistic UI plus the user's own like row/cached liked-set guarantee read-your-writes. Periodic reconciliation from like rows corrects any drift.</p></details>
+<details class="qa"><summary>How do likes turn into notifications without spamming the author?</summary>
+<p>LikeCreated events go to the notification service via Kafka. It holds them briefly (so a quick unlike cancels), aggregates per (author, post) into "X and N others liked your post", respects user notification preferences, rate-limits per recipient, and for very large accounts stops sending per-like pushes entirely (showing aggregates in the activity feed instead). Deduplication on event_id handles redelivery.</p></details>
+<details class="qa"><summary>What changes in the system when users can hide like counts?</summary>
+<p>Nothing in storage or counting — counts are still maintained for the author, ranking and analytics. The read path applies the viewer's preference and the post's hide flag server-side, omitting the number from the API response and showing "Liked by alice and others" instead. Doing it server-side prevents trivially reading hidden counts from API responses.</p></details>
+
+<h2>18. Check your understanding</h2>
+<details class="quiz"><summary>A counter row's update transaction holds its lock for 2 ms. What's the maximum like rate for that post, and how does a 64-way sharded counter change it?</summary>
+<p>1 / 0.002 s = <strong>500 updates/s</strong> for one row. With 64 sub-counter rows, roughly <strong>64 × 500 = 32,000/s</strong> (if the shards live on rows/nodes that don't contend), at the cost of summing 64 rows on read — which you cache.</p></details>
+<details class="quiz"><summary>A user taps like, the response times out, the app retries, then the user unlikes. With "INSERT like; INCR count" on every request (no transition check), what is the final count delta? With the transition-based design?</summary>
+<p>Naive: +1 (first) +1 (retry) −1 (unlike) = <strong>+1</strong>, but the user doesn't like the post — the count is wrong by one. Transition-based: +1 (row created), 0 (retry inserted nothing), −1 (row deleted) = <strong>0</strong>, matching reality.</p></details>
+<details class="quiz"><summary>Why is <code>OFFSET 50000 LIMIT 20</code> bad for comment pagination, and what's the alternative?</summary>
+<p>The database must read and discard 50,000 rows to return 20, so deep pages get slower and costlier; results also shift as new comments arrive. Keyset/cursor pagination (<code>WHERE comment_id &lt; :last_seen ORDER BY comment_id DESC LIMIT 20</code>) seeks straight to the position and is stable.</p></details>
+<details class="quiz"><summary>With the volume assumptions above, how many like events per second hit Kafka on average, and roughly how many counter writes per second does a 2-second aggregation window produce?</summary>
+<p>5B/day ÷ 86,400 ≈ <strong>58,000 events/s</strong>. Counter writes become ≈ (number of distinct posts liked in each 2-second window) ÷ 2 — far fewer than 58k/s, because popular posts collapse thousands of events into one write. For a single viral post at 20k likes/s: 0.5 writes/s.</p></details>
+<details class="quiz"><summary>Why are Cassandra counter columns risky for likes?</summary>
+<p>Counter increments aren't idempotent: if a write times out and the client retries, the increment may be applied twice, and there's no way to tell. Counts drift upwards. Use idempotent like rows as truth and derive counts, or reconcile periodically.</p></details>
+<details class="quiz"><summary>Scenario: a viral post's cached like count is invalidated on every like. What happens, and what's the fix?</summary>
+<p>Each invalidation makes thousands of concurrent readers miss and recompute/fetch the count from the database at once — a cache stampede that can overload the DB. Instead, refresh the cached value on a short timer (or from the aggregator) without per-like invalidation, use leases/single-flight so only one request refills, and replicate the hot key across cache servers.</p></details>
+<details class="quiz"><summary>Why might a per-user Bloom filter of liked posts be a good fit for the "viewer liked?" check, when it's risky for story seen-state?</summary>
+<p>Here a "maybe liked" answer is <em>verified</em> against the cache/DB before showing a filled heart, so false positives only cost an extra lookup; "definitely not liked" (the common case) skips storage entirely. In story seen-state, a false positive was shown directly to the user as wrong UI state.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li><strong>Like rows keyed by (post_id, user_id) are the truth</strong>; counts are derived, cached and may be approximate.</li>
+    <li>Avoid single-row counters on hot posts: use <strong>sharded counters</strong>, <strong>stream aggregation</strong> or <strong>Redis INCR + flush</strong>, plus reconciliation.</li>
+    <li>Make likes <strong>idempotent</strong>: emit ±1 only on real state transitions; debounce on the client.</li>
+    <li>Answer "viewer liked?" with <strong>one batched lookup per page</strong> backed by per-user caches/Bloom filters.</li>
+    <li>Comments: <strong>cursor pagination</strong>, precomputed <strong>top-K ranking</strong>, shallow <strong>parent_id threads</strong>, layered <strong>moderation</strong>.</li>
+    <li>Publish engagement events for notifications, ranking and analytics; protect viral posts from <strong>hot keys and stampedes</strong>; enforce hidden like counts server-side.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="caching.html">Caching</a> — hot keys, stampedes, leases and Redis data structures</li>
+  <li><a href="message-queues.html">Message Queues &amp; Kafka</a> — the event stream behind counters and notifications</li>
+  <li><a href="sharding.html">Sharding</a> — partition keys and hot partitions</li>
+  <li><a href="notifications.html">Notifications</a> — aggregating "X and others liked your post"</li>
+  <li><a href="news-feed.html">News Feed</a> — where like state and counts are hydrated per post</li>
+  <li><a href="cap-consistency.html">CAP &amp; Consistency</a> — eventual consistency and read-your-writes</li>
+  <li><a href="api-design.html">API Design</a> — idempotency and cursor pagination</li>
+  <li><a href="stories.html">Stories</a> — counting views with the same techniques</li>
+  <li><a href="security.html">Security</a> — abuse and spam prevention</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

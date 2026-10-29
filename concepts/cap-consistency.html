@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CAP Theorem, PACELC &amp; Consistency Models — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="cap-consistency">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li><strong>CAP theorem</strong>: when a network <strong>partition</strong> splits replicas, a distributed store must choose between <strong>Consistency</strong> (every read sees the latest write — linearizability) and <strong>Availability</strong> (every non-failed node answers). Partitions are unavoidable, so the real choice is <strong>CP vs AP</strong> <em>during a partition</em>.</li>
+    <li><strong>PACELC</strong> completes the picture: <em>if Partition</em> choose A or C; <em>Else</em> (normal operation) choose <strong>Latency</strong> or <strong>Consistency</strong> — because keeping replicas in sync costs round trips even when nothing is broken.</li>
+    <li>Consistency is a <strong>spectrum</strong>: linearizable → sequential → causal → session guarantees (read-your-writes, monotonic reads) → eventual. Stronger = more coordination, more latency, less availability.</li>
+    <li><strong>Quorums</strong>: with N replicas, writing to W and reading from R where <strong>R + W &gt; N</strong> makes every read overlap the latest write. Conflicts from concurrent writes are resolved by <strong>last-write-wins</strong>, <strong>vector clocks</strong> or <strong>CRDTs</strong>.</li>
+    <li>Instagram chooses <strong>per feature</strong>: strong for usernames and auth; ordered for DMs; read-your-writes for your own posts; eventual for feeds, likes and follower counts.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why can't every replica always agree?</h2>
+<p>Instagram keeps several copies (<a href="replication.html">replicas</a>) of almost every piece of data — across machines, across availability zones, across regions — so that it survives failures and serves users nearby (see <a href="core-principles.html">Core Principles</a>). The moment there are two copies, a question appears: <strong>when one copy changes, what do readers of the other copy see, and when?</strong></p>
+<p>Copies are kept in sync by sending messages over a network. Messages take time (0.5 ms inside a data centre, ~100 ms between continents), and sometimes they don't arrive at all: a switch fails, a fibre is cut, a misconfigured firewall drops traffic, a garbage-collection pause makes a node look dead. Now consider two Instagram scenarios during such a network failure between the US and EU data centres:</p>
+<ul>
+  <li><strong>Alice (US) and Bob (EU) both try to register the username <code>@sunset</code> at the same moment.</strong> If both data centres say "yes", Instagram now has two accounts with the same username — a correctness bug that is painful to fix. If one data centre says "sorry, try again later", a user sees an error.</li>
+  <li><strong>Carol (EU) likes a post, and Dan (US) looks at the like count.</strong> If Dan sees 1,203 instead of 1,204 for a few seconds, nobody is harmed. Refusing to show Dan the post until the data centres can talk again would be absurd.</li>
+</ul>
+<p>The same infrastructure, two opposite right answers. The CAP theorem explains <em>why</em> you must choose, PACELC explains the cost even when nothing is broken, and consistency models give you precise words for <em>what</em> you are choosing.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  Two branches of a small bank share one ledger, kept in sync by phone. One day the phone line goes dead. A customer walks into branch A and asks to withdraw money. Branch A can either <strong>refuse</strong> ("I can't confirm your balance with branch B right now — come back later") — that's choosing <strong>consistency</strong> over availability; or <strong>allow it</strong> and reconcile when the line is back — choosing <strong>availability</strong>, at the risk that the customer also withdrew at branch B and is now overdrawn. There is no third option that is both always open and never wrong while the phone is dead. And even on a normal day, calling the other branch before every withdrawal makes customers wait (PACELC's latency cost).
+</div>
+
+<h2>2. The CAP theorem, precisely</h2>
+<p>The CAP theorem was proposed as a conjecture by Eric Brewer (2000) and proved by Seth Gilbert and Nancy Lynch (2002). It is about a <strong>distributed data store with replicated data</strong>, and it uses three precise definitions:</p>
+<div class="cards">
+  <div class="card"><h4>C — Consistency</h4><p>Specifically <strong>linearizability</strong>: the system behaves as if there were a single copy of the data, and every read returns the value of the most recent completed write (or a later one). Once anyone has seen a new value, nobody may see an older one.</p></div>
+  <div class="card"><h4>A — Availability</h4><p><strong>Every request received by a non-failing node must eventually receive a non-error response.</strong> Not "most requests", not "the majority side" — every node that is up must answer, without waiting for the partition to heal.</p></div>
+  <div class="card"><h4>P — Partition tolerance</h4><p>The system continues to operate even when the network <strong>drops or delays an arbitrary number of messages</strong> between nodes — i.e., when nodes are split into groups that can't communicate.</p></div>
+</div>
+<p><strong>The theorem:</strong> no distributed system can guarantee all three at once. More usefully: <strong>when a partition happens, you must give up either C or A</strong>.</p>
+
+<h3>2.1 Why it's really "CP or AP", not "pick any two"</h3>
+<p>The popular phrasing "pick two of three" is misleading. Partitions aren't a feature you can decline; in any system that spans more than one machine, networks <em>will</em> fail. A "CA" system — consistent and available but not partition tolerant — only exists on a single node (or a network that never fails, which doesn't exist). So in practice:</p>
+<ul>
+  <li><strong>CP</strong>: during a partition, nodes that can't confirm they have the latest data <strong>refuse</strong> (error or timeout) rather than risk returning stale data or accepting conflicting writes.</li>
+  <li><strong>AP</strong>: during a partition, every node keeps <strong>answering</strong> using whatever data it has, accepting that reads may be stale and writes may conflict; replicas reconcile after the partition heals.</li>
+</ul>
+<p>When there is no partition, a well-built system can provide both C and A. CAP only tells you what must give <strong>during</strong> the failure.</p>
+
+<h3>2.2 A partition scenario, step by step</h3>
+<div class="diagram">
+<svg viewBox="0 0 820 340" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-cap5-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <text x="205" y="22" text-anchor="middle" font-weight="700">CP choice: refuse rather than be wrong</text>
+  <text x="615" y="22" text-anchor="middle" font-weight="700">AP choice: answer, reconcile later</text>
+  <path d="M410,10 L410,330" stroke="#ccc" stroke-dasharray="4 4"/>
+  <g text-anchor="middle">
+    <rect x="25" y="40" width="130" height="36" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="90" y="63">Alice (US)</text>
+    <rect x="255" y="40" width="130" height="36" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="320" y="63">Bob (EU)</text>
+    <rect x="25" y="120" width="130" height="56" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="90" y="143" font-weight="600">Node US</text><text x="90" y="162" font-size="12">has majority</text>
+    <rect x="255" y="120" width="130" height="56" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="320" y="143" font-weight="600">Node EU</text><text x="320" y="162" font-size="12">minority side</text>
+    <rect x="435" y="40" width="130" height="36" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="500" y="63">Alice (US)</text>
+    <rect x="665" y="40" width="130" height="36" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="730" y="63">Bob (EU)</text>
+    <rect x="435" y="120" width="130" height="56" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="500" y="143" font-weight="600">Node US</text><text x="500" y="162" font-size="12">accepts writes</text>
+    <rect x="665" y="120" width="130" height="56" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="730" y="143" font-weight="600">Node EU</text><text x="730" y="162" font-size="12">accepts writes</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-cap5-1)">
+    <path d="M90,76 L90,118"/><path d="M320,76 L320,118"/><path d="M500,76 L500,118"/><path d="M730,76 L730,118"/>
+  </g>
+  <g font-size="11" fill="#555"><text x="96" y="101">claim @sunset</text><text x="326" y="101">claim @sunset</text><text x="506" y="101">claim @sunset</text><text x="736" y="101">claim</text></g>
+  <path d="M155,148 L255,148" stroke="#c62828" stroke-width="2" stroke-dasharray="6 4"/>
+  <path d="M565,148 L665,148" stroke="#c62828" stroke-width="2" stroke-dasharray="6 4"/>
+  <text x="205" y="141" text-anchor="middle" font-size="18" fill="#c62828" font-weight="700">✕</text>
+  <text x="615" y="141" text-anchor="middle" font-size="18" fill="#c62828" font-weight="700">✕</text>
+  <text x="205" y="196" text-anchor="middle" font-size="11" fill="#c62828">partition</text>
+  <text x="615" y="196" text-anchor="middle" font-size="11" fill="#c62828">partition</text>
+  <g font-size="12.5">
+    <text x="25" y="230">✅ Alice: "@sunset is yours" (US has quorum)</text>
+    <text x="25" y="252">❌ Bob: "Error, try again" (EU can't reach</text>
+    <text x="25" y="270">    a quorum, so it must not decide)</text>
+    <text x="25" y="300" font-weight="700">Consistent ✔  ·  Available ✘ (for Bob)</text>
+    <text x="435" y="230">✅ Alice: "@sunset is yours"</text>
+    <text x="435" y="252">✅ Bob: "@sunset is yours"</text>
+    <text x="435" y="270">⚠️ After healing: two owners → conflict!</text>
+    <text x="435" y="300" font-weight="700">Available ✔  ·  Consistent ✘</text>
+  </g>
+  <text x="410" y="330" text-anchor="middle" font-size="12" fill="#555">For usernames Instagram must pick CP; for like counts AP is the better trade.</text>
+</svg>
+<div class="caption">The same partition, two behaviours. Neither side can know whether the other side has accepted a conflicting write.</div>
+</div>
+<p>The proof is essentially this picture. Suppose a partition separates node US from node EU. A client writes to US; then another client reads from EU. EU has two options: answer with whatever it has (possibly stale — violating C), or wait/refuse until it can talk to US (violating A). Since the partition may last arbitrarily long, there is no way to do both.</p>
+
+<h3>2.3 Common misconceptions about CAP</h3>
+<ul>
+  <li><strong>"CAP's C is ACID's C."</strong> No. ACID consistency means "transactions preserve application invariants" (e.g. balances never negative). CAP's C means linearizability — a statement about replicas and recency.</li>
+  <li><strong>"A CP system is usually unavailable."</strong> No. CAP's A is extremely strict: <em>every</em> non-failed node must answer. A CP system like etcd stays fully available on the majority side of a partition; only the minority side refuses. And partitions are rare — most of the time CP systems answer everything.</li>
+  <li><strong>"A whole database is CP or AP."</strong> Often it's per operation. Cassandra lets you choose consistency level per query; DynamoDB offers eventually consistent and strongly consistent reads; you can mix them within one application.</li>
+  <li><strong>"AP means no consistency at all."</strong> AP systems typically provide <em>eventual</em> consistency plus useful session guarantees, and often converge within milliseconds when the network is healthy.</li>
+  <li><strong>"CAP covers everything."</strong> It only describes behaviour <em>during partitions</em> and only one consistency model. It says nothing about latency in normal operation — which is why PACELC exists.</li>
+</ul>
+
+<h2>3. Examples of CP and AP systems</h2>
+<div class="table-wrap"><table>
+  <tr><th>System</th><th>Usually classified as</th><th>What happens during a partition</th><th>Typical use</th></tr>
+  <tr><td>ZooKeeper, etcd, Consul</td><td><b>CP</b></td><td>Majority side (quorum) keeps serving; minority rejects writes (and, for linearizable reads, reads)</td><td>Leader election, configuration, locks, service discovery</td></tr>
+  <tr><td>Google Spanner, CockroachDB</td><td><b>CP</b></td><td>Consensus (Paxos/Raft) per data range; ranges without a majority become unavailable</td><td>Globally consistent transactional data</td></tr>
+  <tr><td>HBase / Bigtable</td><td><b>CP</b></td><td>Each key range served by one server; if it's unreachable, that range is unavailable until reassigned</td><td>Large-scale strongly consistent wide-column data</td></tr>
+  <tr><td>Single-leader SQL (PostgreSQL/MySQL with replicas)</td><td>CP-ish for writes</td><td>Writes only on the leader's side; replicas on the other side can serve stale reads if allowed</td><td>Users, accounts, anything needing uniqueness</td></tr>
+  <tr><td>Cassandra, ScyllaDB</td><td><b>AP</b> by default (tunable)</td><td>Any replica accepts reads/writes at consistency ONE; hinted handoff and repair reconcile later. With QUORUM, the minority side fails requests (more CP-like)</td><td>High-write, always-on data: posts, likes, messages</td></tr>
+  <tr><td>Amazon Dynamo (paper), Riak, DynamoDB (default reads)</td><td><b>AP</b></td><td>Sloppy quorums, hinted handoff; conflicts resolved by vector clocks/LWW</td><td>Shopping carts, session data, high availability key-value</td></tr>
+  <tr><td>DNS</td><td><b>AP</b></td><td>Resolvers keep serving cached (possibly stale) records until TTL expiry</td><td>Name resolution (<a href="dns.html">DNS</a>)</td></tr>
+  <tr><td>CDN edge caches</td><td><b>AP</b></td><td>Serve stale content if the origin is unreachable</td><td>Media delivery (<a href="cdn.html">CDN</a>)</td></tr>
+  <tr><td>Redis replication (async)</td><td>AP-ish</td><td>Replicas serve possibly stale data; a failover can lose recent writes</td><td>Caches, timelines, counters (<a href="caching.html">Caching</a>)</td></tr>
+</table></div>
+
+<h2>4. PACELC: consistency costs latency even without partitions</h2>
+<p>Daniel Abadi proposed <strong>PACELC</strong> (2010, published 2012) to fix CAP's blind spot: partitions are rare, but the trade-off between consistency and <em>latency</em> is paid on every single request.</p>
+<pre><code>if (Partition) { choose Availability or Consistency }
+else           { choose Latency     or Consistency }</code></pre>
+<div class="diagram">
+<svg viewBox="0 0 820 230" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-cap5-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <rect x="320" y="15" width="180" height="44" rx="22" fill="#eceff1" stroke="#455a64"/><text x="410" y="42" text-anchor="middle" font-weight="700">Network partition?</text>
+  <path d="M360,59 L210,100" stroke="#555" stroke-width="1.5" marker-end="url(#ar-cap5-2)" fill="none"/>
+  <path d="M460,59 L610,100" stroke="#555" stroke-width="1.5" marker-end="url(#ar-cap5-2)" fill="none"/>
+  <text x="270" y="78" font-size="12" fill="#c62828" font-weight="700">YES (P)</text>
+  <text x="520" y="78" font-size="12" fill="#2e7d32" font-weight="700">NO (Else)</text>
+  <rect x="95" y="102" width="230" height="40" rx="8" fill="#ffebee" stroke="#c62828"/><text x="210" y="127" text-anchor="middle">Availability or Consistency?</text>
+  <rect x="495" y="102" width="230" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="610" y="127" text-anchor="middle">Latency or Consistency?</text>
+  <g text-anchor="middle" font-size="12">
+    <rect x="40" y="170" width="150" height="44" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="115" y="189">PA: keep answering</text><text x="115" y="206">(Cassandra, Dynamo)</text>
+    <rect x="230" y="170" width="150" height="44" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="305" y="189">PC: refuse minority</text><text x="305" y="206">(Spanner, etcd)</text>
+    <rect x="440" y="170" width="150" height="44" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="515" y="189">EL: answer locally</text><text x="515" y="206">(async replicas)</text>
+    <rect x="630" y="170" width="150" height="44" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="705" y="189">EC: coordinate first</text><text x="705" y="206">(sync replication)</text>
+  </g>
+  <g stroke="#555" stroke-width="1.3" fill="none" marker-end="url(#ar-cap5-2)">
+    <path d="M180,142 L125,168"/><path d="M240,142 L295,168"/><path d="M580,142 L525,168"/><path d="M640,142 L695,168"/>
+  </g>
+</svg>
+<div class="caption">PACELC: the "else" branch is where your system lives 99.9%+ of the time — and where users feel the latency of strong consistency.</div>
+</div>
+<p>Why does consistency cost latency without partitions? To guarantee a read sees the latest write, either the write must be <strong>synchronously</strong> copied to other replicas before it's acknowledged, or the read must <strong>consult</strong> several replicas (or the leader). Both add round trips. Within a data centre that's ~0.5–2 ms; across regions it's ~50–150 ms per round trip. A globally linearizable write from Mumbai with a quorum spanning Virginia and Ireland costs hundreds of milliseconds — a huge price for a like.</p>
+<div class="table-wrap"><table>
+  <tr><th>System</th><th>PACELC (commonly cited)</th><th>Meaning</th></tr>
+  <tr><td>Dynamo, Cassandra, Riak</td><td>PA/EL</td><td>Favour availability during partitions and low latency otherwise; consistency is tunable per request</td></tr>
+  <tr><td>Spanner, VoltDB, HBase/Bigtable</td><td>PC/EC</td><td>Always pay for consistency — refuse during partitions, coordinate (consensus) on normal writes</td></tr>
+  <tr><td>MongoDB (classic configuration)</td><td>PA/EC</td><td>Abadi's classification: consistent reads from the primary in normal operation; behaviour during partitions depends on configuration (majority write concern makes it more PC)</td></tr>
+  <tr><td>Yahoo! PNUTS</td><td>PC/EL</td><td>Low-latency reads normally; gives up availability rather than consistency under partitions</td></tr>
+</table></div>
+<p>Most modern systems are <strong>tunable</strong>, so treat these labels as defaults, not laws. The useful habit is to ask, for each feature: <em>during a partition, would I rather return an error or stale data? And normally, is the extra latency of coordination worth it?</em></p>
+
+<h2>5. The consistency models spectrum</h2>
+<p>"Consistent or not" is too coarse. A <strong>consistency model</strong> is a contract between the data store and its users that says which values a read may return given the history of writes. Models range from strong (easy to reason about, expensive) to weak (cheap and available, harder to reason about).</p>
+<div class="diagram">
+<svg viewBox="0 0 820 230" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs>
+    <linearGradient id="grad-cap5" x1="0" x2="1" y1="0" y2="0"><stop offset="0" stop-color="#c62828" stop-opacity=".35"/><stop offset="1" stop-color="#2e7d32" stop-opacity=".35"/></linearGradient>
+    <marker id="ar-cap5-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker>
+  </defs>
+  <text x="20" y="24" font-size="12" fill="#555">◀ stronger: more coordination, higher latency, less available</text>
+  <text x="800" y="24" font-size="12" fill="#555" text-anchor="end">weaker: faster, more available ▶</text>
+  <rect x="20" y="40" width="780" height="28" rx="14" fill="url(#grad-cap5)"/>
+  <g fill="#333"><circle cx="90" cy="54" r="7"/><circle cx="250" cy="54" r="7"/><circle cx="410" cy="54" r="7"/><circle cx="570" cy="54" r="7"/><circle cx="730" cy="54" r="7"/></g>
+  <g text-anchor="middle" font-weight="700">
+    <text x="90" y="96">Linearizable</text><text x="250" y="96">Sequential</text><text x="410" y="96">Causal</text><text x="570" y="96">Session</text><text x="730" y="96">Eventual</text>
+  </g>
+  <g text-anchor="middle" font-size="11.5" fill="#555">
+    <text x="90" y="114">single copy, real time</text><text x="250" y="114">one global order</text><text x="410" y="114">cause before effect</text><text x="570" y="114">RYW, monotonic reads</text><text x="730" y="114">converges eventually</text>
+  </g>
+  <g text-anchor="middle" font-size="12">
+    <rect x="15" y="130" width="150" height="56" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="90" y="153">claim a username</text><text x="90" y="171">change password</text>
+    <rect x="175" y="130" width="150" height="56" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="250" y="153">messages in a chat</text><text x="250" y="171">in the same order</text>
+    <rect x="335" y="130" width="150" height="56" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="410" y="153">reply never shown</text><text x="410" y="171">before its comment</text>
+    <rect x="495" y="130" width="150" height="56" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="570" y="153">I see my own post;</text><text x="570" y="171">counts never go back</text>
+    <rect x="655" y="130" width="150" height="56" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="730" y="153">like counts, feeds,</text><text x="730" y="171">follower counts</text>
+  </g>
+  <text x="410" y="215" text-anchor="middle" font-size="12" fill="#555">Instagram example for each model (blue boxes). Each model includes the guarantees of the models to its right.</text>
+</svg>
+<div class="caption">The consistency spectrum with an Instagram feature that needs each level.</div>
+</div>
+
+<h3>5.1 Linearizable (strong) consistency</h3>
+<p><strong>Definition:</strong> every operation appears to take effect atomically at a single instant between its start and its end, and all clients agree on that order, which respects real time. Equivalently: the system behaves as if there were one copy of the data. If a write completes before a read starts, the read must see that write (or something newer).</p>
+<p><strong>Instagram scenario — username uniqueness:</strong> Alice's sign-up request claims <code>@sunset</code> and gets "success". From that instant, any other sign-up anywhere in the world must see <code>@sunset</code> as taken. If even one replica could answer "available" after Alice's success, two accounts could get the name.</p>
+<pre class="ascii">
+ time ──────────────────────────────────────────────────────────▶
+ Alice:  |── claim @sunset ──| ✔ success
+ Bob:                            |── is @sunset free? ──|  must answer "taken"
+ Carol:          |──── is @sunset free? ────|            may answer either: it overlaps
+                                                         Alice's write (concurrent)
+</pre>
+<p><strong>How it's implemented:</strong> a single leader for the key (a PostgreSQL primary with a <code>UNIQUE</code> constraint) or a consensus protocol (Raft/Paxos, as in etcd or Spanner). <strong>Cost:</strong> every write coordinates with a leader/majority; unavailable on the minority side of a partition.</p>
+
+<h3>5.2 Sequential consistency</h3>
+<p><strong>Definition:</strong> all clients see all operations in <em>the same single order</em>, and each client's own operations appear in the order it issued them — but that global order need not match real time. (A read may return an older value as long as everyone agrees on the sequence.)</p>
+<p><strong>Instagram scenario — DM conversation ordering:</strong> in a group chat, Ann sends "Dinner at 8?", then Ben replies "Yes!" and Cat replies "Can't, sorry". All three participants must see the messages in <strong>the same order</strong> on every device; it doesn't matter if Cat's phone receives the latest message a second later than Ann's. Implementation: a per-conversation sequence number assigned by one owner (the conversation's partition leader), so the total order is per conversation, not global — see <a href="direct-messaging.html">Direct Messaging</a>.</p>
+
+<h3>5.3 Causal consistency</h3>
+<p><strong>Definition:</strong> operations that are <strong>causally related</strong> (one could have influenced the other — e.g. you read X then wrote Y) are seen by everyone in that order. Operations that are <strong>concurrent</strong> (neither knew about the other) may be seen in different orders by different clients.</p>
+<p><strong>Instagram scenario — comments and replies:</strong> Dan comments "Where is this?" on a photo; the author replies "Lisbon!". The reply was caused by the comment. Under causal consistency, no viewer can ever see "Lisbon!" without "Where is this?". Similarly, if Eve blocks Frank and <em>then</em> posts, Frank must never see that post — the block causally precedes the post. Two unrelated comments by strangers, however, may appear in different orders for different viewers.</p>
+<pre class="ascii">
+ Dan:     write C1 "Where is this?"
+ Author:            read C1 ──▶ write C2 "Lisbon!"      (C1 → C2: causal)
+ Viewer X sees:  C1, C2            ✔
+ Viewer Y sees:  C2 only           ✘ forbidden under causal consistency
+ Viewer Z sees:  nothing yet       ✔ allowed (just not caught up)
+</pre>
+<p>Causal consistency is the strongest model that remains available during partitions (it can be served from local replicas), which makes it attractive for geo-distributed systems. Implementation: track dependencies (version vectors, or "this write depends on version v of that item") and delay making a write visible until its dependencies are visible.</p>
+
+<h3>5.4 Session guarantees: read-your-writes, monotonic reads, monotonic writes</h3>
+<p>These are weaker, per-client guarantees that fix the most user-visible anomalies of eventual consistency cheaply:</p>
+<div class="table-wrap"><table>
+  <tr><th>Guarantee</th><th>Definition</th><th>Instagram anomaly it prevents</th><th>Typical technique</th></tr>
+  <tr><td><b>Read-your-writes</b> (read-after-write)</td><td>A client always sees its own previous writes</td><td>You post a photo, pull to refresh your profile, and it's not there (your read hit a lagging replica)</td><td>Read from the leader for a short window after writing; or pass the write's version and wait for a replica that has it</td></tr>
+  <tr><td><b>Monotonic reads</b></td><td>Once a client has seen a value, it never later sees an older one</td><td>A like count shows 1,204, then 1,198 on refresh, then 1,205 (different replicas)</td><td>Pin a user's session to one replica; or carry the last-seen version</td></tr>
+  <tr><td><b>Monotonic writes</b></td><td>A client's writes are applied in the order it issued them</td><td>You change your bio twice; the first edit overwrites the second</td><td>Per-client sequence numbers; route a user's writes to one leader</td></tr>
+  <tr><td><b>Writes-follow-reads</b></td><td>A write made after reading X is ordered after X</td><td>Your reply appears in a replica that doesn't yet have the comment you replied to</td><td>Attach dependency versions to writes (a slice of causal consistency)</td></tr>
+</table></div>
+
+<h3>5.5 Eventual consistency</h3>
+<p><strong>Definition:</strong> if no new writes are made to an item, all replicas will <em>eventually</em> return the same value. No promise about <em>when</em>, and no promise about what you see in the meantime. In healthy systems "eventually" usually means milliseconds to seconds.</p>
+<p><strong>Instagram scenarios:</strong> your friend's new post appears in your feed a few seconds after it was published (asynchronous fan-out through Kafka); a post's like count lags by a second; a celebrity's follower count is approximate; a new account becomes searchable after the indexer catches up. None of these hurt users, and all of them would be expensive to make strongly consistent at Instagram's write rates.</p>
+<p>A stronger variant, <strong>strong eventual consistency</strong>, adds: any two replicas that have received the same set of updates are in the same state — no matter the order received. That's what CRDTs provide (section 8.3).</p>
+
+<h2>6. Quorums: tuning consistency with R + W &gt; N</h2>
+<p>Leaderless stores like Cassandra and Dynamo-style systems let you tune consistency per request with <strong>quorums</strong>. Each key is stored on <strong>N</strong> replicas. A write is acknowledged once <strong>W</strong> replicas confirm it; a read queries <strong>R</strong> replicas and returns the newest version among their answers.</p>
+<pre><code>If R + W &gt; N, every read set overlaps every write set in at least one replica,
+so a read always contacts at least one replica holding the latest acknowledged write.</code></pre>
+<div class="diagram">
+<svg viewBox="0 0 820 230" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <text x="410" y="22" text-anchor="middle" font-weight="700">N = 3, W = 2, R = 2  →  R + W = 4 &gt; 3: read and write sets must overlap</text>
+  <g text-anchor="middle">
+    <circle cx="230" cy="120" r="44" fill="#fff8e1" stroke="#f9a825" stroke-width="2"/><text x="230" y="116" font-weight="700">Replica A</text><text x="230" y="134" font-size="12">likes = 1,204</text>
+    <circle cx="410" cy="120" r="44" fill="#fff8e1" stroke="#f9a825" stroke-width="2"/><text x="410" y="116" font-weight="700">Replica B</text><text x="410" y="134" font-size="12">likes = 1,204</text>
+    <circle cx="590" cy="120" r="44" fill="#fff8e1" stroke="#f9a825" stroke-width="2"/><text x="590" y="116" font-weight="700">Replica C</text><text x="590" y="134" font-size="12">likes = 1,203</text>
+  </g>
+  <rect x="170" y="60" width="300" height="120" rx="20" fill="none" stroke="#2e7d32" stroke-width="2.5" stroke-dasharray="7 4"/>
+  <rect x="350" y="52" width="300" height="136" rx="20" fill="none" stroke="#0277bd" stroke-width="2.5"/>
+  <text x="170" y="200" font-size="12" fill="#2e7d32" font-weight="700">write set (W=2): A, B</text>
+  <text x="650" y="200" font-size="12" fill="#0277bd" font-weight="700" text-anchor="end">read set (R=2): B, C</text>
+  <text x="410" y="222" text-anchor="middle" font-size="12" fill="#555">B is in both sets → the read sees 1,204 (newest version wins); C is repaired in the background (read repair).</text>
+</svg>
+<div class="caption">Quorum overlap. C missed the write (it was slow or briefly down) but the read still returns the latest value.</div>
+</div>
+<div class="table-wrap"><table>
+  <tr><th>Configuration (N = 3)</th><th>R + W &gt; N?</th><th>Behaviour</th><th>Good for</th></tr>
+  <tr><td>W = 1, R = 1 (Cassandra ONE)</td><td>No (2)</td><td>Fastest, most available; reads may be stale</td><td>Like events, view counters, analytics</td></tr>
+  <tr><td>W = 2, R = 2 (QUORUM/QUORUM)</td><td>Yes (4)</td><td>Reads see latest acknowledged write (with caveats below); tolerates 1 replica down</td><td>Post metadata, comments, DM messages</td></tr>
+  <tr><td>W = 3, R = 1 (ALL / ONE)</td><td>Yes (4)</td><td>Fast reads; writes fail if any replica is down</td><td>Rarely-written, read-heavy data</td></tr>
+  <tr><td>W = 1, R = 3 (ONE / ALL)</td><td>Yes (4)</td><td>Fast writes; reads fail if any replica is down</td><td>Rarely used</td></tr>
+</table></div>
+<p>Across regions, Cassandra offers <code>LOCAL_QUORUM</code> (majority within the local data centre — low latency, PA/EL behaviour across regions) vs <code>EACH_QUORUM</code> (majority in every data centre — consistent across regions, but pays cross-region latency and fails if a region is cut off).</p>
+<div class="callout warn"><span class="callout-title">⚠️ Quorums are not automatically linearizable</span>
+R + W &gt; N is necessary but not sufficient for strong consistency. Edge cases: <strong>sloppy quorums</strong> (writes accepted by stand-in nodes during failures, so the overlap guarantee breaks), <strong>concurrent writes</strong> resolved by last-write-wins with skewed clocks (a "newer" write can silently lose), a write that <strong>failed</strong> on some replicas but succeeded on others (not rolled back), and reads racing with in-progress writes. Truly linearizable operations need consensus — e.g. Cassandra's lightweight transactions (Paxos-based compare-and-set) for "insert username if not exists". See <a href="replication.html">Replication</a> for the full mechanics.</div>
+
+<h2>7. ACID vs BASE</h2>
+<p>Two philosophies for data stores, often contrasted:</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>ACID (traditional relational transactions)</th><th>BASE (many NoSQL / AP systems)</th></tr>
+  <tr><td><b>Stands for</b></td><td><b>A</b>tomicity (all or nothing), <b>C</b>onsistency (invariants preserved), <b>I</b>solation (concurrent transactions don't interfere), <b>D</b>urability (committed data survives crashes)</td><td><b>B</b>asically <b>A</b>vailable, <b>S</b>oft state (state may change without input as replicas converge), <b>E</b>ventual consistency</td></tr>
+  <tr><td><b>Priority</b></td><td>Correctness of every transaction</td><td>Availability and scale; correctness converges over time</td></tr>
+  <tr><td><b>Scaling</b></td><td>Easiest on one node; distributed ACID needs consensus/2PC (costly)</td><td>Partition and replicate freely</td></tr>
+  <tr><td><b>Anomalies</b></td><td>Prevented (to the chosen isolation level)</td><td>Stale reads, conflicts — application must tolerate or resolve</td></tr>
+  <tr><td><b>Examples</b></td><td>PostgreSQL, MySQL, Spanner, CockroachDB</td><td>Cassandra, DynamoDB (default), Riak, CouchDB</td></tr>
+  <tr><td><b>Instagram data</b></td><td>Users, usernames, credentials, account settings</td><td>Posts, likes, comments, timelines, counters, messages</td></tr>
+</table></div>
+<p>Note that <strong>isolation</strong> (the I in ACID) has its own spectrum: read committed → repeatable read / snapshot isolation → serializable. Many databases default to weaker levels than serializable for performance, which allows anomalies like lost updates or write skew — a reminder that "ACID" is not a binary label. (Details in <a href="databases.html">Databases</a>.)</p>
+
+<h2>8. Conflict resolution: when replicas disagree</h2>
+<p>In AP (and multi-leader) systems, two replicas can accept <strong>concurrent</strong> writes to the same item. After the partition heals, the system must decide the final value. Three main approaches:</p>
+
+<h3>8.1 Last-write-wins (LWW)</h3>
+<p>Attach a timestamp to every write; when versions conflict, keep the one with the highest timestamp and discard the rest. Simple, and the default in Cassandra (per column).</p>
+<pre><code>Replica US: bio = "Photographer 📷"   ts = 10:00:00.120
+Replica EU: bio = "Traveller ✈️"       ts = 10:00:00.115
+After merge → "Photographer 📷"  (EU's write is silently discarded)</code></pre>
+<p><strong>Problems:</strong> concurrent writes are <em>lost</em>, not merged; and clocks on different machines drift — if the EU server's clock is 50 ms ahead, its <em>earlier</em> write wins. LWW is fine when losing a concurrent write is acceptable (a profile bio edited from two devices at the same instant) or when writes are naturally unique (each like is its own row keyed by (post_id, user_id), so there's nothing to overwrite).</p>
+
+<h3>8.2 Vector clocks (version vectors)</h3>
+<p>A <strong>vector clock</strong> stores, per item, a counter for each replica that has modified it. Comparing two vectors tells you whether one version <strong>happened before</strong> the other or whether they are <strong>concurrent</strong> (a true conflict).</p>
+<pre class="ascii">
+ start:       bio v = {US:1}                          "Photographer"
+ US updates:  {US:2}          "Photographer 📷"
+ EU updates (concurrently, from {US:1}):  {US:1, EU:1}  "Traveller ✈️"
+
+ compare {US:2} vs {US:1, EU:1}:
+   US: 2 &gt; 1   but   EU: 0 &lt; 1   → neither dominates → CONCURRENT → conflict!
+   → keep both "siblings" and let the application (or user) merge them
+
+ compare {US:2, EU:1} vs {US:1, EU:1}:
+   every entry ≥  → the first is strictly newer → safe to discard the second
+</pre>
+<p>Vector clocks never lose a concurrent write silently, but they push merge logic to the application and add metadata per item. The original Amazon Dynamo used them (for shopping carts, merging by union — which famously could resurrect deleted items).</p>
+
+<h3>8.3 CRDTs (Conflict-free Replicated Data Types)</h3>
+<p><strong>CRDTs</strong> are data structures designed so that concurrent updates can always be merged automatically and deterministically: the merge is commutative, associative and idempotent, so replicas that have seen the same updates converge to the same state regardless of order (strong eventual consistency).</p>
+<ul>
+  <li><strong>G-Counter</strong> (grow-only counter): each replica keeps its own count; merge = element-wise max; value = sum. A view counter incremented in US and EU never loses increments.</li>
+  <li><strong>PN-Counter</strong>: two G-counters, one for increments and one for decrements (likes and unlikes); value = P − N.</li>
+  <li><strong>OR-Set</strong> (observed-remove set): supports add and remove with "add wins" semantics for concurrent add/remove — e.g. the set of users who liked a post, or members of a group chat.</li>
+  <li><strong>LWW-Register, multi-value register, sequence CRDTs</strong> (for collaborative text editing).</li>
+</ul>
+<pre><code># G-Counter for a post's view count, replicated in two regions
+US = {"US": 1000, "EU": 0}       # US has counted 1,000 views locally
+EU = {"US": 0,    "EU": 500}     # EU has counted 500 views locally
+
+merge(a, b) = {r: max(a[r], b[r]) for r in a | b}
+merge(US, EU) = {"US": 1000, "EU": 500}   → value = 1,500   (no lost increments,
+                                             and merging twice changes nothing)</code></pre>
+<p>Redis Enterprise (active-active), Riak and Azure Cosmos DB offer CRDT-based types. The trade-off: only certain operations fit the CRDT mould (you can't enforce "username unique" with a CRDT — uniqueness is inherently a coordination problem), and metadata can grow.</p>
+
+<h2>9. Practical techniques: getting "consistent enough" cheaply</h2>
+<p>Most real systems run on eventually consistent replicas and add targeted techniques where users would notice anomalies.</p>
+<h3>9.1 Read-your-writes by reading from the leader after a write</h3>
+<p>With leader–follower replication, followers lag the leader by milliseconds to seconds. To make sure a user sees their own changes:</p>
+<pre><code>def update_profile(user_id, fields):
+    leader_db.update(user_id, fields)
+    session.set("recent_write_until", now() + 10s)      # remember this user just wrote
+
+def get_profile(viewer_id, profile_id):
+    # the author sees their own profile from the leader for a short window;
+    # everyone else (and the author after the window) reads from a nearby replica
+    if viewer_id == profile_id and now() &lt; session.get("recent_write_until", 0):
+        return leader_db.get(profile_id)
+    return replica_db.get(profile_id)</code></pre>
+<p>Variations:</p>
+<ul>
+  <li><strong>Version/LSN tokens:</strong> the write returns the leader's log position (e.g. PostgreSQL LSN); the client sends it with its next read; the server reads from any replica that has replayed past that position, or waits briefly, or falls back to the leader. More precise than a fixed time window.</li>
+  <li><strong>Always read "own" data from the leader:</strong> e.g. your own settings page. Cheap if such reads are a small fraction of traffic.</li>
+  <li><strong>Client-side read-your-writes:</strong> the app inserts your new post or comment into the UI locally (optimistic UI) and reconciles with the server later. Instagram's heart turning red instantly is exactly this — the UI doesn't wait for the server, let alone for replicas.</li>
+  <li><strong>Write-through cache update:</strong> after writing a post, the Upload Service also updates the author's cached profile grid directly, so the author's next read hits fresh data even if the fan-out pipeline is behind.</li>
+</ul>
+<h3>9.2 Monotonic reads via stickiness</h3>
+<p>Route a given user's reads to the same replica (hash the user ID to a replica) so they never "go back in time" by bouncing between replicas with different lag. If that replica fails, re-pinning may cause one backwards step — acceptable for counts.</p>
+<h3>9.3 Strong consistency only where it's needed</h3>
+<ul>
+  <li><strong>Unique claims</strong> (usernames, email addresses): a single-leader database with a <code>UNIQUE</code> constraint, or a compare-and-set via consensus. Keep the strongly consistent part tiny — just the claim — and replicate the rest asynchronously.</li>
+  <li><strong>Leases and fencing tokens</strong> for exclusive ownership (e.g. which WebSocket gateway "owns" a user's connection; which worker processes a partition).</li>
+  <li><strong>Idempotency keys</strong> make retries safe under at-least-once delivery, so duplicates don't become inconsistencies (one like per (user, post), one message per client-generated message ID).</li>
+</ul>
+<h3>9.4 Bounded staleness and invalidation</h3>
+<p>Caches are another source of staleness. Use short TTLs for data that changes, explicit invalidation on writes (delete the cache key after updating the DB), and versioned keys for immutable data (as with <a href="cdn.html">CDN</a> URLs). Public papers from Facebook describe techniques such as <em>leases</em> in memcache to prevent stale sets and thundering herds — see <a href="caching.html">Caching</a>.</p>
+
+<h2>10. How Instagram chooses consistency per feature</h2>
+<p>This table is the heart of the lesson — the answer interviewers want when they ask "what consistency does your design provide?"</p>
+<div class="table-wrap"><table>
+  <tr><th>Feature</th><th>Consistency model</th><th>Mechanism in the diagram</th><th>Justification</th></tr>
+  <tr><td><b>Username uniqueness</b></td><td>Linearizable (CP)</td><td>User DB (PostgreSQL) primary with <code>UNIQUE</code> index on the shard owning the username (or a dedicated username→user_id table); sign-up fails rather than duplicating during failover</td><td>Duplicates are a correctness bug; sign-ups are rare (~tens per second), so the latency/availability cost is negligible</td></tr>
+  <tr><td><b>Authentication, password change, session revocation</b></td><td>Strong for writes; revocations propagate fast</td><td>User/Auth Service on the PostgreSQL primary; short-lived access tokens + server-side revocation list checked at the API Gateway</td><td>Security: a stolen session must stop working everywhere promptly</td></tr>
+  <tr><td><b>Privacy settings &amp; blocks</b></td><td>Read-your-writes + fast propagation; fail closed</td><td>Written to the primary; checked at read time on feed/profile/comments, not only at fan-out time</td><td>Leaking a post to a blocked user is harmful; better to hide content when unsure</td></tr>
+  <tr><td><b>Likes count</b></td><td>Eventual; approximate OK</td><td>Like rows in Cassandra (idempotent per user); counts aggregated asynchronously via Kafka into Redis counters</td><td>~58K likes/s; hot posts get millions of likes; nobody notices if "1.2M" lags by a second</td></tr>
+  <tr><td><b>"Did I like this?"</b></td><td>Read-your-writes</td><td>Optimistic UI on the client + read from the user's own like record</td><td>The heart must not flicker back to grey after you tap it</td></tr>
+  <tr><td><b>Home feed</b></td><td>Eventual (seconds); causal where cheap</td><td>Kafka → Fan-out Workers → Redis timelines; hydration from caches</td><td>Freshness of seconds is invisible; strong consistency would require synchronous fan-out to hundreds of followers</td></tr>
+  <tr><td><b>Your own new post on your profile</b></td><td>Read-your-writes</td><td>Upload Service writes metadata synchronously (quorum) and updates the author's profile cache directly; client shows it optimistically</td><td>"I posted and it's not there" looks like a bug</td></tr>
+  <tr><td><b>Follower / following counts</b></td><td>Eventual; approximate for large accounts</td><td>Graph store edges are the truth; counts maintained asynchronously</td><td>Celebrity counts change thousands of times per minute; "512M" needn't be exact</td></tr>
+  <tr><td><b>Follow / unfollow edge itself</b></td><td>Read-your-writes for the actor</td><td>Write to Graph store; actor's view served from the primary/fresh cache</td><td>After tapping "Follow", the button must stay "Following"</td></tr>
+  <tr><td><b>DM ordering</b></td><td>Total order per conversation (sequential within a chat); at-least-once delivery + dedupe</td><td>Messages Store partitioned by conversation_id; per-conversation sequence numbers; client message IDs for idempotency</td><td>Out-of-order messages change meaning; duplicates are confusing</td></tr>
+  <tr><td><b>Comments and replies</b></td><td>Causal where possible; eventual otherwise</td><td>Replies reference parent comment ID; clients/servers hide replies whose parent isn't loaded yet</td><td>A reply without its parent is confusing; strict global order isn't needed</td></tr>
+  <tr><td><b>Stories</b></td><td>Eventual; expiry enforced at read time</td><td>Stories metadata with TTL; tray built asynchronously; reads filter <code>expires_at &lt; now</code></td><td>A story appearing a second late is fine; showing an expired story is not</td></tr>
+  <tr><td><b>Search index</b></td><td>Eventual (seconds–minutes)</td><td>Kafka → Search Indexer → Elasticsearch</td><td>Indexing synchronously would slow every write</td></tr>
+</table></div>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram (and Meta)</span>
+Public engineering material gives a good picture of these trade-offs at Meta scale. Facebook's <strong>TAO</strong> paper (USENIX ATC 2013), describing the store for the social graph, explains that TAO favours availability and performance: it is <em>eventually consistent</em> across regions, provides <em>read-after-write consistency within a single cache tier</em>, and lets specific reads be marked as critical so they go to the primary region. The <strong>"Scaling Memcache at Facebook"</strong> paper (NSDI 2013) describes leases to avoid stale cache sets and <em>remote markers</em> to reduce the chance a user reads stale data from a replica region right after writing — a read-your-writes technique. Instagram's own talks describe <strong>PostgreSQL</strong> (single-leader per shard, strong constraints) for core relational data and <strong>Cassandra</strong> (tunable, highly available) for high-volume data such as feeds and activity. Exactly the per-feature split in the table above.</div>
+<div class="flow">
+  <div class="fnode client">Tap "Like"<small>heart red instantly</small></div><div class="farrow">→<small>optimistic UI</small></div>
+  <div class="fnode svc">Like service<small>idempotent write</small></div><div class="farrow">→<small>quorum</small></div>
+  <div class="fnode store">Cassandra<small>like row</small></div><div class="farrow">→<small>event</small></div>
+  <div class="fnode async">Kafka</div><div class="farrow">→<small>~seconds</small></div>
+  <div class="fnode store">Redis counter<small>eventually 1,205</small></div>
+</div>
+
+<h2>11. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Strong consistency (CP / EC)</h4><ul>
+    <li>Easy to reason about: behaves like one copy</li>
+    <li>No conflicts, no anomalies, no merge logic</li>
+    <li>Required for uniqueness, ownership, money, security</li>
+  </ul>
+  <h4>✅ Weak/eventual consistency (AP / EL)</h4><ul>
+    <li>Low latency: answer from the nearest replica</li>
+    <li>Stays up during partitions and regional outages</li>
+    <li>Scales writes across regions</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs of strong consistency</h4><ul>
+    <li>Coordination latency on every write (cross-region: 100+ ms)</li>
+    <li>Unavailable on the minority side of a partition</li>
+    <li>Leader/consensus bottlenecks; lower write throughput</li>
+  </ul>
+  <h4>⚠️ Costs of eventual consistency</h4><ul>
+    <li>Stale reads, anomalies users can notice</li>
+    <li>Conflict resolution logic (LWW loses data; vector clocks push merges to apps)</li>
+    <li>Harder testing and debugging</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>"We'll be CA."</strong> Not an option for a distributed system — partitions happen. Say what happens <em>during</em> a partition.</li>
+  <li><strong>One consistency level for everything.</strong> Strong everywhere is slow and fragile; eventual everywhere leaks into correctness bugs (duplicate usernames). Choose per feature.</li>
+  <li><strong>Confusing CAP-C with ACID-C</strong>, or "eventual" with "never".</li>
+  <li><strong>Assuming R + W &gt; N means linearizable.</strong> Sloppy quorums, LWW with clock skew and partial failures break it.</li>
+  <li><strong>Trusting wall clocks</strong> to order events across machines. Use logical clocks, version vectors, sequence numbers from a single owner, or bounded-uncertainty clocks (Spanner's TrueTime).</li>
+  <li><strong>Forgetting the read path after a write</strong>: a user writes to the leader then reads from a lagging replica → "my change disappeared". Add read-your-writes.</li>
+  <li><strong>Forgetting caches and search indexes</strong> are replicas too — they have their own staleness.</li>
+  <li><strong>Silent data loss via LWW</strong> for data where concurrent updates are meaningful (counters as a single overwritten field instead of increments/CRDTs).</li>
+</ul>
+
+<h2>12. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>Consistency offered</th><th>When to use it</th></tr>
+  <tr><td>PostgreSQL / MySQL (single leader + replicas)</td><td>Strong on the leader (ACID); replicas are eventually consistent (async) or synchronous if configured</td><td>Uniqueness, transactions, relational data (Instagram users)</td></tr>
+  <tr><td>etcd, ZooKeeper, Consul</td><td>Linearizable (Raft / Zab consensus)</td><td>Leader election, locks, configuration, small critical metadata</td></tr>
+  <tr><td>Google Spanner, CockroachDB, YugabyteDB</td><td>Linearizable / serializable distributed transactions</td><td>Global strongly consistent data; willing to pay coordination latency</td></tr>
+  <tr><td>Cassandra, ScyllaDB</td><td>Tunable per query (ONE, QUORUM, LOCAL_QUORUM, ALL); LWW; lightweight transactions (Paxos) for CAS</td><td>High-volume, always-on writes (posts, likes, messages)</td></tr>
+  <tr><td>Amazon DynamoDB</td><td>Eventually consistent reads by default; strongly consistent reads optional (single region); transactions; global tables use LWW across regions</td><td>Managed key-value at scale</td></tr>
+  <tr><td>Riak, Redis Enterprise active-active, Azure Cosmos DB</td><td>CRDTs / multi-region conflict resolution; Cosmos DB offers five levels (strong, bounded staleness, session, consistent prefix, eventual)</td><td>Multi-region writes needing automatic merges</td></tr>
+  <tr><td>Kafka</td><td>Total order per partition; replicated log with configurable acks</td><td>Ordering per key (e.g. per conversation) and durable event streams</td></tr>
+  <tr><td>Redis (async replication)</td><td>Eventual; failover may lose recent writes</td><td>Caches, counters, timelines — derived, rebuildable data</td></tr>
+</table></div>
+
+<h2>13. Interview corner</h2>
+<details class="qa"><summary>Explain the CAP theorem precisely.</summary>
+<p>For a replicated data store, you can't simultaneously guarantee Consistency (linearizability — every read sees the latest completed write, as if there were one copy), Availability (every request to a non-failed node gets a non-error response) and Partition tolerance (correct operation despite arbitrary message loss between nodes). Since networks do partition, the practical meaning is: during a partition, each operation must either be refused/delayed on the side that can't coordinate (CP) or answered with possibly stale or conflicting data (AP). Without a partition, you can have both — but you pay latency for consistency, which is what PACELC adds.</p></details>
+<details class="qa"><summary>Is Instagram CP or AP?</summary>
+<p>Neither as a whole — it's chosen per feature. Username registration, authentication and privacy-critical writes are CP: they go through a single leader with constraints and fail rather than risk inconsistency. Feeds, likes, view and follower counts, search and stories are AP/eventually consistent: they keep working from local replicas during failures and converge within seconds. DMs need per-conversation ordering, implemented by partitioning messages by conversation and assigning sequence numbers at one owner.</p></details>
+<details class="qa"><summary>What is PACELC and why does it matter more day-to-day than CAP?</summary>
+<p>PACELC: if Partitioned, choose Availability or Consistency; Else choose Latency or Consistency. Partitions are rare, but every request pays the "else" trade-off: strong consistency requires synchronous replication or multi-replica reads — extra round trips, 100+ ms across regions. For Instagram's likes, paying cross-region latency on every tap would be absurd (EL); for username claims it's fine because they're rare and correctness matters (EC).</p></details>
+<details class="qa"><summary>A user updates their bio and immediately sees the old one. Why, and how do you fix it?</summary>
+<p>The write went to the leader but the read was served by a follower replica (or a cache) that hasn't caught up — a read-your-writes violation under asynchronous replication. Fixes: route the user's reads of their own profile to the leader for a short window after a write; or return the write's log position and only read from replicas past it; invalidate/update the cache entry on write; and update the UI optimistically on the client.</p></details>
+<details class="qa"><summary>With N = 3, which R and W would you choose for Instagram comments, and why?</summary>
+<p>QUORUM writes and reads (W = 2, R = 2, R + W = 4 &gt; 3) within the local region (LOCAL_QUORUM): a comment is visible to subsequent quorum reads, the system tolerates one replica failure per region, and latency stays local. Cross-region replication is asynchronous, so a viewer in another region may see the comment a moment later — acceptable. For like events I'd use W = 1 since counts are aggregated asynchronously anyway.</p></details>
+<details class="qa"><summary>How would you resolve conflicting writes to a post's like count in an active-active multi-region setup?</summary>
+<p>Don't store the count as a single overwritten value — LWW would lose increments. Either store each like as its own idempotent record keyed by (post_id, user_id) and derive the count by aggregation, or use a CRDT counter (PN-counter: per-region increment and decrement counters, merged by element-wise max and summed). Both converge without coordination and never lose a like. Uniqueness of "one like per user" comes from the record key, not from coordination.</p></details>
+<details class="qa"><summary>What's the difference between linearizability and serializability?</summary>
+<p>Linearizability is a recency guarantee on single objects/operations: each operation appears to happen instantaneously at some point between its invocation and response, respecting real time. Serializability is an isolation guarantee for multi-object transactions: the result equals <em>some</em> serial order of the transactions, which need not match real time. "Strict serializability" combines both (Spanner provides it). CAP's C is linearizability; ACID's I at its strongest is serializability.</p></details>
+<details class="qa"><summary>Why can't you implement username uniqueness with an AP store and a CRDT?</summary>
+<p>Uniqueness is a global invariant that requires knowing that nobody else claimed the name concurrently — inherently a coordination problem. An AP store lets both sides of a partition accept "@sunset", and CRDTs can only merge, not reject, so you'd end up with two owners. You need a single authority or consensus (a leader with a UNIQUE constraint, or a Paxos/Raft compare-and-set) and must accept that claims fail when that authority is unreachable.</p></details>
+
+<h2>14. Check your understanding</h2>
+<details class="quiz"><summary>During a partition, a CP store's minority-side node receives a read. What does it do?</summary>
+<p>It returns an error or blocks/times out (for linearizable reads), because it can't be sure it has the latest value. The majority side keeps serving normally.</p></details>
+<details class="quiz"><summary>Numeric: N = 5. Which of these guarantee read/write overlap: (a) W=3,R=3 (b) W=2,R=3 (c) W=5,R=1 (d) W=1,R=4?</summary>
+<p>Overlap requires R + W &gt; 5. (a) 6 ✔ (b) 5 ✘ (c) 6 ✔ (d) 5 ✘.</p></details>
+<details class="quiz"><summary>Numeric: N = 3, W = 2, R = 2. How many replicas can be down while reads and writes still succeed?</summary>
+<p><strong>One.</strong> Both need 2 of 3 replicas. With two down, neither a write quorum nor a read quorum can be formed.</p></details>
+<details class="quiz"><summary>Which consistency model is violated: you see a reply "Lisbon!" but not the comment "Where is this?" it replies to?</summary>
+<p><strong>Causal consistency</strong> — the reply causally depends on the comment, so it must not be visible without it.</p></details>
+<details class="quiz"><summary>Which guarantee is violated: a like count shows 1,204, then 1,198 after refresh?</summary>
+<p><strong>Monotonic reads</strong> — the second read came from a replica that was further behind. Fix by pinning the user to one replica or carrying the last-seen version.</p></details>
+<details class="quiz"><summary>Vector clocks: version X = {US:3, EU:1}, version Y = {US:2, EU:2}. Which is newer?</summary>
+<p>Neither: US 3 &gt; 2 but EU 1 &lt; 2, so they are <strong>concurrent</strong> — a genuine conflict that must be merged (or resolved by policy).</p></details>
+<details class="quiz"><summary>Scenario: you use LWW for a profile field and the EU server's clock runs 200 ms fast. What can go wrong?</summary>
+<p>An EU write made up to 200 ms <em>before</em> a US write can still carry a later timestamp and win, so the newer US update is silently discarded. LWW correctness depends on clock synchronisation; it also loses all but one of any truly concurrent writes.</p></details>
+<details class="quiz"><summary>G-Counter: replica A = {A:7, B:2}, replica B = {A:5, B:4}. What is the merged state and value?</summary>
+<p>Element-wise max: {A:7, B:4} → value <strong>11</strong>. Merging again (or in the other order) gives the same result — that's what makes it conflict-free.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li><strong>CAP</strong>: during a partition choose <strong>C (refuse)</strong> or <strong>A (answer possibly stale)</strong>. "CA" isn't a real option for distributed systems; CAP's C is linearizability, not ACID's C.</li>
+    <li><strong>PACELC</strong>: without partitions you still trade <strong>latency vs consistency</strong> on every request.</li>
+    <li>Consistency spectrum: <strong>linearizable → sequential → causal → session (RYW, monotonic) → eventual</strong>.</li>
+    <li><strong>R + W &gt; N</strong> gives overlap, not full linearizability; conflicts need <strong>LWW, vector clocks or CRDTs</strong>.</li>
+    <li>Instagram: <strong>strong</strong> for usernames/auth, <strong>ordered</strong> for DMs, <strong>read-your-writes</strong> for your own actions, <strong>eventual</strong> for feeds, likes, counts, search and stories.</li>
+    <li>Get "consistent enough" cheaply: read from the leader after a write, sticky replicas, idempotency keys, optimistic UI.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="replication.html">Replication</a> — leader/follower, multi-leader, leaderless quorums and replication lag in depth</li>
+  <li><a href="databases.html">Databases: SQL vs NoSQL</a> — ACID, isolation levels and choosing a store</li>
+  <li><a href="sharding.html">Sharding</a> — how partitioning interacts with consistency (cross-shard operations)</li>
+  <li><a href="core-principles.html">Core Principles</a> — availability, redundancy and failover</li>
+  <li><a href="likes-comments.html">Likes, Comments &amp; Counters</a> — eventual counters in practice</li>
+  <li><a href="direct-messaging.html">Direct Messaging</a> — per-conversation ordering and delivery guarantees</li>
+  <li><a href="multi-region.html">Multi-Region Architecture</a> — consistency across regions and active-active writes</li>
+  <li><a href="caching.html">Caching</a> — cache staleness, invalidation and leases</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

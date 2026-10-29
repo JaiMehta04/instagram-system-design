@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clients: Mobile &amp; Web Apps — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="clients">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>The <strong>client</strong> (iOS app, Android app, web app) is the first and last component of every request — and the one you control least: it runs on slow, flaky, battery-powered devices you do not own, in versions you cannot force-update.</li>
+    <li>Instagram is a <strong>thick client</strong>: it caches aggressively (memory + disk image caches, a local database), renders <strong>optimistically</strong> (a like appears instantly and is rolled back if the server refuses), and keeps a <strong>persistent upload queue</strong> so posts survive lost signal and app restarts.</li>
+    <li>It loads the feed with <strong>cursor pagination</strong> and infinite scroll, <strong>prefetches</strong> the next posts, stories and video segments, and picks the right <strong>image rendition and format</strong> (size, WebP/AVIF, progressive JPEG, tiny placeholders) for the screen and network.</li>
+    <li>It is <strong>network-frugal</strong>: reused connections, batched requests, push notifications and a persistent real-time connection instead of polling.</li>
+    <li>Because millions of phones run old versions, APIs must stay <strong>backward compatible</strong>, features ship behind <strong>server-side flags</strong>, and a <strong>forced upgrade</strong> is the last resort.</li>
+    <li>Client <strong>telemetry</strong> (startup time, scroll jank, image load time, crashes) is how you know whether the whole system is actually fast for real users.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why does the client deserve its own lesson?</h2>
+<p>Most system design discussions start at the load balancer and stop at the database. But the user never sees your database — they see an app on a phone. Every millisecond you save in the backend can be thrown away by a client that opens six new connections, downloads a 4&nbsp;MB image for a 360-pixel-wide thumbnail, or blocks the screen while waiting for a "like" to be confirmed.</p>
+<p>Consider what Instagram's app must survive every day:</p>
+<ul>
+  <li><strong>Hostile networks.</strong> A user in a Mumbai local train flips between 4G, 3G and no signal every few minutes. Round-trip times jump from 40&nbsp;ms to 800&nbsp;ms; packets get lost; connections die silently.</li>
+  <li><strong>Limited devices.</strong> A budget Android phone may have 2–3&nbsp;GB of RAM shared with the OS and other apps, a slow CPU, and a nearly full storage chip.</li>
+  <li><strong>Battery and data budgets.</strong> If Instagram drains the battery or eats a prepaid data plan, people uninstall it.</li>
+  <li><strong>Version skew.</strong> On any given day, hundreds of millions of devices run dozens of different app versions — some months old. The backend must serve all of them correctly.</li>
+  <li><strong>Perceived speed.</strong> Users judge speed by what they see: does the feed appear instantly on open? Does the heart turn red the moment I tap? Does the next Reel start without a spinner?</li>
+</ul>
+<p>The client is therefore a genuine <em>distributed system component</em>: it has caches, queues, retries, consistency decisions and versioning problems, exactly like the backend. Designing it well is often the cheapest way to make the whole product feel fast.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  Think of a travelling journalist filing stories from remote villages. A <strong>thin</strong> journalist phones the newsroom for every fact and can do nothing when the line is down. A <strong>thick</strong> journalist carries a notebook of background facts (cache), writes the story offline, stamps it "pending" (optimistic UI), keeps a stack of sealed envelopes to post whenever a post office appears (upload queue), and reads ahead in tomorrow's schedule (prefetching). The newsroom (backend) still owns the truth — but the journalist stays productive even when the phone line crackles.
+</div>
+
+<h2>2. Thin vs thick clients</h2>
+<p>A <strong>client</strong> is any program that sends requests to your servers on behalf of a user. Clients sit on a spectrum:</p>
+<ul>
+  <li>A <strong>thin client</strong> does almost nothing locally. It sends input to the server and displays whatever the server returns. Classic examples: a server-rendered website with no JavaScript, a remote desktop session, or a dumb terminal. All logic and state live on the server.</li>
+  <li>A <strong>thick (fat) client</strong> holds significant logic and state locally: it caches data, validates input, renders UI from raw data, works offline and synchronises with the server later. Native mobile apps, desktop email clients and modern single-page web apps are thick clients.</li>
+</ul>
+
+<div class="table-wrap"><table>
+  <tr><th></th><th>Thin client</th><th>Thick client</th></tr>
+  <tr><td><b>Where logic runs</b></td><td>Server</td><td>Mostly on the device; server is the source of truth</td></tr>
+  <tr><td><b>Offline capability</b></td><td>None</td><td>Read cached content, queue writes</td></tr>
+  <tr><td><b>Perceived latency</b></td><td>Every action waits for a round trip</td><td>Instant UI from cache and optimistic updates</td></tr>
+  <tr><td><b>Shipping changes</b></td><td>Deploy the server — everyone gets it instantly</td><td>Needs an app release; old versions linger for months</td></tr>
+  <tr><td><b>Device requirements</b></td><td>Low</td><td>Needs memory, storage and CPU</td></tr>
+  <tr><td><b>Consistency</b></td><td>Simple — one copy of state</td><td>Local state can be stale or conflict with the server</td></tr>
+  <tr><td><b>Security</b></td><td>Logic hidden on server</td><td>Code can be reverse-engineered; never trust the client</td></tr>
+</table></div>
+
+<p>Real products blend the two. Instagram's apps are thick (local caches, offline queue, optimistic UI, on-device rendering and video playback), but some screens use <strong>server-driven UI</strong>: the server sends a description of what to render ("a carousel with these three cards"), which lets the team change layouts without an app release. The guiding rule is: <strong>the client owns the experience; the server owns the truth.</strong> Anything that matters for correctness or security — whether a user may view a private profile, how many likes a post has, whether a comment is spam — is decided by the backend. The client may <em>predict</em> outcomes, but the server decides them.</p>
+
+<div class="callout warn"><span class="callout-title">⚠️ Never trust the client</span>
+Every request can be forged with a script; the app's code can be decompiled. Authentication, authorisation, rate limits and validation must all happen server-side, at the <a href="api-gateway.html">API Gateway</a> and in the services. Client-side validation is a UX nicety only. See <a href="authentication.html">Authentication</a> and <a href="rate-limiting.html">Rate limiting</a>.</div>
+
+<h2>3. Mobile constraints: designing for the real world</h2>
+
+<h3>3.1 Flaky and slow networks</h3>
+<p>Two numbers describe a network: <strong>latency</strong> (how long a round trip takes, the <em>RTT</em>) and <strong>bandwidth</strong> (how many bytes per second flow once data is moving). On mobile, latency usually hurts more than bandwidth, because a typical API call needs several round trips (DNS lookup, TCP handshake, TLS handshake, the request itself — see <a href="networking-basics.html">Networking basics</a>).</p>
+<div class="table-wrap"><table>
+  <tr><th>Network</th><th>Typical RTT to a nearby server (assumption)</th><th>Typical usable bandwidth</th><th>Notes</th></tr>
+  <tr><td>Wi-Fi / fibre</td><td>10–40 ms</td><td>20–500 Mbps</td><td>Usually good, but congested public Wi-Fi can be awful</td></tr>
+  <tr><td>5G</td><td>15–40 ms</td><td>50–1000 Mbps</td><td>Coverage still patchy; frequent fallbacks to 4G</td></tr>
+  <tr><td>4G / LTE</td><td>30–100 ms</td><td>5–50 Mbps</td><td>The workhorse network for most users</td></tr>
+  <tr><td>3G</td><td>100–500 ms</td><td>0.5–3 Mbps</td><td>Still common in rural areas and emerging markets</td></tr>
+  <tr><td>2G / EDGE</td><td>300–1000 ms</td><td>50–200 kbps</td><td>A single feed image can take seconds</td></tr>
+</table></div>
+<p>Design consequences:</p>
+<ul>
+  <li><strong>Minimise round trips</strong>, not just bytes: reuse connections, batch requests, return everything a screen needs in one response.</li>
+  <li><strong>Assume every request can fail or hang</strong>: set timeouts, retry idempotent requests with exponential backoff (see <a href="resilience-patterns.html">Resilience patterns</a>), and show cached content while waiting.</li>
+  <li><strong>Adapt to measured conditions</strong>: the app continuously estimates bandwidth (bytes received ÷ time) and latency, and uses that estimate to pick image sizes, video bitrates and how aggressively to prefetch.</li>
+</ul>
+
+<h3>3.2 Battery: the radio is the expensive part</h3>
+<p>The cellular radio is one of the most power-hungry components in a phone. Cellular radios have a power <strong>state machine</strong>: an idle low-power state, and a high-power "connected" state used while sending or receiving. Crucially, after a transfer finishes the radio <em>stays</em> in a high-power state for a "tail" period — often several seconds, in case more data arrives — before dropping back to idle.</p>
+<pre class="ascii">
+ power
+   ^        transfer      tail (radio stays hot, ~5-15 s)
+   |       ┌────────┐────────────────────┐
+   |       │########│....................│
+   |  idle │########│....................│ idle
+   +───────┘        └────────────────────└──────────────────&gt; time
+           ^ wake-up costs latency (100 ms - 2 s) AND energy
+</pre>
+<p>That means <strong>ten tiny requests spaced 20 seconds apart</strong> can cost far more energy than one request carrying the same data, because each one pays the wake-up and tail cost. Battery-friendly clients therefore:</p>
+<ul>
+  <li><strong>Batch</strong> non-urgent traffic (analytics events, read receipts, prefetches) and send it together, ideally while the radio is already awake for a user-initiated request.</li>
+  <li><strong>Avoid polling</strong>; rely on push notifications (section 11).</li>
+  <li><strong>Defer heavy work</strong> (uploading large videos, syncing caches) to moments when the device is charging or on Wi-Fi, using OS schedulers like Android <code>WorkManager</code> and iOS <code>BGTaskScheduler</code> / background <code>URLSession</code>.</li>
+  <li><strong>Limit CPU/GPU work</strong>: decoding huge images, running animations off-screen and re-rendering lists unnecessarily all burn battery.</li>
+</ul>
+
+<h3>3.3 Data cost</h3>
+<p>For many users, especially in emerging markets, mobile data is prepaid and expensive relative to income. Assume a user scrolls 100 feed images at ~200&nbsp;KB each and watches 10 minutes of Reels at ~1&nbsp;Mbps:</p>
+<pre><code>images: 100 × 200 KB            = 20 MB
+video : 10 min × 60 s × 1 Mbps  = 600 Mbit = 75 MB
+total ≈ 95 MB per session  →  on a 1 GB/day plan that is ~10% of the day's data</code></pre>
+<p>That is why apps offer a <strong>data saver</strong> mode (lower-resolution renditions, no video autoplay or preloading on cellular), use efficient formats (WebP/AVIF save 25–50% versus JPEG), and never download the same bytes twice (disk cache). Meta also ships lightweight apps such as <strong>Instagram Lite</strong>, publicly described as a much smaller Android app aimed at low-end devices and slow networks.</p>
+
+<h3>3.4 Memory and storage</h3>
+<p>Images are small on the wire but huge in memory. A compressed JPEG is decoded into an uncompressed <strong>bitmap</strong> before it can be drawn, typically 4 bytes per pixel (red, green, blue, alpha):</p>
+<pre><code>1080 × 1350 pixels × 4 bytes = 5,832,000 bytes ≈ 5.8 MB in RAM
+the same image as a JPEG on the wire ≈ 150–250 KB      → ~25–40× bigger once decoded
+20 such images held in memory ≈ 117 MB</code></pre>
+<p>Operating systems kill apps that use too much memory (Android's low-memory killer, iOS jetsam). So clients <strong>downsample</strong> while decoding (decode a 1080px image at 540px for a thumbnail grid → ¼ the memory), keep a <strong>bounded LRU memory cache</strong> (e.g. ~⅛ to ¼ of the app's memory budget), and recycle views in long lists (<code>RecyclerView</code> on Android, <code>UICollectionView</code> cell reuse on iOS) so only on-screen rows hold bitmaps. Disk is also finite: caches need a size cap and eviction, and the app should respond when the OS reports low storage.</p>
+
+<div class="cards">
+  <div class="card"><h4>📶 Network</h4><p>High, variable latency and loss. Minimise round trips, time out, retry, adapt quality.</p></div>
+  <div class="card"><h4>🔋 Battery</h4><p>Radio wake-ups and tails dominate. Batch, push instead of poll, defer heavy work.</p></div>
+  <div class="card"><h4>💸 Data</h4><p>Bytes cost money. Right-size renditions, modern formats, data saver, never re-download.</p></div>
+  <div class="card"><h4>🧠 Memory</h4><p>Decoded bitmaps are huge. Downsample, bounded LRU caches, recycle views.</p></div>
+</div>
+
+<h2>4. Client-side caching</h2>
+<p>A <strong>cache</strong> is a fast copy of data kept closer to where it is used. The client has several cache layers, each slower but larger than the one before. The goal: when the user opens the app, scrolls back up, or revisits a profile, the content appears <em>without</em> a network request.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 230" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-clients-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <rect x="20" y="75" width="125" height="80" rx="8" fill="#e1f5fe" stroke="#0277bd"/>
+  <text x="82" y="110" text-anchor="middle" font-weight="600">📱 Feed screen</text>
+  <text x="82" y="128" text-anchor="middle" font-size="11">needs data + images</text>
+  <rect x="190" y="30" width="160" height="50" rx="8" fill="#e1f5fe" stroke="#0277bd"/>
+  <text x="270" y="51" text-anchor="middle" font-weight="600">Memory cache</text>
+  <text x="270" y="68" text-anchor="middle" font-size="11">decoded bitmaps (LRU)</text>
+  <rect x="405" y="30" width="160" height="50" rx="8" fill="#e1f5fe" stroke="#0277bd"/>
+  <text x="485" y="51" text-anchor="middle" font-weight="600">Disk image cache</text>
+  <text x="485" y="68" text-anchor="middle" font-size="11">encoded JPEG/WebP</text>
+  <rect x="625" y="30" width="170" height="50" rx="8" fill="#fff3e0" stroke="#ef6c00"/>
+  <text x="710" y="51" text-anchor="middle" font-weight="600">CDN edge</text>
+  <text x="710" y="68" text-anchor="middle" font-size="11">media bytes</text>
+  <rect x="190" y="150" width="160" height="50" rx="8" fill="#e1f5fe" stroke="#0277bd"/>
+  <text x="270" y="171" text-anchor="middle" font-weight="600">In-memory store</text>
+  <text x="270" y="188" text-anchor="middle" font-size="11">parsed post models</text>
+  <rect x="405" y="150" width="160" height="50" rx="8" fill="#e1f5fe" stroke="#0277bd"/>
+  <text x="485" y="171" text-anchor="middle" font-weight="600">Local DB + HTTP cache</text>
+  <text x="485" y="188" text-anchor="middle" font-size="11">SQLite: feed, drafts</text>
+  <rect x="625" y="150" width="170" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/>
+  <text x="710" y="171" text-anchor="middle" font-weight="600">API</text>
+  <text x="710" y="188" text-anchor="middle" font-size="11">LB → Gateway → Feed</text>
+  <g stroke="#555" stroke-width="1.5" marker-end="url(#ar-clients-1)" fill="none">
+    <path d="M145,100 L188,60"/><path d="M145,130 L188,170"/>
+    <path d="M350,55 L403,55"/><path d="M565,55 L623,55"/>
+    <path d="M350,175 L403,175"/><path d="M565,175 L623,175"/>
+  </g>
+  <g font-size="11" fill="#555" text-anchor="middle">
+    <text x="377" y="47">miss</text><text x="594" y="47">miss</text>
+    <text x="377" y="167">miss</text><text x="594" y="167">miss</text>
+    <text x="270" y="100">~0.1 ms</text><text x="485" y="100">~5–20 ms</text><text x="710" y="100">50–500 ms</text>
+    <text x="270" y="220">~0.1 ms</text><text x="485" y="220">~1–10 ms</text><text x="710" y="220">100–800 ms</text>
+  </g>
+</svg>
+<div class="caption">Two cache hierarchies on the device: one for media bytes (top), one for API data (bottom). Each miss falls through to a slower, larger layer and finally the network.</div>
+</div>
+
+<h3>4.1 Memory image cache</h3>
+<p>Holds <strong>decoded, ready-to-draw bitmaps</strong> keyed by URL plus target size. A hit costs microseconds and avoids both disk I/O and the CPU cost of JPEG decoding. It is small (tens to a couple of hundred MB) and uses <strong>LRU (least-recently-used) eviction</strong>: when full, the bitmap that hasn't been shown for the longest time is dropped. When the OS signals memory pressure, the app trims this cache first.</p>
+
+<h3>4.2 Disk image cache</h3>
+<p>Holds the <strong>compressed bytes</strong> exactly as downloaded from the <a href="cdn.html">CDN</a>, typically capped at a few hundred MB, also LRU. A hit avoids the network entirely — critical for scrolling back up the feed, reopening the app on a train, or viewing a profile grid you saw yesterday. Because Instagram media URLs are <strong>content-versioned and immutable</strong> (a changed image gets a new URL), the disk cache never needs to check freshness: if the URL is in the cache, the bytes are correct. The only complication is that signed CDN URLs carry expiry parameters, so the cache key should be the stable part of the URL (the media ID + rendition), not the full signed query string.</p>
+<p>Meta's open-source Android image library <strong>Fresco</strong> was built around exactly these layers (an encoded-memory cache, a bitmap cache and a disk cache, plus careful memory management on older Android versions).</p>
+
+<h3>4.3 HTTP cache</h3>
+<p>Both mobile networking stacks (OkHttp, <code>URLSession</code>) and browsers implement the standard HTTP cache: responses are stored according to <code>Cache-Control</code>, <code>ETag</code> and <code>Last-Modified</code> headers. For API responses that can be revalidated, the client sends <code>If-None-Match: "etag"</code> and the server replies <code>304 Not Modified</code> with no body if nothing changed — one round trip, almost no bytes. Personalised API responses are usually <code>Cache-Control: private</code>, meaning <em>this device</em> may cache them but shared caches (CDNs, proxies) must not.</p>
+
+<h3>4.4 Local database</h3>
+<p>For structured data — the last-seen feed page, your own profile, the DM inbox, drafts, the pending-upload queue — apps use an on-device database: <strong>SQLite</strong> directly or through wrappers such as Room (Android) and Core Data / GRDB (iOS). It survives app restarts, supports queries ("unread threads sorted by time"), and allows the UI to render from local data while the network catches up. This leads to the common <strong>"cache-then-network" (stale-while-revalidate)</strong> pattern:</p>
+<ol class="steps">
+  <li>App opens → immediately render the feed stored in the local DB (maybe 2 hours old). The screen is never blank.</li>
+  <li>In parallel, request fresh feed from the API.</li>
+  <li>When fresh data arrives, merge it: insert new posts at the top (or show a "New posts" pill rather than jumping the scroll position), update counters, drop deleted posts.</li>
+  <li>Write the fresh data back to the local DB for next time.</li>
+</ol>
+
+<div class="table-wrap"><table>
+  <tr><th>Layer</th><th>Stores</th><th>Typical size</th><th>Survives restart?</th><th>Freshness strategy</th></tr>
+  <tr><td>Memory image cache</td><td>Decoded bitmaps</td><td>50–200 MB</td><td>No</td><td>Immutable URLs → never stale</td></tr>
+  <tr><td>Disk image cache</td><td>Encoded JPEG/WebP/video segments</td><td>100–500 MB</td><td>Yes</td><td>Immutable URLs → never stale; LRU eviction</td></tr>
+  <tr><td>HTTP cache</td><td>Raw HTTP responses</td><td>10–50 MB</td><td>Yes</td><td><code>Cache-Control</code>, ETag revalidation</td></tr>
+  <tr><td>Local DB</td><td>Feed, profiles, inbox, drafts, upload queue</td><td>10–200 MB</td><td>Yes</td><td>Show stale, refresh in background, server wins</td></tr>
+</table></div>
+
+<div class="callout tip"><span class="callout-title">💡 What not to cache (or cache carefully)</span>
+Auth tokens belong in the OS secure store (iOS Keychain, Android Keystore-backed storage), not in a plain cache. On logout or account switch, wipe per-user caches so the next user doesn't see the previous user's DMs. When a user blocks someone or a post is deleted, the server's response must be able to <em>remove</em> items from the local cache — design the sync protocol to carry deletions ("tombstones"), not only additions.</div>
+
+<h2>5. Optimistic UI</h2>
+<p><strong>Optimistic UI</strong> means updating the screen <em>as if</em> the server had already accepted the action, then reconciling when the real response arrives. It works because most actions (likes, follows, saves, comments) succeed &gt;99% of the time. Waiting a full round trip — maybe 300&nbsp;ms on 4G, 2&nbsp;s on a bad connection — before turning the heart red would make the app feel sluggish.</p>
+
+<pre class="ascii">
+ User            App (UI + local state)                  API → Like service
+  | tap ♥             |                                        |
+  |-----------------&gt; | 1. heart turns red, count 41 → 42      |
+  |   (instant)       | 2. store pending op {id: op-7f3, like} |
+  |                   |--- POST /posts/123/like  (op-7f3) ----&gt;|
+  |                   |                                        | 3. write like (idempotent)
+  |                   |&lt;------------------ 200 {likes: 57} ----| 
+  |                   | 4. reconcile: count = 57 (server wins) |
+  |                                                            |
+  | ─── failure case ──────────────────────────────────────────|
+  |                   |--- POST /posts/123/like ------------&gt;  X timeout / 403
+  |                   | retry with backoff (same op-7f3) ...   |
+  |                   | gives up → ROLLBACK: heart grey, 41,   |
+  |                   |   toast "Couldn't like. Tap to retry"  |
+</pre>
+
+<h3>5.1 Making optimistic updates safe</h3>
+<ul>
+  <li><strong>Keep the previous state</strong> so you can roll back exactly (not "decrement by one", which breaks if other updates arrived meanwhile).</li>
+  <li><strong>Make the request idempotent.</strong> Retrying a like must not create two likes. Either the operation is naturally idempotent (<code>PUT /posts/123/likes/me</code> — "the like exists"), or the client sends an <strong>idempotency key</strong> (<code>op-7f3</code>) the server deduplicates on. See <a href="api-design.html">API design</a>.</li>
+  <li><strong>Server wins on reconcile.</strong> The response carries the authoritative state (liked = true, like count = 57). The client overwrites its guess. Counts are only ever approximate anyway — see <a href="likes-comments.html">Likes &amp; counters</a>.</li>
+  <li><strong>Coalesce rapid toggles.</strong> A user who taps like/unlike/like in one second should produce one final request ("liked"), not three racing ones whose responses could arrive out of order. Debounce briefly, or attach a client sequence number so stale responses are ignored.</li>
+  <li><strong>Roll back visibly but gently</strong> for user-visible content (a comment that failed shows a "Not posted · Tap to retry" label instead of silently disappearing).</li>
+</ul>
+
+<pre><code>// simplified optimistic like
+function onLikeTapped(post) {
+  const before = { liked: post.liked, count: post.likeCount };
+  const opId = uuid();                       // idempotency key
+  store.update(post.id, { liked: !before.liked,
+                          likeCount: before.count + (before.liked ? -1 : 1),
+                          pendingOp: opId });
+  api.setLike(post.id, !before.liked, { idempotencyKey: opId })
+     .then(server =&gt; {
+        if (store.get(post.id).pendingOp !== opId) return;   // a newer tap superseded us
+        store.update(post.id, { liked: server.liked, likeCount: server.likeCount, pendingOp: null });
+     })
+     .catch(err =&gt; {
+        if (isRetryable(err)) return outbox.enqueue(opId, ...);  // keep optimistic state, retry later
+        store.update(post.id, { ...before, pendingOp: null });   // rollback
+        toast("Couldn't like this post");
+     });
+}</code></pre>
+
+<div class="callout warn"><span class="callout-title">⚠️ When NOT to be optimistic</span>
+Don't fake outcomes that are expensive to undo or that the user must be certain about: payments, deleting an account, changing a password, or making a private account public. For these, show a progress state and wait for the server.</div>
+
+<h2>6. Offline mode and the persistent upload queue</h2>
+<h3>6.1 Reading offline</h3>
+<p>With the cache layers above, an offline app can still show the last-loaded feed, profiles you visited, your DM history and anything in the disk image cache. The UI should clearly but quietly indicate staleness ("No internet connection" banner) and disable actions that truly need the network (search, loading new comments).</p>
+
+<h3>6.2 Writing offline: the outbox pattern</h3>
+<p>Writes — posting a photo, sending a DM, liking, commenting — go into a <strong>persistent outbox</strong>: a table in the local DB where each row is one pending operation with an idempotency key, payload, attempt count and next-retry time. A background worker drains it whenever the network is available. Because the queue is <em>persistent</em>, it survives the app being killed, the phone rebooting, or the user switching to another app.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 260" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-clients-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600">
+    <rect x="20" y="40" width="120" height="50" rx="25" fill="#e1f5fe" stroke="#0277bd"/><text x="80" y="70" text-anchor="middle">QUEUED</text>
+    <rect x="215" y="40" width="140" height="50" rx="25" fill="#e8f5e9" stroke="#2e7d32"/><text x="285" y="70" text-anchor="middle">UPLOADING</text>
+    <rect x="430" y="40" width="150" height="50" rx="25" fill="#f3e5f5" stroke="#6a1b9a"/><text x="505" y="70" text-anchor="middle">CONFIRMING</text>
+    <rect x="660" y="40" width="130" height="50" rx="25" fill="#e8f5e9" stroke="#2e7d32"/><text x="725" y="70" text-anchor="middle">DONE ✔</text>
+    <rect x="215" y="175" width="140" height="50" rx="25" fill="#fff3e0" stroke="#ef6c00"/><text x="285" y="205" text-anchor="middle">WAIT (backoff)</text>
+    <rect x="430" y="175" width="150" height="50" rx="25" fill="#eceff1" stroke="#455a64"/><text x="505" y="205" text-anchor="middle">FAILED ✖</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" marker-end="url(#ar-clients-2)" fill="none">
+    <path d="M140,65 L213,65"/><path d="M355,65 L428,65"/><path d="M580,65 L658,65"/>
+    <path d="M270,90 L270,173"/><path d="M215,200 C120,200 80,150 80,92"/>
+    <path d="M300,90 L300,173" stroke-dasharray="4 3"/>
+    <path d="M355,200 L428,200"/>
+  </g>
+  <g font-size="11" fill="#555">
+    <text x="150" y="58">network ok</text><text x="362" y="58">bytes sent</text><text x="586" y="58">201 Created</text>
+    <text x="196" y="135" text-anchor="end">retryable error</text>
+    <text x="306" y="135">timeout</text>
+    <text x="20" y="245">timer fires / network back</text>
+    <text x="392" y="245" text-anchor="middle">max attempts, or 4xx (e.g. 403)</text>
+  </g>
+</svg>
+<div class="caption">Lifecycle of one item in the persistent upload queue. Retryable errors loop through an exponential backoff wait; permanent errors end in FAILED with a "retry / discard" option for the user.</div>
+</div>
+
+<h3>6.3 Retries done right</h3>
+<ul>
+  <li><strong>Exponential backoff with jitter.</strong> Wait 1&nbsp;s, 2&nbsp;s, 4&nbsp;s, 8&nbsp;s… up to a cap (say 5 minutes), each multiplied by a random factor. Jitter prevents millions of phones that lost signal at the same moment (say, a cell tower outage) from all retrying in perfect sync and hammering the backend — a self-inflicted DDoS called a <em>retry storm</em>.</li>
+  <li><strong>Distinguish error types.</strong> Network errors, timeouts, <code>429 Too Many Requests</code> and <code>5xx</code> are retryable (respect <code>Retry-After</code>). <code>400</code>/<code>403</code>/<code>413</code> are not — retrying won't change the answer.</li>
+  <li><strong>Listen for connectivity changes</strong> rather than polling: when the OS says the network is back, wake the queue immediately.</li>
+  <li><strong>Idempotency</strong> again: the server may have committed a post right before the connection dropped. Retrying with the same client-generated key returns the existing post instead of creating a duplicate.</li>
+  <li><strong>Ordering</strong>: some operations depend on others (you cannot comment on a post that hasn't been created yet). Keep per-object FIFO order in the queue, or record dependencies.</li>
+</ul>
+
+<h3>6.4 Uploading big media reliably</h3>
+<p>A 60-second Reel can be 30–100&nbsp;MB. Restarting from zero after a dropped connection at 95% would be cruel on a slow network. The client therefore uses <strong>resumable, chunked uploads</strong>: the file is split into chunks (e.g. 1–8&nbsp;MB); each chunk is uploaded and acknowledged; after a failure the client asks the server "what offset do you have?" and continues from there. Uploads go directly to storage using <strong>pre-signed URLs</strong> issued by the <a href="media-upload.html">Upload Service</a>, so the media bytes never pass through the API servers. The client also <strong>pre-processes</strong> before upload: it resizes the photo to the maximum size the server will keep (Instagram's well-known limit is around 1080px wide for feed photos), strips unnecessary metadata, and compresses — turning a 12-megapixel, 5&nbsp;MB camera photo into a few hundred KB.</p>
+<p>On iOS, background <code>URLSession</code> upload tasks are handed to the OS, which continues them even if the app is suspended; on Android, <code>WorkManager</code> jobs with network constraints play the same role.</p>
+
+<div class="callout instagram"><span class="callout-title">📸 Instagram's classic "instant share" trick</span>
+Early Instagram engineers publicly described a now-famous optimisation: the app <strong>starts uploading the photo as soon as you pick a filter</strong> — while you are still typing the caption and tagging friends. When you finally tap <em>Share</em>, only the small metadata request remains, so the post appears to publish instantly. If you abandon the post, the server discards the orphaned upload. It's optimistic, speculative work traded for perceived speed — a perfect example of client-side design beating backend optimisation.</div>
+
+<h2>7. Pagination and infinite scroll</h2>
+<p>A user's feed is effectively endless, so the client loads it in <strong>pages</strong> (e.g. 10–20 posts per request). There are two main ways to ask for "the next page".</p>
+
+<h3>7.1 Offset pagination</h3>
+<p><code>GET /feed?offset=40&amp;limit=20</code> — "skip 40 items, give me the next 20". Simple, and it lets you jump to page 7. But it has two serious problems for a live feed:</p>
+<ul>
+  <li><strong>Shifting data.</strong> If 3 new posts are inserted at the top between your page-1 and page-2 requests, everything shifts down by 3: you see the last 3 posts of page 1 again (duplicates). If items are deleted, you silently skip some.</li>
+  <li><strong>Cost.</strong> In a database, <code>OFFSET 100000</code> still has to walk past 100,000 rows before returning anything; deep pages get slower and slower.</li>
+</ul>
+<pre class="ascii">
+ Feed at time T1:  [P50 P49 P48 P47 P46 | P45 P44 P43 P42 P41]   page 1 = offset 0, limit 5
+                                          ^ next page should start here
+ 3 new posts arrive: P53 P52 P51
+ Feed at time T2:  [P53 P52 P51 P50 P49 | P48 P47 P46 P45 P44]   page 2 = offset 5, limit 5
+                                          ^^^^^^^^^^^ P48, P47, P46 shown AGAIN (duplicates)
+</pre>
+
+<h3>7.2 Cursor (keyset) pagination</h3>
+<p><code>GET /feed?max_id=P46&amp;limit=20</code> or <code>GET /feed?cursor=eyJ0cyI6...</code> — "give me 20 items <em>after this specific item</em>". The <strong>cursor</strong> is an opaque token the server returns with each page (<code>next_cursor</code>), usually encoding the sort key of the last item (e.g. its time-sortable ID — see <a href="id-generation.html">ID generation</a>) and sometimes a ranking session. Because it anchors to an item rather than a position, inserts at the top don't cause duplicates, and the database can seek directly with an index (<code>WHERE id &lt; :cursor ORDER BY id DESC LIMIT 20</code>) — equally fast on page 1 and page 10,000.</p>
+
+<div class="table-wrap"><table>
+  <tr><th></th><th>Offset / limit</th><th>Cursor (keyset)</th></tr>
+  <tr><td><b>Request</b></td><td><code>?offset=40&amp;limit=20</code></td><td><code>?cursor=abc123&amp;limit=20</code></td></tr>
+  <tr><td><b>Stable under inserts/deletes</b></td><td>❌ duplicates / skipped items</td><td>✅ anchored to an item</td></tr>
+  <tr><td><b>Deep-page performance</b></td><td>❌ O(offset) scan</td><td>✅ index seek, constant</td></tr>
+  <tr><td><b>Jump to arbitrary page</b></td><td>✅ easy ("page 7")</td><td>❌ only next/previous</td></tr>
+  <tr><td><b>Total count / page numbers</b></td><td>Natural</td><td>Usually not provided</td></tr>
+  <tr><td><b>Best for</b></td><td>Admin tables, search results with page numbers, small static lists</td><td>Feeds, comments, DMs, followers lists — anything live and long</td></tr>
+</table></div>
+<p>Instagram's APIs use cursor-style pagination (public API responses carry fields like <code>next_max_id</code> / <code>end_cursor</code> and a <code>more_available</code> flag). For a <strong>ranked</strong> feed the cursor is even more important: the server has computed an ordering for this session, and the cursor tells it where in that ranked list you are, so the next page doesn't re-rank and reshuffle what you've already seen. More detail in <a href="api-design.html">API design</a> and <a href="news-feed.html">News feed</a>.</p>
+
+<h3>7.3 Infinite scroll mechanics</h3>
+<ol class="steps">
+  <li>Render the first page from cache, then from the network.</li>
+  <li>Watch the scroll position. When the user is within a threshold of the end (e.g. 5 posts or 1.5 screen heights from the bottom), request the next page <em>before</em> they reach it, so they never see a spinner.</li>
+  <li>Only one "load more" request in flight at a time; ignore further triggers until it returns. Deduplicate items by ID when appending (defence in depth).</li>
+  <li>Use <strong>list virtualisation / view recycling</strong>: only the ~10 rows near the viewport exist as real views; scrolled-away rows release their bitmaps so memory stays flat after 500 posts.</li>
+  <li>Stop when the server says <code>more_available: false</code>; show an "You're all caught up" marker (Instagram added exactly such a marker in 2018).</li>
+</ol>
+
+<h2>8. Prefetching: hiding latency before the user asks</h2>
+<p><strong>Prefetching</strong> means downloading things the user is likely to need next, while they are busy with the current thing. Done well, the next post's image is already in the disk cache when it scrolls into view, so it renders in milliseconds instead of hundreds.</p>
+<ul>
+  <li><strong>Feed:</strong> when page N arrives, start downloading images for the first few posts of that page and the next few off-screen posts in scroll direction. When you're near the bottom, fetch page N+1's JSON.</li>
+  <li><strong>Stories:</strong> the stories tray at the top is ranked; prefetch the first story item of the first few accounts in the tray (and the next item of the story you're watching). Tapping a ring then opens instantly. See <a href="stories.html">Stories</a>.</li>
+  <li><strong>Reels / video:</strong> preload the first segment(s) of the next one or two videos (section 10).</li>
+  <li><strong>Navigation hints:</strong> when the user's finger lands on a profile link (touch-down), start fetching the profile header before the tap completes (touch-up) — a 100–200&nbsp;ms head start.</li>
+</ul>
+<div class="callout warn"><span class="callout-title">⚠️ Prefetching has a budget</span>
+Every prefetched byte that is never viewed is wasted data, battery and CDN bandwidth. Good clients use a <strong>budget</strong> that adapts to context: aggressive on unmetered Wi-Fi with a full battery, conservative on cellular, minimal in data-saver or low-battery mode. They also <strong>prioritise</strong> (on-screen content first, prefetch at low priority) and <strong>cancel</strong> prefetches when the user scrolls quickly past or leaves the screen. A useful metric to track is <em>prefetch hit rate</em> = prefetched items actually displayed ÷ prefetched items.</div>
+
+<h2>9. Choosing the right image: size, format and placeholders</h2>
+<p>After upload, the <a href="media-processing.html">media processing workers</a> generate several <strong>renditions</strong> of every photo — e.g. 150px, 320px, 640px, 750px, 1080px wide, in more than one format — and store them in <a href="object-storage.html">object storage</a>. The feed API returns a list of candidate URLs with their dimensions, and the <em>client</em> chooses.</p>
+
+<h3>9.1 Picking the size</h3>
+<pre><code>needed_px = view_width_in_points × screen_scale (device pixel ratio)
+
+iPhone, full-width post: 390 pt × 3  = 1170 px → pick 1080 (largest available)
+budget Android:          360 dp × 2  =  720 px → pick 750 (smallest ≥ needed)
+profile grid (3 columns): 130 pt × 3 = 390 px → pick 480 or 640
+Explore thumbnail on 2G / data saver → cap at 320 regardless of screen</code></pre>
+<p>Rule of thumb: choose the <strong>smallest rendition that is at least as large as the displayed pixel size</strong>, then cap it based on network quality and data-saver settings. Downloading a 1080px image for a 130pt grid cell wastes roughly 7× the bytes and the decode memory.</p>
+
+<h3>9.2 Picking the format</h3>
+<div class="table-wrap"><table>
+  <tr><th>Format</th><th>Size vs baseline JPEG (rough)</th><th>Strengths</th><th>Weaknesses</th></tr>
+  <tr><td>Baseline JPEG</td><td>100%</td><td>Universal support, fast decode</td><td>Loads top-to-bottom; larger files</td></tr>
+  <tr><td>Progressive JPEG</td><td>~95–100%</td><td>Shows a blurry full image after ~10–20% of bytes, sharpening as more arrive</td><td>Slightly more CPU to decode; multiple render passes</td></tr>
+  <tr><td>WebP</td><td>~70–75%</td><td>Good compression, transparency, broad Android/browser and modern iOS support</td><td>Older iOS needed extra libraries</td></tr>
+  <tr><td>AVIF</td><td>~50–60%</td><td>Best compression for photos, HDR</td><td>Slow to encode; decode support only on newer OS versions</td></tr>
+  <tr><td>HEIC</td><td>~50–60%</td><td>iPhone camera default</td><td>Patent-encumbered; limited support outside Apple</td></tr>
+</table></div>
+<p>The client advertises what it can decode — browsers send <code>Accept: image/avif,image/webp,*/*</code>; native apps send their supported formats in the API request or pick from the candidate list — and the server or CDN returns the best format the device supports (<em>content negotiation</em>). Remember the CDN's cache key must then include the format, or an AVIF-capable phone might receive a JPEG cached for an older one (or worse, vice versa). Facebook engineers have publicly written about switching their iOS app to <strong>progressive JPEG</strong> to show a useful image sooner on slow networks.</p>
+
+<h3>9.3 Placeholders: never show an empty box</h3>
+<p>Even with a fast CDN, a 4G image fetch takes 100–500&nbsp;ms. Instead of a grey box, the feed JSON itself carries a tiny preview so something meaningful appears with the text:</p>
+<ul>
+  <li><strong>Dominant colour</strong> — a single hex colour per image (7 bytes). Cheap, surprisingly effective.</li>
+  <li><strong>BlurHash</strong> — a ~20–30 character string encoding a few low-frequency colour components; decoded on-device into a smooth blurred gradient.</li>
+  <li><strong>Tiny thumbnail</strong> — a ~40×40 JPEG of a few hundred bytes, scaled up and blurred. Facebook publicly described sending ~200-byte preview photos by stripping the JPEG header (which is identical across images) and re-attaching it on the device.</li>
+</ul>
+<p>The sequence the user sees: placeholder (0&nbsp;ms, inline in JSON) → progressive low-quality scan (first few KB) → full image, with a short cross-fade. The page also reserves the correct height from the known aspect ratio, so text doesn't jump around as images load (<em>layout shift</em>).</p>
+
+<h2>10. Video: preloading and adaptive playback</h2>
+<p>Reels, Stories videos and feed videos are delivered as <strong>adaptive bitrate (ABR)</strong> streams: the <a href="media-processing.html">pipeline</a> encodes each video at several bitrates and cuts it into short segments (a few seconds each) listed in a manifest (DASH or HLS). The player picks a bitrate per segment based on measured bandwidth and buffer level — dropping to 360p in a tunnel rather than stalling.</p>
+<p>The key client technique is <strong>preloading the start</strong> of upcoming videos:</p>
+<ul>
+  <li>While you watch Reel #1, the client downloads the manifest and the first segment (roughly the first 1–3 seconds) of Reels #2 and #3 at a modest bitrate. Assume ~300–500&nbsp;KB each — cheap compared with full videos of many MB.</li>
+  <li>When you swipe, playback starts instantly from the preloaded segment while the player fetches the rest, possibly at a higher bitrate.</li>
+  <li>Decoders are expensive: keep at most one or two player instances warm, and release them when far off-screen.</li>
+  <li>Autoplay in the feed is muted, starts only when the video is mostly visible, and is limited (or disabled) on cellular with data saver on.</li>
+</ul>
+<p>The metrics that matter are <strong>time-to-first-frame</strong> and <strong>rebuffering ratio</strong> (time stalled ÷ time watched); both are reported by client telemetry (section 14) and directly affect watch time, which feeds the <a href="analytics-ml.html">ranking models</a>.</p>
+
+<h2>11. Talking to the server efficiently</h2>
+<h3>11.1 Connection reuse</h3>
+<p>Opening a new HTTPS connection costs a DNS lookup (if not cached), a TCP handshake (1 RTT) and a TLS handshake (1 RTT with TLS 1.3, 2 with TLS 1.2) <em>before</em> the first request byte is sent. On a 150&nbsp;ms 3G link that's 300–450&nbsp;ms of pure overhead. So clients:</p>
+<ul>
+  <li>Use a <strong>single shared HTTP client</strong> per app (one OkHttp instance, one <code>URLSession</code>) whose connection pool keeps connections alive and reuses them.</li>
+  <li>Prefer <strong>HTTP/2 or HTTP/3</strong>, which multiplex many concurrent requests over one connection, so 30 thumbnails don't need 30 connections. HTTP/3 (QUIC) additionally survives Wi-Fi ⇄ cellular switches without a new handshake — see <a href="networking-basics.html">Networking basics</a>.</li>
+  <li>Keep the number of distinct hostnames small (typically one API host and one CDN host family), because each hostname needs its own DNS lookup and connection.</li>
+  <li><strong>Pre-connect</strong> on app launch: resolve DNS and open the API and CDN connections while the splash screen shows, so the first real request is "warm".</li>
+</ul>
+
+<h3>11.2 Batching and shaping requests</h3>
+<ul>
+  <li><strong>One request per screen.</strong> The home screen needs the feed, the stories tray, unread DM count and notification badge. Four sequential calls on 3G could take 2 seconds; one aggregated call (via a backend-for-frontend endpoint at the <a href="api-gateway.html">API gateway</a>, or a GraphQL query) takes one round trip.</li>
+  <li><strong>Batch small writes.</strong> "Seen" events for stories, impression logs and read receipts are queued and sent together every few seconds or when the radio is already awake.</li>
+  <li><strong>Deduplicate in-flight requests.</strong> If two components ask for the same profile at the same time, issue one request and share the result.</li>
+  <li><strong>Compress</strong> payloads (gzip/brotli/zstd) and request only needed fields — a feed item on a thumbnail grid needs far fewer fields than in full view.</li>
+  <li><strong>Prioritise.</strong> User-blocking requests (the post you tapped) go first; prefetches and analytics run at low priority and yield bandwidth.</li>
+</ul>
+
+<h2>12. Getting updates: push vs polling</h2>
+<p>How does the app learn that someone liked your photo or sent you a message?</p>
+<div class="table-wrap"><table>
+  <tr><th>Approach</th><th>How it works</th><th>Latency</th><th>Cost</th><th>Use for</th></tr>
+  <tr><td><b>Short polling</b></td><td>Ask "anything new?" every N seconds</td><td>Up to N seconds</td><td>Huge: most responses are empty; wakes the radio constantly</td><td>Rarely; simple dashboards</td></tr>
+  <tr><td><b>Long polling</b></td><td>Request is held open until there is news or a timeout (~30–60 s)</td><td>Near real-time</td><td>One held request per user; reconnect overhead</td><td>Fallback when sockets are blocked</td></tr>
+  <tr><td><b>Persistent connection</b> (WebSocket / MQTT)</td><td>One long-lived bidirectional connection while the app is in the foreground</td><td>Real-time (tens of ms)</td><td>Server must hold millions of open connections</td><td>DMs, typing indicators, live comments, in-app badges</td></tr>
+  <tr><td><b>OS push</b> (APNs / FCM)</td><td>Server sends to Apple/Google; the OS's single shared connection delivers to the device</td><td>Seconds (best-effort)</td><td>Cheap for the device — one connection for all apps</td><td>Notifications while the app is backgrounded or closed</td></tr>
+</table></div>
+<p>The numbers make polling's cost obvious. Assume 500M daily users polling every 30&nbsp;s for even 4 hours a day:</p>
+<pre><code>requests per user = 4 h × 3600 s / 30 s = 480
+total             = 500M × 480 = 240 billion requests/day ≈ 2.8 million QPS
+…and > 95% of them return "nothing new" — while waking every phone's radio 480 times.</code></pre>
+<p>Instagram's pattern is therefore a hybrid: when the app is in the <strong>foreground</strong>, it keeps a persistent real-time connection (Meta has publicly described MQTT-based persistent connections for its messaging apps) for DMs, typing indicators and live updates — see <a href="direct-messaging.html">Direct messaging</a>. When the app is in the <strong>background</strong>, the <a href="notifications.html">Notification Service</a> sends pushes through APNs (iOS) and FCM (Android). A push can carry visible text ("alex liked your photo") or be a <em>silent</em> data push that tells the app to sync a small piece of state in the background. On each app open, the client also does a quick delta-sync to catch anything a best-effort push missed.</p>
+
+<h2>13. Old app versions in the wild</h2>
+<p>A server deploy reaches 100% of users in minutes. A mobile release reaches users over weeks or months: app store review takes time, staged rollouts start at 1%, and many people disable auto-update or simply never open the store. At any moment the backend may be serving dozens of app versions, some a year old. This is called <strong>version skew</strong>, and it drives several rules:</p>
+
+<h3>13.1 Backward-compatible APIs</h3>
+<ul>
+  <li><strong>Additive changes only.</strong> Add new fields and endpoints; never remove or rename a field an old client reads, and never change the meaning or type of an existing field (e.g. <code>like_count</code> from a number to a string).</li>
+  <li><strong>Tolerant reader.</strong> Clients must ignore unknown fields and handle unknown enum values gracefully (render "unsupported post type — update the app" rather than crash). Schema formats like Protocol Buffers and GraphQL help enforce this.</li>
+  <li><strong>Know who's calling.</strong> Every request carries the app version and platform (Instagram's User-Agent famously looks like <code>Instagram 3xx.0.0.x Android (…)</code>). The server can then tailor responses — e.g. not send a new post type to versions that can't render it.</li>
+  <li><strong>Deprecate deliberately.</strong> Track traffic per app version on dashboards; only remove an old API path when its traffic is negligible. Explicit API versions (<code>/v1/</code>, <code>/v2/</code>) are covered in <a href="api-design.html">API design</a>.</li>
+</ul>
+
+<h3>13.2 Feature flags and server-driven configuration</h3>
+<p>New features ship in the binary <strong>switched off</strong>, behind a flag fetched from the server at startup. This separates <em>deploying code</em> from <em>releasing a feature</em>:</p>
+<ul>
+  <li>Turn a feature on for 1% → 10% → 100% of users, by country, app version or device class.</li>
+  <li>Run <strong>A/B experiments</strong> (does a new feed layout increase time spent?).</li>
+  <li><strong>Kill switch</strong>: if the feature crashes or overloads a backend, turn it off remotely in seconds — no app release needed.</li>
+</ul>
+<p>Meta has publicly described its internal gating/configuration system (often called <em>Gatekeeper</em>) and its config-management infrastructure used for exactly this.</p>
+
+<h3>13.3 Forced upgrade</h3>
+<p>Sometimes an old version must go: a security hole, a protocol the backend can no longer support, or an API that is too expensive to keep. The client checks a <strong>minimum supported version</strong> (from config at startup, or a special API error such as an "upgrade required" response). Below a <em>soft</em> minimum, show a dismissible "Please update" banner; below the <em>hard</em> minimum, block the app with an update screen. Forced upgrades are disruptive — users with no data or storage may churn — so they are a last resort, used rarely and announced with grace periods.</p>
+
+<h2>14. The web client: SPA, SSR and service workers</h2>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Single-Page App (SPA)</th><th>Server-Side Rendering (SSR)</th><th>Hybrid (SSR + hydration)</th></tr>
+  <tr><td><b>First load</b></td><td>Blank page until a large JS bundle downloads, parses and fetches data</td><td>Server returns ready HTML → fast first paint</td><td>Fast first paint, then JS "hydrates" to become interactive</td></tr>
+  <tr><td><b>Navigation after load</b></td><td>Very fast, app-like; only data is fetched</td><td>Full page load per click (classic)</td><td>App-like after hydration</td></tr>
+  <tr><td><b>SEO / link previews</b></td><td>Weak unless pre-rendered</td><td>Excellent</td><td>Excellent</td></tr>
+  <tr><td><b>Server cost</b></td><td>Low — static files on a CDN</td><td>Higher — render per request</td><td>Higher</td></tr>
+  <tr><td><b>Examples</b></td><td>React/Vue apps built with Vite</td><td>Classic Django/Rails templates</td><td>Next.js, Remix, React Server Components</td></tr>
+</table></div>
+<p>Instagram's web app (instagram.com) is built with <strong>React</strong> — the UI library Meta created — and public profile and post pages need to load fast and be indexable and previewable when shared, which favours server rendering of the initial HTML followed by client-side navigation. Instagram itself began life as a Django app, the classic SSR world.</p>
+<h3>14.1 Service workers and PWAs</h3>
+<p>A <strong>service worker</strong> is a JavaScript worker the browser runs separately from the page, which can intercept every network request the site makes. It lets a web app behave like a native one:</p>
+<ul>
+  <li><strong>Offline shell</strong>: cache the HTML/CSS/JS "app shell" so the site opens instantly and works without a network.</li>
+  <li><strong>Caching strategies</strong> per route: cache-first for versioned static assets and images, network-first (falling back to cache) for feed data, stale-while-revalidate for profile data.</li>
+  <li><strong>Background sync</strong>: queue a failed like or comment and replay it when connectivity returns — the web equivalent of the outbox.</li>
+  <li><strong>Web push</strong>: receive notifications even when the tab is closed.</li>
+</ul>
+<p>Together with a web app manifest, this makes a <strong>Progressive Web App (PWA)</strong> that can be "installed" to the home screen — attractive for users on low-storage phones in emerging markets.</p>
+
+<h2>15. Client telemetry: measuring what users actually experience</h2>
+<p>Server dashboards can show 50&nbsp;ms API latency while users in Jakarta wait 4 seconds for the feed — because of DNS, TLS, slow radios, image decoding and the main thread being busy. Only the client can measure the end-to-end experience. Typical client metrics:</p>
+<ul>
+  <li><strong>Cold start time</strong> — app launch to first meaningful content (e.g. first feed image displayed).</li>
+  <li><strong>Time to first byte / full load</strong> for API calls and images, broken down by network type, country and device class.</li>
+  <li><strong>Scroll performance</strong> — dropped frames / "jank" (a 60&nbsp;Hz screen needs a frame every 16.7&nbsp;ms).</li>
+  <li><strong>Video</strong> — time to first frame, rebuffering ratio, bitrate selected.</li>
+  <li><strong>Reliability</strong> — crash rate, ANRs ("app not responding" on Android), request error rates, upload success rate.</li>
+  <li><strong>Product events</strong> — impressions (which posts were on screen and for how long), likes, shares — the raw material for ranking.</li>
+</ul>
+<p>Events are buffered in a local file, batched and compressed, and uploaded periodically (or when the radio is already active) to a logging endpoint. High-volume events are <strong>sampled</strong> (log 1% of scroll-performance traces), every event carries app version, OS and network type, and privacy rules strip or never collect sensitive data. On the backend, these logs flow through Kafka into the <a href="analytics-ml.html">Analytics &amp; ML</a> pipeline: dwell time and impressions train the feed and Explore ranking models, while performance metrics drive alerting and dashboards (see <a href="observability.html">Observability</a>). Releases are watched closely: if crash rate for the new version spikes in the 1% rollout, the rollout is halted.</p>
+
+<h2>16. How the client touches the architecture diagram</h2>
+<p>In the main diagram the client box has four kinds of arrows leaving or entering it. Each uses a different path through the system, with different protocols and caching rules:</p>
+
+<div class="diagram">
+<svg viewBox="0 0 840 360" width="840" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-clients-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <rect x="20" y="140" width="150" height="80" rx="10" fill="#e1f5fe" stroke="#0277bd"/>
+  <text x="95" y="175" text-anchor="middle" font-weight="600">📱 Instagram app</text>
+  <text x="95" y="194" text-anchor="middle" font-size="11">iOS · Android · Web</text>
+  <rect x="300" y="20" width="150" height="50" rx="8" fill="#fff3e0" stroke="#ef6c00"/>
+  <text x="375" y="41" text-anchor="middle" font-weight="600">① DNS</text>
+  <text x="375" y="58" text-anchor="middle" font-size="11">hostname → nearby IP</text>
+  <rect x="300" y="110" width="150" height="50" rx="8" fill="#fff3e0" stroke="#ef6c00"/>
+  <text x="375" y="131" text-anchor="middle" font-weight="600">② Load balancer</text>
+  <text x="375" y="148" text-anchor="middle" font-size="11">TLS, spreads load</text>
+  <rect x="490" y="110" width="150" height="50" rx="8" fill="#fff3e0" stroke="#ef6c00"/>
+  <text x="565" y="131" text-anchor="middle" font-weight="600">API Gateway</text>
+  <text x="565" y="148" text-anchor="middle" font-size="11">auth, rate limits</text>
+  <rect x="680" y="110" width="140" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/>
+  <text x="750" y="131" text-anchor="middle" font-weight="600">App services</text>
+  <text x="750" y="148" text-anchor="middle" font-size="11">Feed, Upload, DM…</text>
+  <rect x="300" y="200" width="150" height="50" rx="8" fill="#fff3e0" stroke="#ef6c00"/>
+  <text x="375" y="221" text-anchor="middle" font-weight="600">③ CDN edge</text>
+  <text x="375" y="238" text-anchor="middle" font-size="11">photos, video segments</text>
+  <rect x="490" y="200" width="150" height="50" rx="8" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="565" y="221" text-anchor="middle" font-weight="600">Object storage</text>
+  <text x="565" y="238" text-anchor="middle" font-size="11">CDN origin (S3)</text>
+  <rect x="300" y="290" width="150" height="50" rx="8" fill="#eceff1" stroke="#455a64"/>
+  <text x="375" y="311" text-anchor="middle" font-weight="600">④ APNs / FCM</text>
+  <text x="375" y="328" text-anchor="middle" font-size="11">OS push channel</text>
+  <rect x="490" y="290" width="150" height="50" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/>
+  <text x="565" y="311" text-anchor="middle" font-weight="600">Notification svc</text>
+  <text x="565" y="328" text-anchor="middle" font-size="11">consumes Kafka</text>
+  <g stroke="#555" stroke-width="1.5" marker-end="url(#ar-clients-3)" fill="none">
+    <path d="M170,155 L298,50"/><path d="M170,170 L298,135"/><path d="M170,200 L298,222"/>
+    <path d="M300,312 L172,212"/>
+    <path d="M450,135 L488,135"/><path d="M640,135 L678,135"/>
+    <path d="M450,225 L488,225" stroke-dasharray="5 3"/>
+    <path d="M490,315 L452,315"/>
+    <path d="M750,160 L750,315 L642,315" stroke-dasharray="5 3"/>
+  </g>
+  <g font-size="11" fill="#555">
+    <text x="205" y="84">lookup</text><text x="188" y="138">API (JSON)</text><text x="205" y="234">media GET</text><text x="200" y="285">push</text>
+    <text x="456" y="218">miss</text><text x="757" y="240">events</text><text x="757" y="254">(Kafka)</text>
+  </g>
+</svg>
+<div class="caption">The four client paths: ① name resolution, ② personalised API calls through LB → Gateway → services, ③ cacheable media straight from the CDN, ④ notifications arriving via Apple/Google push.</div>
+</div>
+
+<ol>
+  <li><strong>DNS</strong> — the app resolves the API hostname and the CDN hostnames. <a href="dns.html">DNS</a> answers with the address of a nearby edge or region, and the OS caches the answer for its TTL.</li>
+  <li><strong>Load balancer → API Gateway → services</strong> — every personalised, dynamic call (load feed page, like, follow, search, request an upload URL) goes over a reused HTTPS connection to the <a href="load-balancer.html">load balancer</a>, then the <a href="api-gateway.html">API gateway</a> (which authenticates the token and rate-limits), then the right <a href="microservices.html">stateless service</a>. Responses are JSON with <em>URLs</em> to media, never media bytes.</li>
+  <li><strong>CDN</strong> — the client fetches the image and video URLs from the <a href="cdn.html">CDN</a>, which serves from edge cache or origin-pulls from object storage. For uploads, the client sends bytes directly to object storage using a pre-signed URL from the Upload Service.</li>
+  <li><strong>Push</strong> — the Notification Service (a Kafka consumer) sends through APNs/FCM; the phone's OS delivers it even when Instagram isn't running. In the foreground, a persistent real-time connection (via the LB to the DM/real-time gateway) carries live events instead.</li>
+</ol>
+
+<h3>16.1 A cold start, step by step</h3>
+<div class="flow">
+  <div class="fnode client">Launch<small>show cached feed</small></div><div class="farrow">→<small>parallel</small></div>
+  <div class="fnode edge">DNS + connect<small>pre-warm API &amp; CDN</small></div><div class="farrow">→</div>
+  <div class="fnode svc">GET home<small>feed + tray + badges</small></div><div class="farrow">→<small>URLs</small></div>
+  <div class="fnode edge">CDN<small>first images, story heads</small></div><div class="farrow">→</div>
+  <div class="fnode client">Render &amp; prefetch<small>next page, next reels</small></div>
+</div>
+<p>Note how much happens before any backend service does real work: cache read, DNS, TCP/TLS, and image decode are all client-side or edge costs. That's why client telemetry measures <em>"launch to first feed image"</em> rather than API latency alone.</p>
+
+<h2>17. How Instagram uses these ideas</h2>
+<div class="callout instagram"><span class="callout-title">📸 Instagram's client, end to end</span>
+<ul>
+  <li><strong>Native, thick apps</strong> on iOS and Android, plus a React web app; Meta also publicly ships <strong>Instagram Lite</strong>, a much smaller Android app for low-end phones and slow networks.</li>
+  <li><strong>Speculative upload</strong>: the photo starts uploading while you write the caption, so "Share" feels instant; uploads are resumable and survive app restarts via a persistent queue.</li>
+  <li><strong>Optimistic engagement</strong>: likes, saves, follows and comments update the UI immediately and reconcile with the server's authoritative state.</li>
+  <li><strong>Cache-then-network feed</strong>: the last feed renders from local storage on launch, then fresh ranked content loads with cursor pagination and a "New posts" pill.</li>
+  <li><strong>Right-sized media</strong>: the API returns multiple renditions per post; the client chooses by screen size and network, with tiny inline previews so nothing is ever blank.</li>
+  <li><strong>Aggressive but budgeted prefetching</strong> of feed images, the first items in the stories tray and the opening segments of upcoming Reels.</li>
+  <li><strong>Real-time</strong> via a persistent connection in the foreground and APNs/FCM in the background.</li>
+  <li><strong>Server-controlled behaviour</strong>: features gated by flags and experiments, with kill switches and a minimum supported version.</li>
+</ul></div>
+<h3>Rough numbers (assumptions, not official stats)</h3>
+<pre><code>Assume 500M DAU, each opening the app 10×/day:
+  cold/warm starts       = 5 billion/day ≈ 58,000 per second on average
+  if each start made 4 sequential API calls instead of 1 aggregated call:
+     extra requests      = 3 × 58,000 ≈ 174,000 QPS of avoidable load
+     extra latency on 4G ≈ 3 × 80 ms = 240 ms per launch
+  a 90% disk-cache hit rate on scroll-back/re-opened images saves the CDN
+     roughly 10× the bytes for those views — and the user's data plan too.</code></pre>
+<div class="callout instagram"><span class="callout-title">📸 Why it matters for the backend</span>
+Client decisions show up directly in backend load: polling vs push changes QPS by orders of magnitude; retry policy without jitter can turn a 2-minute outage into a 20-minute retry storm; and choosing image renditions badly can double CDN egress. When designing Instagram in an interview, mention the client explicitly — it's where many of the biggest wins live.</div>
+
+<h2>18. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Benefits of a smart, thick client</h4><ul>
+    <li>Instant-feeling UI (cache-then-network, optimistic updates)</li>
+    <li>Works offline and on terrible networks; writes are never lost</li>
+    <li>Massive backend and CDN savings (disk caches, batching, push not poll)</li>
+    <li>Lower data and battery cost for users → better retention</li>
+    <li>Rich media experiences (instant Reels, smooth scrolling)</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs</h4><ul>
+    <li>Local state can be stale or briefly wrong (optimistic guesses, cached counts)</li>
+    <li>Two or three codebases (iOS, Android, Web) to keep consistent</li>
+    <li>Slow release cycle and long-lived old versions → API compatibility burden</li>
+    <li>Harder debugging: bugs depend on device, OS, network and app version</li>
+    <li>Prefetching and caching consume device storage and can waste data</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Retry storms</strong>: immediate, synchronised retries without backoff or jitter turn a brief backend blip into a sustained overload.</li>
+  <li><strong>Non-idempotent retries</strong>: re-sending "create post" without an idempotency key creates duplicate posts.</li>
+  <li><strong>Offset pagination on a live feed</strong>: duplicates and skipped posts as new content arrives.</li>
+  <li><strong>Downloading full-resolution images for thumbnails</strong>: wasted bytes, slow loads and out-of-memory crashes.</li>
+  <li><strong>Unbounded caches</strong>: the disk cache grows to gigabytes and the OS (or the user) deletes the app.</li>
+  <li><strong>Polling for notifications</strong> instead of push: battery drain and millions of empty requests per second.</li>
+  <li><strong>Breaking old clients</strong>: removing or changing a field that a 6-month-old app version still depends on causes crashes you can't fix with a server deploy.</li>
+  <li><strong>Trusting the client</strong> for permissions, limits or prices.</li>
+  <li><strong>Not wiping per-user caches</strong> on logout or account switch, leaking one user's DMs to another.</li>
+  <li><strong>Measuring only server latency</strong> and missing that users actually wait seconds.</li>
+</ul>
+
+<h2>19. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Tool / technology</th><th>What it does</th><th>When to use it</th></tr>
+  <tr><td>Fresco (Meta), Glide, Coil</td><td>Android image loading: memory/disk caches, downsampling, progressive JPEG</td><td>Any Android app showing lots of images</td></tr>
+  <tr><td>SDWebImage, Kingfisher, Nuke</td><td>iOS image loading and caching</td><td>Image-heavy iOS apps</td></tr>
+  <tr><td>OkHttp, Cronet, URLSession</td><td>HTTP clients with connection pooling, HTTP/2, HTTP cache; Cronet (Chromium's stack) adds QUIC/HTTP/3</td><td>All network calls; one shared instance per app</td></tr>
+  <tr><td>SQLite, Room, Core Data, GRDB, Realm</td><td>On-device databases</td><td>Offline feed, inbox, drafts, outbox queue</td></tr>
+  <tr><td>WorkManager (Android), BGTaskScheduler &amp; background URLSession (iOS)</td><td>OS-managed background work with network/charging constraints</td><td>Uploads, sync, cache cleanup</td></tr>
+  <tr><td>ExoPlayer / Media3, AVPlayer</td><td>Adaptive video playback (DASH/HLS), preloading, caching</td><td>Reels, Stories, feed video</td></tr>
+  <tr><td>APNs, FCM, Web Push</td><td>OS-level push delivery</td><td>Background notifications</td></tr>
+  <tr><td>MQTT, WebSocket</td><td>Persistent bidirectional connections</td><td>DMs, typing indicators, live updates</td></tr>
+  <tr><td>React, Next.js, Remix; Workbox</td><td>Web UI with SSR/hydration; service-worker caching toolkit</td><td>Web client and PWAs</td></tr>
+  <tr><td>Firebase Remote Config, LaunchDarkly, in-house (Meta Gatekeeper)</td><td>Feature flags, experiments, kill switches</td><td>Every mobile app with more than a handful of users</td></tr>
+  <tr><td>Crashlytics, Sentry, custom logging pipelines</td><td>Crash reporting, performance traces, event logging</td><td>Client telemetry</td></tr>
+  <tr><td>Litho, ComponentKit (Meta open source)</td><td>Declarative, efficient UI rendering for long scrolling lists</td><td>High-performance feeds</td></tr>
+</table></div>
+
+<h2>20. Interview corner</h2>
+<details class="qa"><summary>The interviewer says "the feed feels slow in India". Where do you look first, and what client-side changes would you make?</summary>
+<p>Measure first with client telemetry, broken down by country, network type and device: launch-to-first-image, DNS/connect/TLS time, API time, image download and decode time. Typical fixes: render the cached feed immediately (cache-then-network); pre-connect to API and CDN hosts at launch; aggregate the home-screen calls into one request; use HTTP/2 or HTTP/3 (QUIC handles loss and network switches better); choose smaller renditions and WebP/AVIF on slow networks; send tiny inline placeholders; prefetch the next posts' images; make sure the CDN and DNS route Indian users to Indian PoPs. Also consider a lite app or data-saver defaults for low-end devices.</p></details>
+<details class="qa"><summary>How would you implement the like button so it feels instant but stays correct?</summary>
+<p>Optimistic update: flip the heart and adjust the count immediately, remember the previous state and a pending-operation ID. Send an idempotent request (<code>PUT /posts/{id}/like</code> or POST with an idempotency key). On success, overwrite local state with the server's authoritative liked flag and count. On retryable failure, keep the optimistic state and retry with exponential backoff via the persistent outbox; on permanent failure (403: post deleted / blocked), roll back to the saved state and show a toast. Coalesce rapid like/unlike taps into the final state and ignore responses superseded by a newer operation.</p></details>
+<details class="qa"><summary>A user posts a Reel while going into a subway. How do you guarantee it gets posted exactly once?</summary>
+<p>Persist the post (local file path, caption, a client-generated idempotency key) in an on-device outbox before showing "Posting…". Upload media in resumable chunks to a pre-signed URL so progress isn't lost; hand the transfer to the OS background service so it continues if the app is suspended. Retry with exponential backoff and jitter, triggered by connectivity changes. When the media is complete, call "create post" with the idempotency key; the server deduplicates, so a retry after a lost response returns the same post instead of creating a duplicate. That gives <em>effectively-once</em> semantics from at-least-once delivery.</p></details>
+<details class="qa"><summary>Offset or cursor pagination for the feed — why?</summary>
+<p>Cursor. The feed changes constantly: with offsets, new posts at the top shift positions and cause duplicates (or deletions cause skipped items). Offsets are also O(n) to skip in the database. A cursor encodes the position after the last item seen (e.g. its sortable ID or a ranked-session position), is stable under inserts, maps to an index seek and lets the server keep a consistent ranked ordering across pages. The trade-off is no "jump to page 7", which a feed doesn't need.</p></details>
+<details class="qa"><summary>How do you ship a breaking API change when 20% of users run app versions older than six months?</summary>
+<p>Avoid breaking it: make the change additive (new field or new endpoint), keep serving the old shape to old versions identified by their app-version header, and ship the new client behind a feature flag. Monitor traffic per version; once old-version traffic is negligible, deprecate. If the old path must die (security), raise the soft minimum version to nag users, then the hard minimum to block, with a grace period. Clients should already be tolerant readers that ignore unknown fields and degrade gracefully on unknown enum values.</p></details>
+<details class="qa"><summary>Why doesn't the app just poll for new notifications every 10 seconds?</summary>
+<p>Cost and battery. With hundreds of millions of active devices, 10-second polling means tens of millions of QPS of mostly empty responses, and every poll wakes the cellular radio, which then stays in a high-power tail state for seconds — draining the battery. Instead use OS push (APNs/FCM: one shared, efficient connection for all apps) when backgrounded, and a single persistent connection (WebSocket/MQTT) for real-time events while foregrounded, plus a cheap delta-sync on app open to catch missed pushes.</p></details>
+<details class="qa"><summary>How should the client choose which image rendition to download?</summary>
+<p>Compute the displayed size in physical pixels (view width × device pixel ratio), pick the smallest available rendition at least that large, then cap it by network quality and data-saver setting. Prefer the most efficient format the device can decode (AVIF → WebP → JPEG), use progressive JPEG or an inline BlurHash/tiny thumbnail so something appears immediately, and decode with downsampling to the view size to save memory. The API provides the candidate list (width, height, URL) so the client decides without extra round trips, and the CDN cache key includes size and format.</p></details>
+
+<h2>21. Check your understanding</h2>
+<details class="quiz"><summary>A 1080 × 1350 photo is 200 KB as a JPEG. Roughly how much memory does it take once decoded as a 32-bit bitmap, and what's one way to reduce that for a 3-column profile grid?</summary>
+<p>1080 × 1350 × 4 bytes ≈ <strong>5.8 MB</strong> — about 29× the compressed size. For a grid cell ~390 px wide, download a smaller rendition and/or decode with downsampling to ~390 × 488, which needs ≈ 0.76 MB — roughly 1/8 of the memory.</p></details>
+<details class="quiz"><summary>Between page 1 and page 2 of an offset-paginated feed (limit 10), 4 new posts are inserted at the top. What does the user see on page 2?</summary>
+<p>Everything shifted down by 4, so page 2 (offset 10) starts with the last 4 posts of the old page 1: <strong>4 duplicates</strong>, followed by only 6 genuinely new-to-the-user posts. Cursor pagination avoids this because page 2 starts strictly after the last item ID the user saw.</p></details>
+<details class="quiz"><summary>Why is exponential backoff with <em>jitter</em> better than plain exponential backoff for a mobile upload queue?</summary>
+<p>When a common cause (cell tower outage, backend blip) makes millions of clients fail at the same moment, plain exponential backoff makes them all retry at exactly 1 s, 2 s, 4 s… later — synchronised spikes that can knock the recovering backend over again. Randomising each wait spreads retries evenly over time.</p></details>
+<details class="quiz"><summary>A user taps like, then immediately unlikes. The "like" request's response arrives <em>after</em> the "unlike" response. What goes wrong with a naive client, and how do you fix it?</summary>
+<p>The naive client applies the late "liked = true" response and shows the post as liked, even though the user's final intent (and possibly the server's final state) is "not liked". Fix: tag each operation with an ID/sequence number and ignore responses for superseded operations, or debounce rapid toggles so only the final state is sent.</p></details>
+<details class="quiz"><summary>Assume 200M devices poll every 60 s for 3 hours a day. What average QPS does that create, and what replaces it?</summary>
+<p>Each device: 3 × 3600 / 60 = 180 polls/day. Total: 200M × 180 = 36 billion/day ÷ 86,400 ≈ <strong>417,000 QPS</strong>, almost all returning "nothing new". Replace with push (APNs/FCM) in the background and a persistent connection in the foreground.</p></details>
+<details class="quiz"><summary>Why can Instagram's disk image cache treat a cached image as valid forever without asking the server?</summary>
+<p>Media URLs are content-versioned: once a rendition is generated it never changes, and an edit produces a new URL. So "URL in cache" ⇒ "bytes are correct". The cache only needs LRU eviction for space, and should key on the stable media ID/rendition rather than the expiring signature parameters.</p></details>
+<details class="quiz"><summary>For which of these would you NOT use optimistic UI: (a) like, (b) follow, (c) deleting your account, (d) posting a comment, (e) switching your account to private?</summary>
+<p><strong>(c) and (e).</strong> They are high-stakes, hard-to-undo or privacy-critical; the user must know they actually took effect, so show progress and wait for the server. Likes, follows and comments are cheap to roll back and almost always succeed (comments can show a "posting…" state and "tap to retry" on failure).</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>The client is part of the distributed system: it has caches, queues, retries, consistency choices and versioning problems.</li>
+    <li>Design for <strong>bad networks, small batteries, expensive data and limited memory</strong>: fewer round trips, batching, push instead of polling, right-sized media.</li>
+    <li>Use <strong>layered caches</strong> (memory, disk, HTTP, local DB) and <strong>cache-then-network</strong> so screens are never blank.</li>
+    <li><strong>Optimistic UI + idempotent requests + a persistent outbox with backoff and jitter</strong> = instant and correct.</li>
+    <li><strong>Cursor pagination</strong>, budgeted <strong>prefetching</strong>, placeholders and video preloading hide latency.</li>
+    <li>Old versions live for months: <strong>additive APIs, tolerant readers, feature flags, kill switches</strong>, forced upgrade only as a last resort.</li>
+    <li>Measure the real experience with <strong>client telemetry</strong>, not just server latency.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="networking-basics.html">Networking basics</a> — the round trips, TLS and HTTP/2/3 behaviour behind every client request</li>
+  <li><a href="dns.html">DNS</a> — how the app finds the nearest API region and CDN PoP</li>
+  <li><a href="cdn.html">CDN</a> — where the client's images and video segments come from</li>
+  <li><a href="api-design.html">API design</a> — pagination cursors, idempotency keys and versioning from the server side</li>
+  <li><a href="media-upload.html">Media upload</a> — pre-signed URLs and resumable uploads that the client's queue drives</li>
+  <li><a href="media-processing.html">Media processing</a> — how the renditions the client picks between are produced</li>
+  <li><a href="notifications.html">Notifications</a> — the push path via APNs/FCM</li>
+  <li><a href="direct-messaging.html">Direct messaging</a> — persistent connections for real-time updates</li>
+  <li><a href="resilience-patterns.html">Resilience patterns</a> — retries, backoff, jitter and idempotency in depth</li>
+  <li><a href="analytics-ml.html">Analytics &amp; ML</a> — where client telemetry and impression logs end up</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

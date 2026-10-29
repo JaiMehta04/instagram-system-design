@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Search &amp; Inverted Indexes — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="search">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>Search lets users find <strong>accounts, hashtags and places</strong> — usually character by character via <strong>typeahead</strong>. Databases are terrible at "find rows containing this word"; search engines are built for it.</li>
+    <li>The core data structure is the <strong>inverted index</strong>: a map from each <em>term</em> to the sorted list of documents that contain it (a <em>posting list</em>). Queries become fast list lookups and intersections instead of full scans.</li>
+    <li>Text goes through <strong>analysis</strong> (tokenize, lowercase, fold accents, stem, handle stop words, emoji and hashtags) — the same way at index and query time — so that "Sunsets" matches "sunset".</li>
+    <li><strong>Elasticsearch/Lucene</strong> splits an index into <strong>shards</strong> (with <strong>replicas</strong>), each made of immutable <strong>segments</strong>; a <strong>refresh</strong> every ~1 s makes new documents searchable (<em>near-real-time</em>), and background <strong>merges</strong> compact segments.</li>
+    <li>Ranking combines text relevance (<strong>TF-IDF / BM25</strong>) with <strong>popularity</strong>, <strong>social graph</strong> and <strong>personalization</strong> signals. Typeahead uses <strong>tries</strong> or <strong>edge n-grams</strong> with precomputed <strong>top-k</strong> results; places use <strong>geohashes</strong>.</li>
+    <li>The index is fed asynchronously from <strong>Kafka/CDC</strong>, so search is <strong>eventually consistent</strong> — a new account appears within seconds, not instantly.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why can't the database just search?</h2>
+<p>When you tap the search bar on Instagram and type <code>sun</code>, you expect to instantly see <em>@sunsetchaser</em>, <em>#sunset</em> and <em>Sunset Boulevard, Los Angeles</em> — ranked so that the account your friend follows is on top. Then you type <code>suns</code> and the list updates again, in under 100 ms. Every keystroke is a new query.</p>
+<p>Try that with the User DB (sharded PostgreSQL in our architecture):</p>
+<pre><code>SELECT * FROM users
+WHERE username ILIKE '%sun%' OR full_name ILIKE '%sun%'
+ORDER BY follower_count DESC LIMIT 10;</code></pre>
+<ul>
+  <li><strong>It can't use a normal index.</strong> A B-tree index (see <a href="indexing.html">Indexing</a>) helps with <em>prefix</em> matches on one column (<code>LIKE 'sun%'</code>), but not with "contains", multiple words, different word forms or typos. A leading wildcard forces a <strong>full table scan</strong> over billions of rows.</li>
+  <li><strong>It's sharded by user_id.</strong> A name search would have to hit <em>every</em> shard and merge the results — on every keystroke.</li>
+  <li><strong>It has no notion of relevance.</strong> Is "Sun" (exact) better than "Sunday_Brunch_Club" (prefix)? Should an account with 10M followers beat your friend with 300? SQL can sort by one column; it can't blend dozens of signals.</li>
+  <li><strong>It doesn't understand language.</strong> "Café" vs "cafe", "running" vs "run", "#SunsetVibes" vs "sunset vibes", emoji, scripts without spaces (Japanese, Thai)…</li>
+</ul>
+<p>The solution is a dedicated <strong>Search Service</strong> backed by a <strong>search index</strong> (Elasticsearch in our diagram) that is built from the source-of-truth databases and optimised for one thing: finding the best few documents that match some text, fast.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  To find every page of a 1,000-page textbook that mentions "photosynthesis", you could read every page (a table scan) — or flip to the <strong>index at the back</strong>, which lists the word alphabetically followed by page numbers: <em>photosynthesis … 12, 47, 311</em>. That back-of-book index is literally an <strong>inverted index</strong>. A search engine builds one for billions of "pages" (users, hashtags, places), keeps it updated every second, and also decides which page numbers are the <em>best</em> answer for you.
+</div>
+
+<h2>2. Requirements and numbers</h2>
+
+<h3>2.1 Functional requirements</h3>
+<ul>
+  <li><strong>Search users</strong> by username and display name (e.g. <code>maya</code> → @maya_travels, "Maya Patel").</li>
+  <li><strong>Search hashtags</strong> (<code>#sunset</code>, with post counts) and open a hashtag page of top/recent posts.</li>
+  <li><strong>Search places</strong> (cafés, cities, landmarks), preferring places near the user.</li>
+  <li><strong>Typeahead / autocomplete</strong>: results update on every keystroke, starting from the first character; recent searches shown on focus.</li>
+  <li><strong>Relevant, personalised ranking</strong>: people you follow or interact with, and popular/verified accounts, rank higher.</li>
+  <li><strong>Respect privacy and safety</strong>: blocked users, deactivated accounts and banned hashtags never appear.</li>
+</ul>
+
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+  <li><strong>Latency</strong>: typeahead p99 under ~100 ms server-side (users perceive &gt;100–150 ms as lag); full search under ~200 ms.</li>
+  <li><strong>Freshness</strong>: a new account, renamed username or new hashtag searchable within seconds to a minute — <strong>eventual consistency</strong> is acceptable.</li>
+  <li><strong>Availability</strong>: search going down must not affect posting or the feed (it's a separate read path with its own store).</li>
+  <li><strong>Scale</strong>: billions of documents, hundreds of thousands of queries per second at peak.</li>
+</ul>
+
+<h3>2.3 Back-of-the-envelope (assumptions)</h3>
+<pre><code>Assume 500M DAU, 5 searches/day each           → 2.5B searches/day
+Each search ≈ 6 typeahead keystroke requests    → 15B typeahead requests/day
+15B / 86,400 s ≈ 175,000 requests/s average     → ~400,000/s at peak
+(client-side debouncing and caching typically cut this by 30-50%)
+
+Corpus (assumptions):
+  users:    ~2B accounts × ~1 KB of searchable fields   ≈ 2 TB raw
+  hashtags: ~1B distinct tags × ~100 B                   ≈ 100 GB raw
+  places:   ~200M places × ~500 B                        ≈ 100 GB raw
+Index overhead (postings, n-grams, doc values) ≈ 1-3× raw → ~3-6 TB primary data
+With 2 replicas → ~10-18 TB across the search cluster</code></pre>
+<p>Note the shape: the corpus is <em>moderate</em> (a few TB) but the <strong>query rate is enormous</strong> and latency-critical. That pushes us toward many replicas, aggressive caching, and keeping hot data in RAM.</p>
+
+<h2>3. The inverted index, step by step</h2>
+<p>A normal (<strong>forward</strong>) index maps <em>document → words</em>: "user 17's bio contains these words". An <strong>inverted</strong> index flips it: <em>word → documents</em>. Let's build one by hand.</p>
+
+<h3>3.1 A worked example</h3>
+<p>Take three tiny documents (think of them as post captions or bios):</p>
+<div class="table-wrap"><table>
+  <tr><th>Doc ID</th><th>Text</th></tr>
+  <tr><td>1</td><td>Sunset at the beach 🌅 #Travel</td></tr>
+  <tr><td>2</td><td>Best tacos on the beach</td></tr>
+  <tr><td>3</td><td>Chasing sunsets daily #travel</td></tr>
+</table></div>
+<ol class="steps">
+  <li><strong>Analyze</strong> each document into terms (details in section 4): lowercase, drop stop words (<em>at, the, on</em>), stem (<em>sunsets → sunset</em>, <em>chasing → chase</em>, <em>tacos → taco</em>), keep hashtags and emoji as tokens.<br>
+  Doc 1 → <code>sunset, beach, 🌅, #travel</code> · Doc 2 → <code>best, taco, beach</code> · Doc 3 → <code>chase, sunset, daily, #travel</code></li>
+  <li><strong>Invert</strong>: for each term, record the IDs of documents containing it, in sorted order. Optionally store term frequency and positions (for phrase queries like <code>"sunset beach"</code>).</li>
+  <li><strong>Sort the terms</strong> into a dictionary (Lucene stores it as a compact <em>FST</em>, a finite-state transducer — think of it as a compressed trie) so any term can be located in microseconds.</li>
+</ol>
+
+<div class="diagram">
+<svg viewBox="0 0 860 300" width="860" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-se-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <text x="185" y="24" text-anchor="middle" font-weight="700">Documents (forward)</text>
+  <rect x="20" y="45" width="330" height="40" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="35" y="70">1: Sunset at the beach 🌅 #Travel</text>
+  <rect x="20" y="105" width="330" height="40" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="35" y="130">2: Best tacos on the beach</text>
+  <rect x="20" y="165" width="330" height="40" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="35" y="190">3: Chasing sunsets daily #travel</text>
+  <path d="M360,125 L455,125" stroke="#555" stroke-width="1.5" marker-end="url(#ar-se-1)"/>
+  <text x="407" y="115" text-anchor="middle" font-size="11" fill="#555">analyze</text>
+  <text x="407" y="145" text-anchor="middle" font-size="11" fill="#555">+ invert</text>
+  <text x="640" y="24" text-anchor="middle" font-weight="700">Inverted index (term → postings)</text>
+  <g font-size="12.5">
+    <rect x="470" y="38" width="120" height="28" fill="#fff8e1" stroke="#f9a825"/><text x="482" y="57">#travel</text><rect x="590" y="38" width="240" height="28" fill="#fff" stroke="#f9a825"/><text x="602" y="57">→ [1, 3]</text>
+    <rect x="470" y="66" width="120" height="28" fill="#fff8e1" stroke="#f9a825"/><text x="482" y="85">beach</text><rect x="590" y="66" width="240" height="28" fill="#fff" stroke="#f9a825"/><text x="602" y="85">→ [1, 2]</text>
+    <rect x="470" y="94" width="120" height="28" fill="#fff8e1" stroke="#f9a825"/><text x="482" y="113">best</text><rect x="590" y="94" width="240" height="28" fill="#fff" stroke="#f9a825"/><text x="602" y="113">→ [2]</text>
+    <rect x="470" y="122" width="120" height="28" fill="#fff8e1" stroke="#f9a825"/><text x="482" y="141">chase</text><rect x="590" y="122" width="240" height="28" fill="#fff" stroke="#f9a825"/><text x="602" y="141">→ [3]</text>
+    <rect x="470" y="150" width="120" height="28" fill="#fff8e1" stroke="#f9a825"/><text x="482" y="169">daily</text><rect x="590" y="150" width="240" height="28" fill="#fff" stroke="#f9a825"/><text x="602" y="169">→ [3]</text>
+    <rect x="470" y="178" width="120" height="28" fill="#fff8e1" stroke="#f9a825"/><text x="482" y="197">sunset</text><rect x="590" y="178" width="240" height="28" fill="#fff" stroke="#f9a825"/><text x="602" y="197">→ [1, 3]</text>
+    <rect x="470" y="206" width="120" height="28" fill="#fff8e1" stroke="#f9a825"/><text x="482" y="225">taco</text><rect x="590" y="206" width="240" height="28" fill="#fff" stroke="#f9a825"/><text x="602" y="225">→ [2]</text>
+    <rect x="470" y="234" width="120" height="28" fill="#fff8e1" stroke="#f9a825"/><text x="482" y="253">🌅</text><rect x="590" y="234" width="240" height="28" fill="#fff" stroke="#f9a825"/><text x="602" y="253">→ [1]</text>
+  </g>
+  <text x="185" y="245" text-anchor="middle" font-size="12" fill="#555">Query "sunsets beach" → terms: sunset, beach</text>
+  <text x="185" y="268" text-anchor="middle" font-size="12" fill="#555">AND: [1,3] ∩ [1,2] = [1]</text>
+</svg>
+<div class="caption">Building an inverted index: each analysed term points to a sorted list of document IDs (its posting list).</div>
+</div>
+
+<h3>3.2 Answering queries</h3>
+<p>Now the query <code>sunsets beach</code> is analysed with the <em>same</em> analyzer → terms <code>sunset</code>, <code>beach</code>. Look up both posting lists:</p>
+<ul>
+  <li><strong>AND query</strong> (all terms must match): intersect <code>[1, 3] ∩ [1, 2] = [1]</code>.</li>
+  <li><strong>OR query</strong> (any term): union <code>{1, 2, 3}</code>, then rank — Doc 1 matches both terms so it scores highest.</li>
+  <li><strong>Phrase query</strong> <code>"sunset beach"</code>: intersect, then check the stored <em>positions</em> to see whether the words are adjacent. In Doc 1, <code>sunset</code> is at position 0 and <code>beach</code> at position 3 (removed stop words leave gaps), so a strict phrase query does <em>not</em> match, while a phrase query with "slop" 2 (allow up to two positions of movement) does. Analysis choices directly change query results.</li>
+</ul>
+<p>Because posting lists are <strong>sorted</strong>, intersection is a linear two-pointer walk — the same merge idea used in merge sort:</p>
+<pre><code>def intersect(a, b):                 # a, b sorted doc-ID lists
+    i = j = 0; out = []
+    while i &lt; len(a) and j &lt; len(b):
+        if a[i] == b[j]: out.append(a[i]); i += 1; j += 1
+        elif a[i] &lt; b[j]: i += 1
+        else: j += 1
+    return out
+# Real engines start with the SHORTEST list and use skip pointers to
+# leap ahead in the long one: "rare AND common" costs ~ size of the rare list.</code></pre>
+
+<h3>3.3 Why it's fast and small</h3>
+<ul>
+  <li><strong>Lookup is independent of corpus size</strong>: finding a term in the dictionary is O(term length); work is proportional to the posting lists touched, not to the number of documents.</li>
+  <li><strong>Compression</strong>: posting lists store <em>deltas</em> between sorted IDs (<code>[1000, 1003, 1010]</code> → <code>[1000, 3, 7]</code>), packed into a few bits each (Lucene uses block-based bit packing). A posting often costs ~1 byte or less.</li>
+  <li><strong>Skip lists / blocks</strong> inside each posting list let intersection jump over thousands of IDs at a time.</li>
+  <li><strong>Early termination</strong>: with algorithms like WAND / block-max WAND, the engine can skip documents that provably can't make the top-k, so a query over a list of millions of postings may score only thousands.</li>
+  <li><strong>Doc values / stored fields</strong>: beside the inverted index, Lucene keeps column-oriented per-document values (follower_count, verified, location) for fast sorting, filtering and ranking, plus the original source document for display.</li>
+</ul>
+
+<h2>4. Text analysis: turning text into terms</h2>
+<p>Whether a search "finds" something depends entirely on whether the query and document produce the <em>same terms</em>. The component that does this is the <strong>analyzer</strong>, a pipeline of three stages:</p>
+<div class="flow">
+  <div class="fnode client">Raw text<small>"Café Déjà-Vu ☕ #SunsetVibes"</small></div><div class="farrow">→</div>
+  <div class="fnode svc">Char filters<small>Unicode NFKC, strip HTML</small></div><div class="farrow">→</div>
+  <div class="fnode svc">Tokenizer<small>split into tokens</small></div><div class="farrow">→</div>
+  <div class="fnode svc">Token filters<small>lowercase, fold, stem…</small></div><div class="farrow">→</div>
+  <div class="fnode store">Terms<small>cafe, deja, vu, ☕, #sunsetvibes, sunset, vibes</small></div>
+</div>
+
+<h3>4.1 The standard steps</h3>
+<div class="table-wrap"><table>
+  <tr><th>Step</th><th>What it does</th><th>Example</th><th>Why</th></tr>
+  <tr><td><b>Unicode normalization</b> (char filter)</td><td>Converts equivalent code-point sequences to one form (NFC/NFKC)</td><td>"é" as one code point vs "e" + combining accent → same; full-width "ｓｕｎ" → "sun"</td><td>Visually identical strings must match</td></tr>
+  <tr><td><b>Tokenization</b></td><td>Splits text into tokens at word boundaries (Unicode text segmentation rules)</td><td>"Best tacos, ever!" → [Best, tacos, ever]</td><td>Terms are the unit of the index</td></tr>
+  <tr><td><b>Lowercasing</b></td><td>Case-folds every token</td><td>"Sunset" → "sunset"</td><td>Users rarely type case correctly</td></tr>
+  <tr><td><b>ASCII / accent folding</b></td><td>Removes diacritics</td><td>"café" → "cafe", "São" → "sao"</td><td>Users often type without accents</td></tr>
+  <tr><td><b>Stop words</b></td><td>Drops very common words</td><td>"the", "at", "on" removed</td><td>Saves space; but can break queries like "The Who" — often kept for names</td></tr>
+  <tr><td><b>Stemming</b></td><td>Chops words to a root by rules (e.g. Porter / Snowball stemmers)</td><td>"running", "runs" → "run"; "sunsets" → "sunset"</td><td>Matches different forms of a word</td></tr>
+  <tr><td><b>Lemmatization</b> (alternative)</td><td>Dictionary-based root form</td><td>"better" → "good", "mice" → "mouse"</td><td>More accurate than stemming, slower</td></tr>
+  <tr><td><b>Synonyms</b></td><td>Adds equivalent terms</td><td>"nyc" ↔ "new york"</td><td>Matches user intent</td></tr>
+</table></div>
+
+<h3>4.2 Instagram-specific text: usernames, hashtags, emoji, scripts</h3>
+<ul>
+  <li><strong>Usernames are not prose.</strong> <code>maya_travels.2024</code> should match queries "maya", "travels", "mayatravels" and "maya_tr". So the username field is indexed several ways: the whole lowercase string (exact match), split on <code>_ . digits</code> (word parts), and as edge n-grams for prefixes (section 8). <strong>Do not stem usernames</strong> — "running_man" is a name, not a verb.</li>
+  <li><strong>Hashtags</strong> must keep their identity: <code>#SunsetVibes</code> is indexed as the exact tag <code>#sunsetvibes</code> (for hashtag search and the hashtag page) <em>and</em> optionally decomposed into <code>sunset</code>, <code>vibes</code> (camel-case split, or dictionary-based word segmentation for all-lowercase tags like <code>#sunsetvibes</code>) so caption search still matches. A naive tokenizer that strips <code>#</code> would merge hashtags with ordinary words.</li>
+  <li><strong>Emoji</strong> are real content (🌅, 🍕). Standard tokenizers may drop them; Instagram-style search wants them kept as tokens, and possibly mapped to keywords (🍕 → "pizza"). Watch out for multi-code-point emoji (skin-tone modifiers, ZWJ sequences like 👩‍💻) — treat a whole grapheme cluster as one token.</li>
+  <li><strong>Languages without spaces</strong> (Chinese, Japanese, Thai) can't be split on whitespace. Use language-specific dictionary tokenizers or character <strong>bigrams</strong> (each overlapping pair of characters becomes a term). Detect the language per field and pick the analyzer accordingly.</li>
+  <li><strong>Transliteration</strong>: a user may type "Mumbai" or "मुंबई"; indexing a transliterated form of names helps cross-script matching.</li>
+</ul>
+
+<div class="callout warn"><span class="callout-title">⚠️ The golden rule of analysis</span>
+The <strong>query must be analysed the same way as the indexed text</strong> (or deliberately compatibly — e.g. edge n-grams at index time but not at query time). If you stem at index time but not at query time, "sunsets" is indexed as <code>sunset</code> but searched as <code>sunsets</code> → zero results. And changing an analyzer means <strong>reindexing everything</strong>, because terms already in the index were produced by the old rules.</div>
+
+<h2>5. Lucene &amp; Elasticsearch architecture</h2>
+<p><strong>Lucene</strong> is a Java library that implements an inverted index on a single machine. <strong>Elasticsearch</strong> (and its fork <strong>OpenSearch</strong>, and <strong>Solr</strong>) wraps Lucene into a distributed system: it splits data across machines, replicates it, routes queries and exposes a JSON/HTTP API. Learn these terms precisely — interviewers love them.</p>
+
+<div class="cards">
+  <div class="card"><h4>🗂️ Index</h4><p>A logical collection of documents with the same kind of schema (a <em>mapping</em>), e.g. <code>users</code>, <code>hashtags</code>, <code>places</code>. Like a table.</p></div>
+  <div class="card"><h4>📄 Document</h4><p>A JSON object, e.g. one user: <code>{username, full_name, follower_count, verified, ...}</code>. Like a row.</p></div>
+  <div class="card"><h4>🧩 Shard</h4><p>A slice of an index; each shard is one complete Lucene index holding a subset of the documents. A <em>primary</em> shard accepts writes.</p></div>
+  <div class="card"><h4>🪞 Replica</h4><p>A copy of a primary shard on a different node. Used for failover and to serve more read queries in parallel.</p></div>
+  <div class="card"><h4>🧱 Segment</h4><p>An immutable mini-index inside a shard. A shard is a set of segments searched together.</p></div>
+  <div class="card"><h4>🖥️ Node / cluster</h4><p>A node is one Elasticsearch server; the cluster is all nodes plus elected master nodes that manage shard placement.</p></div>
+</div>
+
+<div class="diagram">
+<svg viewBox="0 0 820 300" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-se-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <rect x="320" y="12" width="180" height="40" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="410" y="37" text-anchor="middle" font-weight="600">Search Service</text>
+  <rect x="300" y="85" width="220" height="44" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="410" y="104" text-anchor="middle" font-weight="600">Coordinating node</text><text x="410" y="121" text-anchor="middle" font-size="11">scatter query, gather top-k</text>
+  <rect x="30" y="170" width="220" height="115" rx="10" fill="#eceff1" stroke="#455a64"/><text x="140" y="190" text-anchor="middle" font-weight="600">Node 1</text>
+  <rect x="300" y="170" width="220" height="115" rx="10" fill="#eceff1" stroke="#455a64"/><text x="410" y="190" text-anchor="middle" font-weight="600">Node 2</text>
+  <rect x="570" y="170" width="220" height="115" rx="10" fill="#eceff1" stroke="#455a64"/><text x="680" y="190" text-anchor="middle" font-weight="600">Node 3</text>
+  <rect x="45" y="205" width="90" height="60" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="90" y="232" text-anchor="middle" font-weight="600">P0</text><text x="90" y="250" text-anchor="middle" font-size="11">primary</text>
+  <rect x="145" y="205" width="90" height="60" rx="6" fill="#fff" stroke="#f9a825" stroke-dasharray="5 3"/><text x="190" y="232" text-anchor="middle" font-weight="600">R1</text><text x="190" y="250" text-anchor="middle" font-size="11">replica</text>
+  <rect x="315" y="205" width="90" height="60" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="360" y="232" text-anchor="middle" font-weight="600">P1</text><text x="360" y="250" text-anchor="middle" font-size="11">primary</text>
+  <rect x="415" y="205" width="90" height="60" rx="6" fill="#fff" stroke="#f9a825" stroke-dasharray="5 3"/><text x="460" y="232" text-anchor="middle" font-weight="600">R2</text><text x="460" y="250" text-anchor="middle" font-size="11">replica</text>
+  <rect x="585" y="205" width="90" height="60" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="630" y="232" text-anchor="middle" font-weight="600">P2</text><text x="630" y="250" text-anchor="middle" font-size="11">primary</text>
+  <rect x="685" y="205" width="90" height="60" rx="6" fill="#fff" stroke="#f9a825" stroke-dasharray="5 3"/><text x="730" y="232" text-anchor="middle" font-weight="600">R0</text><text x="730" y="250" text-anchor="middle" font-size="11">replica</text>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-se-2)">
+    <path d="M410,52 L410,83"/>
+    <path d="M330,129 L150,168"/><path d="M410,129 L410,168"/><path d="M490,129 L670,168"/>
+  </g>
+</svg>
+<div class="caption">An index with 3 primary shards and 1 replica each, spread over 3 nodes so that no node holds both copies of the same shard. A query hits one copy of every shard.</div>
+</div>
+
+<h3>5.1 Writing: routing, translog, refresh and near-real-time search</h3>
+<p>A document is routed to a primary shard by <code>shard = hash(_routing) % number_of_primary_shards</code> (the routing key defaults to the document ID). This is why the number of primary shards is fixed when the index is created — changing it changes every document's home (it requires a split, shrink or reindex; compare with <a href="consistent-hashing.html">consistent hashing</a>). The primary indexes the document and forwards it to its replicas.</p>
+<p>Inside a shard, Lucene never modifies existing files. New documents go to an in-memory buffer and an append-only <strong>translog</strong> (a write-ahead log, for durability):</p>
+<pre class="ascii">
+ index request ──► in-memory buffer  +  translog append (fsync'd per request or every few s)
+                         │
+                         │  REFRESH  (default every 1 s)
+                         ▼
+               new small segment, opened for search   ──►  document is now SEARCHABLE
+               (written to the OS page cache, not yet fsync'd)
+                         │
+                         │  FLUSH  (periodically, or when the translog grows large)
+                         ▼
+               segments fsync'd to disk + new commit point; translog trimmed
+                         │
+                         │  MERGE  (background, continuous)
+                         ▼
+     many small segments ──► fewer, larger segments; deleted docs physically removed
+</pre>
+<ul>
+  <li><strong>Refresh</strong> is what makes Elasticsearch <strong>near-real-time (NRT)</strong>: a document becomes searchable about 1 second after indexing, not immediately. You can lengthen the refresh interval (e.g. 30 s during a bulk backfill) to get much higher indexing throughput, because each refresh creates a segment.</li>
+  <li><strong>Updates and deletes</strong>: since segments are immutable, a delete just sets a bit in a "live docs" bitmap, and an update = delete old version + index new version. Deleted docs still occupy space and are skipped at query time until a merge drops them.</li>
+  <li><strong>Merges</strong> combine segments (like LSM-tree compaction — see <a href="indexing.html">Indexing</a>) to keep the segment count low (each query must visit every segment) and to reclaim space. Merging is I/O-heavy; a heavy write load can make merges fall behind and slow down search.</li>
+  <li><strong>Durability</strong> comes from the translog: if a node crashes before a flush, the translog is replayed on restart. Replicas protect against losing the node entirely (see <a href="replication.html">Replication</a>).</li>
+</ul>
+
+<h3>5.2 Reading: query-then-fetch</h3>
+<ol class="steps">
+  <li>The <strong>coordinating node</strong> (any node that receives the request) sends the query to <em>one copy</em> (primary or replica) of <em>every shard</em> of the index — a scatter-gather.</li>
+  <li><strong>Query phase</strong>: each shard searches all its segments and returns only its top-k <em>(doc ID, score)</em> pairs. With 20 shards and k = 10, the coordinator receives 200 pairs.</li>
+  <li>The coordinator merges them into the global top 10 (a k-way merge again).</li>
+  <li><strong>Fetch phase</strong>: it asks only the shards holding those 10 winners for the actual documents (or just the fields needed), then returns the results.</li>
+</ol>
+<div class="callout warn"><span class="callout-title">⚠️ Deep pagination is expensive</span>
+To return results 10,000–10,010, <em>every</em> shard must produce its top 10,010 and the coordinator must sort 20 × 10,010 entries. That's why Elasticsearch caps <code>from + size</code> (10,000 by default) and recommends <code>search_after</code> (a cursor of the last sort values) for deep scrolling — the same cursor idea as in <a href="news-feed.html">feed pagination</a>.</div>
+
+<h3>5.3 Sizing shards and replicas</h3>
+<ul>
+  <li><strong>Shard size</strong>: a common rule of thumb is ~10–50 GB per shard. Too few large shards → slow recovery and limited parallelism; too many tiny shards → per-shard overhead (memory, file handles, cluster state) and wider scatter-gather fan-out.</li>
+  <li><strong>Replicas scale reads</strong>: each copy can serve queries, so 3 copies of every shard ≈ 3× the query throughput, plus survival of node failures. Writes must be applied to every copy, so replicas cost indexing capacity.</li>
+  <li><strong>Separate indices per entity</strong>: users, hashtags and places have different sizes, schemas, analyzers and traffic, so they're separate indices with their own shard counts — and can even live on separate clusters for isolation.</li>
+</ul>
+
+<h2>6. Document-partitioned vs term-partitioned indexes</h2>
+<p>There are two fundamentally different ways to split an inverted index across machines (this is <a href="sharding.html">sharding</a> applied to search):</p>
+<pre class="ascii">
+ DOCUMENT-partitioned (local index)              TERM-partitioned (global index)
+ ┌──────────── Shard A ───────────┐              ┌──────────── Shard A ───────────┐
+ │ docs 1-1M: ALL terms           │              │ terms a..m: postings for ALL   │
+ │ beach → [3, 77, 902 ...]       │              │ docs: beach → [3,77,...,9.9M]  │
+ │ sunset → [5, 77 ...]           │              └────────────────────────────────┘
+ └────────────────────────────────┘              ┌──────────── Shard B ───────────┐
+ ┌──────────── Shard B ───────────┐              │ terms n..z: postings for ALL   │
+ │ docs 1M-2M: ALL terms          │              │ docs: sunset → [5,77,...,9.8M] │
+ │ beach → [1000012 ...]          │              └────────────────────────────────┘
+ └────────────────────────────────┘
+ query "sunset beach" → ask EVERY shard         query "sunset beach" → ask shard A (beach)
+ write doc → ONE shard                          and shard B (sunset), ship lists, intersect
+                                                write doc → one shard PER TERM it contains
+</pre>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Document-partitioned ⭐</th><th>Term-partitioned</th></tr>
+  <tr><td><b>Each shard holds</b></td><td>A complete index of a subset of documents</td><td>Complete posting lists for a subset of terms</td></tr>
+  <tr><td><b>Query cost</b></td><td>Every shard does a little work (scatter-gather to all)</td><td>Only shards owning the query's terms are touched</td></tr>
+  <tr><td><b>Indexing a document</b></td><td>Touches one shard</td><td>Touches one shard <em>per distinct term</em> — a distributed transaction-like write</td></tr>
+  <tr><td><b>Multi-term queries</b></td><td>Intersection is local to each shard (cheap)</td><td>Long posting lists must be shipped across the network to intersect</td></tr>
+  <tr><td><b>Load balance</b></td><td>Even (documents hash evenly)</td><td>Skewed: popular terms (<code>#love</code>) create hot shards</td></tr>
+  <tr><td><b>Tail latency</b></td><td>Grows with shard count (slowest shard wins)</td><td>Fewer shards per query</td></tr>
+  <tr><td><b>Used by</b></td><td>Elasticsearch, Solr, OpenSearch, most production engines</td><td>Some specialised and research systems; mostly a theoretical alternative today</td></tr>
+</table></div>
+<p>Document partitioning wins in practice because indexing stays simple and load stays balanced; its main cost — every query touches every shard — is managed by keeping the shard count moderate, using replicas, and caching. A useful hybrid is <strong>custom routing</strong>: if a query is always scoped to one key (e.g. "search within one user's own posts"), route documents by that key so the query touches one shard.</p>
+
+<h2>7. The indexing pipeline: Kafka, CDC and eventual consistency</h2>
+<p>The search index is a <strong>derived view</strong> of the source-of-truth databases. It must be kept up to date without slowing down or coupling the write path. In our architecture this is the <em>Search Indexer</em> consumer of Kafka.</p>
+<div class="flow">
+  <div class="fnode store">User DB / Post store<small>source of truth</small></div><div class="farrow">→<small>CDC / events</small></div>
+  <div class="fnode async">Kafka<small>user.changed, post.created</small></div><div class="farrow">→</div>
+  <div class="fnode async">Search Indexer<small>transform, batch</small></div><div class="farrow">→<small>_bulk API</small></div>
+  <div class="fnode store">Elasticsearch<small>users, hashtags, places</small></div>
+</div>
+
+<h3>7.1 Getting changes out of the databases</h3>
+<ul>
+  <li><strong>Domain events</strong>: services publish events like <code>post.created</code> (with its hashtags) or <code>user.renamed</code> to Kafka.</li>
+  <li><strong>CDC (change data capture)</strong>: a connector (e.g. Debezium) tails the database's replication log (PostgreSQL's WAL) and emits every committed row change to Kafka. This captures changes even from code paths that "forgot" to publish an event, and the order matches commit order per row.</li>
+  <li><strong>Avoid dual writes.</strong> Having the User Service write to PostgreSQL <em>and</em> Elasticsearch directly is fragile: if the second write fails, they diverge forever. CDC or the <strong>transactional outbox</strong> pattern (write the event into an outbox table in the same DB transaction, then relay it) guarantees every committed change eventually reaches the index (see <a href="message-queues.html">Message queues</a>).</li>
+</ul>
+
+<h3>7.2 The indexer</h3>
+<pre class="ascii">
+ User Svc     PostgreSQL     CDC connector     Kafka (user.changes)     Search Indexer        Elasticsearch
+    | UPDATE username |            |                    |                       |                     |
+    |---------------&gt; | commit     |                    |                       |                     |
+    |                 |-- WAL ----&gt;|-- {id:17, username:"maya.t", lsn:9001} --&gt;|                     |
+    |                 |            |                    |-- poll batch (500) --&gt;|                     |
+    |                 |            |                    |                       | build search docs   |
+    |                 |            |                    |                       | (denormalize: follower
+    |                 |            |                    |                       |  count, verified...) |
+    |                 |            |                    |                       |-- POST _bulk -----&gt; |
+    |                 |            |                    |                       |   version=9001      |
+    |                 |            |                    |                       |   version_type=     |
+    |                 |            |                    |                       |   external          |
+    |                 |            |                    |                       |&lt;-- 200 (per-item) --|
+    |                 |            |                    |&lt;-- commit offsets ----|                     |
+    |                 |            |                    |                       |   ~1 s later: refresh
+    |                 |            |                    |                       |   → "maya.t" searchable
+</pre>
+<ul>
+  <li><strong>Bulk requests</strong>: batching ~1,000 documents (a few MB) per <code>_bulk</code> call is far more efficient than one request per document.</li>
+  <li><strong>Idempotency &amp; ordering</strong>: Kafka delivers at-least-once and a retry can arrive after a newer update. Using <strong>external versioning</strong> (the source DB's log sequence number or an <code>updated_at</code> timestamp as the document version) makes Elasticsearch reject stale writes — so replays and reordering are harmless.</li>
+  <li><strong>Partition by entity ID</strong> in Kafka so all changes to user 17 are processed in order by the same consumer.</li>
+  <li><strong>Denormalization</strong>: the search document contains what ranking needs (follower_count, verified, is_private, language) so queries never join across services.</li>
+  <li><strong>Counters are aggregated, not streamed per event.</strong> <code>#love</code> may get thousands of new posts per minute; updating its document on every post would hammer one shard. A stream processor aggregates counts and updates hashtag docs every few minutes.</li>
+</ul>
+
+<h3>7.3 Eventual consistency and its user-visible effects</h3>
+<p>End-to-end lag = CDC delay + Kafka lag + batching + refresh interval — typically <strong>1–10 seconds</strong>, longer during incidents. Consequences and fixes:</p>
+<ul>
+  <li><strong>"I renamed myself and search still shows the old name"</strong> — acceptable for a few seconds. For the user's <em>own</em> profile, the client can show local state (read-your-writes at the UI level; see <a href="cap-consistency.html">Consistency models</a>).</li>
+  <li><strong>Privacy must not depend on the index being fresh.</strong> If a user blocks you or goes private, the Search Service re-checks block/privacy status against the authoritative store (or a fast cache) before returning results — the same "derived view is not the source of truth" rule as in the feed.</li>
+  <li><strong>Deletions</strong> must flow through too (account deactivated → delete the doc); a periodic <strong>reconciliation job</strong> compares the index with the DB and fixes drift.</li>
+</ul>
+
+<h3>7.4 Reindexing without downtime</h3>
+<p>Changing a mapping or analyzer requires rebuilding the index. The standard pattern uses an <strong>alias</strong> (a pointer name that queries use):</p>
+<ol class="steps">
+  <li>Create <code>users_v2</code> with the new mapping. Queries still go to alias <code>users</code> → <code>users_v1</code>.</li>
+  <li>Backfill <code>users_v2</code> from a database snapshot (a Spark/batch job), recording the Kafka offset at snapshot time.</li>
+  <li>Start a second indexer consumer group writing live changes to <code>users_v2</code> from that offset (external versioning resolves overlaps).</li>
+  <li>Validate (document counts, sample queries, relevance metrics), then atomically switch the alias <code>users</code> → <code>users_v2</code>. Keep v1 for quick rollback.</li>
+</ol>
+
+<h2>8. Relevance: deciding which match is best</h2>
+<p>Finding matching documents is half the job; the other half is <strong>ranking</strong> them. For "maya" there may be 2 million matching accounts — the user will look at the top 5.</p>
+
+<h3>8.1 TF-IDF: the classic intuition</h3>
+<p>Two common-sense ideas:</p>
+<ul>
+  <li><strong>TF (term frequency)</strong>: a document that mentions the query term more often is probably more about it.</li>
+  <li><strong>IDF (inverse document frequency)</strong>: rare terms are more informative than common ones. Matching "sunset" means more than matching "photo".</li>
+</ul>
+<pre><code>tf-idf(t, d) = tf(t, d) × idf(t)          idf(t) = log( N / df(t) )
+   N = number of documents, df(t) = number of documents containing t
+
+Worked example: N = 1,000,000 captions
+  "sunset" appears in 1,000 docs    → idf = log10(1,000,000 / 1,000)   = 3.0
+  "photo"  appears in 900,000 docs  → idf = log10(1,000,000 / 900,000) ≈ 0.046
+
+Query "sunset photo": a caption that contains "sunset" once scores ~3.0 from that term,
+while containing "photo" adds only ~0.05. The rare word dominates — as it should.</code></pre>
+<p>Plain TF-IDF has two weaknesses: TF grows without limit (a caption that spams "sunset sunset sunset ×50" wins), and long documents match more terms just by being long.</p>
+
+<h3>8.2 BM25: the modern default</h3>
+<p><strong>BM25</strong> ("Best Matching 25") is the default similarity in Lucene/Elasticsearch. It fixes both problems:</p>
+<pre><code>                         f(t,d) · (k1 + 1)
+score(d, q) = Σ  IDF(t) · ─────────────────────────────────────────
+             t∈q          f(t,d) + k1 · (1 − b + b · |d| / avgdl)
+
+  f(t,d)  = how many times term t occurs in document d
+  |d|     = length of d in terms;  avgdl = average document length
+  k1 ≈ 1.2  controls TF saturation;  b ≈ 0.75 controls length normalization
+  IDF(t)  = ln( 1 + (N − n + 0.5) / (n + 0.5) ),  n = docs containing t</code></pre>
+<p>Intuition, using an average-length document (|d| = avgdl, so the length term is 1):</p>
+<div class="table-wrap"><table>
+  <tr><th>Occurrences f</th><th>BM25 TF part = f·2.2 / (f + 1.2)</th><th>Plain TF</th></tr>
+  <tr><td>1</td><td>1.00</td><td>1</td></tr>
+  <tr><td>2</td><td>1.38</td><td>2</td></tr>
+  <tr><td>5</td><td>1.77</td><td>5</td></tr>
+  <tr><td>10</td><td>1.96</td><td>10</td></tr>
+  <tr><td>∞</td><td>→ 2.2 (k1 + 1), a hard ceiling</td><td>∞</td></tr>
+</table></div>
+<ul>
+  <li><strong>Saturation (k1)</strong>: the first occurrence matters most; repeats help less and less — keyword stuffing stops paying off.</li>
+  <li><strong>Length normalization (b)</strong>: a match in a short field (a username, a 5-word bio) counts more than the same match buried in a 300-word caption. With b = 0 length is ignored; with b = 1 it's fully normalised.</li>
+  <li><strong>IDF</strong> works like TF-IDF's: with N = 1M, a term in 1,000 docs gets IDF ≈ 6.9; a term in 900,000 docs gets ≈ 0.1.</li>
+</ul>
+<p>Field boosts refine this further: a match in <code>username</code> is worth more than in <code>full_name</code>, which is worth more than in <code>bio</code>; an <strong>exact</strong> match ("maya" = @maya) beats a prefix match, which beats a fuzzy match.</p>
+
+<h3>8.3 Beyond text: popularity, social and personal signals</h3>
+<p>For people search, text relevance alone is nearly useless: thousands of accounts are called "maya". What users want is the Maya <em>they mean</em>. Signals:</p>
+<div class="table-wrap"><table>
+  <tr><th>Signal family</th><th>Examples</th><th>Where it comes from</th></tr>
+  <tr><td><b>Text match quality</b></td><td>BM25 score, exact vs prefix vs fuzzy, which field matched</td><td>The search engine</td></tr>
+  <tr><td><b>Popularity / quality</b></td><td>Follower count (log-scaled), verified badge, engagement rate, account age, spam score</td><td>Denormalised fields in the search document</td></tr>
+  <tr><td><b>Social graph</b></td><td>You follow them; they follow you; mutual followers; your friends follow them</td><td><a href="social-graph.html">Graph service</a> at query time</td></tr>
+  <tr><td><b>Personal history</b></td><td>You searched/visited this profile before; you DM them; you liked their posts</td><td>Per-user activity store / feature store</td></tr>
+  <tr><td><b>Context</b></td><td>Your language, country, location (for places), trending now (for hashtags)</td><td>Request context, stream aggregates</td></tr>
+</table></div>
+<p>A practical design is <strong>two-stage ranking</strong>, the same funnel as the <a href="news-feed.html">feed</a>:</p>
+<ol class="steps">
+  <li><strong>Retrieval</strong>: the search engine finds candidates using text match plus cheap static boosts, returning the top ~200–1,000 per index.</li>
+  <li><strong>Re-ranking</strong>: the Search Service fetches social and personal features for those candidates (batched) and scores them with a <strong>learning-to-rank</strong> model (e.g. gradient-boosted trees) trained on clicks: <em>which result did people tap for this query?</em></li>
+  <li><strong>Blending</strong>: results from the users, hashtags and places indices are merged into one list ("Top" tab), using per-type scores calibrated to be comparable, plus rules (e.g. an exact username match always first).</li>
+</ol>
+<pre><code># Elasticsearch-style first stage for user search (simplified)
+{
+  "query": { "function_score": {
+      "query": { "multi_match": {
+          "query": "maya",
+          "fields": ["username^3", "username.edge^2", "full_name"],
+          "type": "best_fields" } },
+      "functions": [
+        { "field_value_factor": { "field": "follower_count", "modifier": "log1p", "factor": 0.5 } },
+        { "filter": { "term": { "verified": true } }, "weight": 1.5 }
+      ],
+      "boost_mode": "multiply" } },
+  "post_filter": { "term": { "is_searchable": true } },
+  "size": 200
+}</code></pre>
+<div class="callout tip"><span class="callout-title">💡 Personal results first, then global</span>
+A very effective trick for people search: the most likely targets are people <em>in your own network</em>. A small per-user index (the accounts you follow, plus recent searches and frequent contacts — a few hundred to a few thousand entries) can be searched first, even <strong>on the device</strong>, giving instant results for the first keystroke while the global query is still in flight. Facebook has publicly described this kind of "first-degree connections first" approach for its typeahead.</div>
+
+<h2>9. Typeahead (autocomplete)</h2>
+<p>Typeahead is the hardest latency target: a query per keystroke, very short and ambiguous prefixes ("s"), a budget of tens of milliseconds, and results that must feel personal. There are three main tools.</p>
+
+<h3>9.1 Tries with top-k at every node</h3>
+<p>A <strong>trie</strong> (prefix tree) stores strings character by character; every path from the root spells a prefix. Finding all completions of "su" means walking to the "su" node and exploring its subtree — but the subtree for "s" might contain 50 million terms. The fix: <strong>precompute and store the top-k completions at every node</strong>. Lookup becomes "walk |prefix| steps, read the list" — O(prefix length), independent of corpus size.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 340" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <g stroke="#555" stroke-width="1.5">
+    <line x1="410" y1="56" x2="410" y2="80"/>
+    <line x1="410" y1="124" x2="410" y2="148"/>
+    <line x1="380" y1="192" x2="180" y2="216"/><line x1="410" y1="192" x2="410" y2="216"/><line x1="440" y1="192" x2="640" y2="216"/>
+    <line x1="150" y1="260" x2="95" y2="284"/><line x1="210" y1="260" x2="270" y2="284"/>
+  </g>
+  <rect x="370" y="20" width="80" height="36" rx="18" fill="#eceff1" stroke="#455a64"/><text x="410" y="43" text-anchor="middle" font-weight="600">root</text>
+  <rect x="310" y="80" width="200" height="44" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="410" y="99" text-anchor="middle" font-weight="600">"s"</text><text x="410" y="116" text-anchor="middle" font-size="11">top: sunset, summer, sushi</text>
+  <rect x="310" y="148" width="200" height="44" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="410" y="167" text-anchor="middle" font-weight="600">"su"</text><text x="410" y="184" text-anchor="middle" font-size="11">top: sunset, summer, sushi</text>
+  <rect x="95" y="216" width="170" height="44" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="180" y="235" text-anchor="middle" font-weight="600">"sun"</text><text x="180" y="252" text-anchor="middle" font-size="11">top: sunset, sunny</text>
+  <rect x="325" y="216" width="170" height="44" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="410" y="235" text-anchor="middle" font-weight="600">"sum" … "summer" ★</text><text x="410" y="252" text-anchor="middle" font-size="11">top: summer</text>
+  <rect x="555" y="216" width="170" height="44" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="640" y="235" text-anchor="middle" font-weight="600">"sus" … "sushi" ★</text><text x="640" y="252" text-anchor="middle" font-size="11">top: sushi</text>
+  <rect x="20" y="284" width="150" height="44" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="95" y="303" text-anchor="middle" font-weight="600">"sunset" ★</text><text x="95" y="320" text-anchor="middle" font-size="11">score 9.1M</text>
+  <rect x="195" y="284" width="150" height="44" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="270" y="303" text-anchor="middle" font-weight="600">"sunny" ★</text><text x="270" y="320" text-anchor="middle" font-size="11">score 2.3M</text>
+  <text x="790" y="110" text-anchor="end" font-size="11" fill="#555">each node caches its</text>
+  <text x="790" y="126" text-anchor="end" font-size="11" fill="#555">best k completions</text>
+  <text x="790" y="310" text-anchor="end" font-size="11" fill="#555">★ = complete term</text>
+</svg>
+<div class="caption">A (compressed) trie for hashtags. Typing "su" walks two edges and returns the cached list instantly — no subtree search.</div>
+</div>
+<ul>
+  <li><strong>Memory</strong>: storing k = 10 IDs at every node multiplies the size. Assume 100M popular terms with ~8 new nodes each → 800M nodes × 10 × 8 bytes ≈ 64 GB, plus the nodes themselves — fits on a handful of large-memory machines, and is usually sharded by first character(s) of the prefix and replicated.</li>
+  <li><strong>Updates</strong>: changing a term's score means updating top-k lists on every ancestor node. Real systems rebuild the trie <strong>offline</strong> (e.g. hourly from query logs and popularity counts) and swap it in atomically, with a small real-time overlay for trending items.</li>
+  <li><strong>Compressed tries</strong> (radix trees) and <strong>FSTs</strong> merge chains of single-child nodes to save memory; Elasticsearch's <em>completion suggester</em> is an in-memory FST of exactly this kind.</li>
+</ul>
+
+<h3>9.2 Edge n-gram indexes</h3>
+<p>The alternative that works inside a normal search engine: at index time, emit every <strong>prefix</strong> of each word as a term. For <code>maya_travels</code>:</p>
+<pre><code>edge n-grams (min 1, max 15) of "maya":    m, ma, may, maya
+edge n-grams of "travels":                  t, tr, tra, trav, trave, travel, travels
+
+Index time: analyzer = lowercase → split on _ . → edge_ngram
+Query time: analyzer = lowercase only   (do NOT n-gram the query!)
+Query "trav" → a plain term lookup of "trav" → matches maya_travels</code></pre>
+<p>Edge n-grams turn a prefix query into an ordinary, fast term lookup, and the result benefits from all the normal machinery (BM25, filters, function scores, personalization). The cost is a bigger index (each word produces up to ~10 terms) and very long posting lists for 1–2 letter prefixes. (Full <em>n-grams</em> — all substrings, not just prefixes — allow "contains" matching and some typo tolerance but are much larger.)</p>
+
+<h3>9.3 Top-k caching for short prefixes</h3>
+<p>Short prefixes are both the <strong>most frequent</strong> (every search starts with one letter) and the <strong>most expensive</strong> (posting lists of millions). But there are only 26 one-letter and ~1,000 common two-letter prefixes per language. So precompute: a batch job computes the global top-k for every prefix up to length 2–3 per country/language and stores it in Redis or in-process memory. Typeahead then becomes:</p>
+<pre><code>def typeahead(viewer, prefix):
+    prefix = normalize(prefix)                       # lowercase, NFKC, trim
+    personal = local_index[viewer].prefix_search(prefix)      # follows, recents (instant)
+    if len(prefix) &lt;= 2:
+        global_ = topk_cache.get(f"ta:{viewer.country}:{prefix}")   # precomputed
+    else:
+        global_ = es.search(edge_ngram_query(prefix), size=50, timeout_ms=60)
+    return rerank(viewer, dedupe(personal + global_))[:10]</code></pre>
+
+<h3>9.4 Client-side tricks (they matter as much as the server)</h3>
+<ul>
+  <li><strong>Debounce</strong>: wait ~50–150 ms after a keystroke before sending, so a fast typist sends 2 requests instead of 6.</li>
+  <li><strong>Cancel stale requests</strong>: if the user typed "sun" → "suns", drop the "sun" response if it arrives late — otherwise results flicker backwards.</li>
+  <li><strong>Client cache and filtering</strong>: results for "sun" can be filtered locally to show instant candidates for "suns" while the request is in flight.</li>
+  <li><strong>Prefetch the personal index</strong> (accounts you follow, recent searches) when the search tab opens.</li>
+</ul>
+
+<h2>10. Caching popular queries</h2>
+<p>Query popularity follows a <strong>Zipf-like distribution</strong>: a small set of queries (celebrity names, trending hashtags, big cities) accounts for a large share of traffic. That makes caching extremely effective (see <a href="caching.html">Caching</a>):</p>
+<ul>
+  <li><strong>Result cache</strong>: key = normalised query + type + locale (e.g. <code>sq:users:en-IN:taylor</code>) → top-200 candidate IDs, TTL 1–10 minutes. Hit ratios of 30–60% are plausible for typeahead.</li>
+  <li><strong>Cache the non-personal part only.</strong> Personalised final results can't be shared between users. So cache the <em>retrieval</em> output (global candidates) and run the cheap personalised re-rank on top per request.</li>
+  <li><strong>Elasticsearch's own caches</strong>: the node <em>query cache</em> (caches filter bitsets like <code>is_searchable:true</code>), the <em>shard request cache</em> (whole-result cache, invalidated on refresh) and the OS page cache holding segment files — keeping hot segments in RAM is the biggest performance lever.</li>
+  <li><strong>Negative caching</strong>: cache "no results" for gibberish queries briefly to absorb bots.</li>
+  <li><strong>Invalidation</strong>: short TTLs are usually enough (search is eventually consistent anyway); safety-critical removals (banned hashtag, deleted account) are enforced by a post-filter at serve time, not by the cache.</li>
+</ul>
+
+<h2>11. Geo search for places</h2>
+<p>For places, "relevant" mostly means <strong>near me</strong> and <strong>popular</strong>. Typing "starb" in Mumbai should show Starbucks branches in Mumbai, not Seattle. We need to answer "places matching X within ~5 km of (lat, lon)" quickly.</p>
+
+<h3>11.1 Geohash</h3>
+<p>A <strong>geohash</strong> encodes a latitude/longitude into a short string by repeatedly halving the world: the first bit says east or west half (longitude), the next says north or south half (latitude), and so on, alternating. Every 5 bits become one base-32 character. Each extra character makes the cell ~32× smaller in area, and <strong>points that share a prefix are in the same cell</strong>, so proximity becomes a prefix match — which inverted indexes and B-trees are great at.</p>
+<div class="table-wrap"><table>
+  <tr><th>Geohash length</th><th>Approx. cell size</th><th>Good for</th></tr>
+  <tr><td>4</td><td>~39 km × 19.5 km</td><td>City / metro area</td></tr>
+  <tr><td>5</td><td>~4.9 km × 4.9 km</td><td>"Near me" neighbourhood</td></tr>
+  <tr><td>6</td><td>~1.2 km × 0.6 km</td><td>Walking distance</td></tr>
+  <tr><td>7</td><td>~153 m × 153 m</td><td>A block</td></tr>
+  <tr><td>8</td><td>~38 m × 19 m</td><td>A building</td></tr>
+</table></div>
+<pre class="ascii">
+ Worked example (Mumbai)
+   Gateway of India      (18.9220, 72.8347) → te7g9kss
+   CST railway station   (18.9400, 72.8350) → te7g9ruv   shares "te7g9" → same ~5 km cell
+   Colaba, west side     (18.9067, 72.8147) → te7g8cy5   only ~3 km away, but shares just "te7g"
+                                                          (it sits in the cell to the WEST)
+
+   Real neighbours of cell te7g9 (precision 5):    ┌───────┬───────┬───────┐
+   a point near a cell EDGE can be 50 m from a      │ te7gb │ te7gc │ te7gf │   N
+   point in the next cell with a different prefix → ├───────┼───────┼───────┤
+   so always search the cell AND its 8 neighbours   │ te7g8 │*te7g9*│ te7gd │
+                                                    ├───────┼───────┼───────┤
+                                                    │ te7g2 │ te7g3 │ te7g6 │   S
+                                                    └───────┴───────┴───────┘
+                                                       W                 E
+</pre>
+<p>Notice that the neighbours' last characters (b, c, f, 8, d, 2, 3, 6) don't follow alphabetical order: geohash cells are laid out along a zig-zag <em>Z-order curve</em>, so neighbours are computed with a small lookup algorithm (every geo library has one), never by incrementing characters.</p>
+
+<h3>11.2 Running a place query</h3>
+<ol class="steps">
+  <li>Compute the user's geohash at a precision matching the search radius (5 chars ≈ 5 km), plus its 8 neighbours.</li>
+  <li>Filter place documents whose geohash starts with any of those 9 prefixes (cheap term/prefix filters), and whose name matches the text (edge n-grams for typeahead).</li>
+  <li>Compute exact distances for the survivors and score: text match × popularity (check-ins, tagged posts) × a <strong>distance decay</strong> function (e.g. Gaussian: full score within 1 km, half at 5 km).</li>
+  <li>If too few results, widen to precision 4 (city) and then drop the geo filter entirely ("Starbucks Reserve Roastery, Seattle" is still a valid answer if nothing is nearby).</li>
+</ol>
+<pre><code># Elasticsearch has this built in: geo_point fields are indexed with BKD trees,
+# and a distance decay can be applied inside function_score.
+{ "query": { "function_score": {
+    "query": { "bool": {
+        "must":   { "match": { "name.edge": "starb" } },
+        "filter": { "geo_distance": { "distance": "10km", "location": { "lat": 18.92, "lon": 72.83 } } } } },
+    "functions": [
+      { "gauss": { "location": { "origin": "18.92,72.83", "scale": "2km" } } },
+      { "field_value_factor": { "field": "checkins", "modifier": "log1p" } } ] } } }</code></pre>
+<p>Alternatives to geohash: <strong>quadtrees</strong> (adaptive cells — small where places are dense, big where sparse), Google's <strong>S2</strong> cells (on a sphere, fewer edge distortions) and Uber's hexagonal <strong>H3</strong> (equal-distance neighbours). All share the idea: map 2-D space onto 1-D cell IDs so standard indexes can search it.</p>
+
+<h2>12. Search vs Explore: retrieval vs recommendation</h2>
+<p>Instagram has a search bar <em>and</em> an Explore grid on the same tab, but they are different systems:</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Search</th><th>Explore (recommendations)</th></tr>
+  <tr><td><b>Input</b></td><td>An explicit query typed by the user ("maya", "#sunset")</td><td>No query — the user's history and interests</td></tr>
+  <tr><td><b>Core question</b></td><td>"Which documents match this text, and which match best?"</td><td>"What might this user enjoy that they haven't seen?"</td></tr>
+  <tr><td><b>Candidate retrieval</b></td><td>Inverted index lookups (terms, prefixes, geohashes)</td><td>Embedding similarity (approximate nearest neighbour search), co-engagement ("people who liked X also liked Y"), graph walks</td></tr>
+  <tr><td><b>Main data store</b></td><td>Search index (Elasticsearch)</td><td>Embedding indexes, feature stores, model servers</td></tr>
+  <tr><td><b>Success metric</b></td><td>Did the user find what they wanted? (click on a top result, time to success)</td><td>Engagement (likes, saves, watch time) and long-term satisfaction</td></tr>
+  <tr><td><b>Freshness</b></td><td>New accounts must be findable in seconds</td><td>New posts need engagement signals before being recommended widely</td></tr>
+  <tr><td><b>Lesson</b></td><td>This one</td><td><a href="analytics-ml.html">Analytics &amp; ML Ranking</a></td></tr>
+</table></div>
+<p>They do converge: search ranking uses ML (learning to rank), and "keyword search for posts" (searching captions/topics) blends retrieval with recommendation — the hashtag page's "Top posts" are ranked with engagement models. But in an interview, keep them separate: <strong>search is pull with intent; Explore is push without a query</strong>.</p>
+
+<h2>13. Scaling search: putting numbers on it</h2>
+<p>Let's size the cluster for the assumptions in section 2.3 (all numbers are illustrative):</p>
+<pre><code>Data: ~4 TB of primary index (users ~3 TB with n-grams, hashtags ~0.5 TB, places ~0.5 TB)
+Shard size target ~30 GB → users: ~100 primary shards; hashtags/places: ~16 each
+
+Query load: ~400k typeahead req/s at peak
+  − client debouncing &amp; caches (~40%)           → ~240k req/s reach the Search Service
+  − precomputed short-prefix &amp; result caches (~50%) → ~120k req/s reach Elasticsearch
+  Each request fans out to every shard of the index queried (scatter-gather)
+
+Assume one shard copy handles ~500 simple queries/s with data in RAM
+  users index: 120k q/s needs 120k / 500 = 240 copies of EVERY shard?  ✗ far too many
+  → this is why typeahead is NOT a 100-shard scatter-gather:
+     • short prefixes are served from precomputed top-k caches
+     • a dedicated small "typeahead" index holds only the ~50M most searchable
+       accounts (2-4 shards, fully in RAM), with ~20-40 replicas across regions
+     • the full 100-shard users index serves only "see all results" queries</code></pre>
+<p>This calculation reveals the key scaling insights:</p>
+<ul>
+  <li><strong>Replicas scale queries; shards scale data.</strong> The number of shards should be as small as the data allows, because every extra shard multiplies query fan-out and tail latency.</li>
+  <li><strong>Tier the index by popularity.</strong> A small hot index of the most-searched entities (in RAM, many replicas) answers most typeahead queries; the long-tail full index answers the rest.</li>
+  <li><strong>Keep the working set in memory.</strong> Search latency collapses when segments must be read from disk; size nodes so hot indices fit in the OS page cache.</li>
+  <li><strong>Isolate workloads</strong>: indexing (heavy writes, merges) and querying compete for CPU and I/O; separate clusters per entity type or per region contain blast radius.</li>
+  <li><strong>Multi-region</strong>: each region runs its own search clusters fed by the same Kafka streams (replicated cross-region), so queries are served locally (see <a href="multi-region.html">Multi-region</a>).</li>
+  <li><strong>Protect the cluster</strong>: per-request timeouts with partial results (<code>timeout</code> + <code>allow_partial_search_results</code>), <a href="rate-limiting.html">rate limiting</a> of scrapers, and rejecting pathological queries (huge wildcards, regexes).</li>
+</ul>
+
+<h2>14. How Instagram uses search</h2>
+<div class="flow">
+  <div class="fnode client">📱 Search tab<small>types "sun"</small></div><div class="farrow">→<small>debounced</small></div>
+  <div class="fnode edge">API Gateway</div><div class="farrow">→</div>
+  <div class="fnode svc">Search Service<small>personal + global</small></div><div class="farrow">→<small>top-k / query</small></div>
+  <div class="fnode store">Search Index<small>users, tags, places</small></div><div class="farrow">→<small>re-rank, filter</small></div>
+  <div class="fnode client">📱 Results</div>
+</div>
+<ol>
+  <li>When you open the search tab, the app shows <strong>recent searches</strong> and preloads a small personal index (accounts you interact with).</li>
+  <li>As you type, debounced requests go through the <strong>API Gateway</strong> to the <strong>Search Service</strong>, which queries the users, hashtags and places indices in parallel (short prefixes hit precomputed caches).</li>
+  <li>Candidates are re-ranked with social signals from the <strong>Follow/Graph Service</strong> and personal history, filtered for blocks, privacy and policy, and blended into the "Top" list; tabs (Accounts, Tags, Places) show per-type lists.</li>
+  <li>Every change that affects search — new account, rename, new post with hashtags, new place tag — flows through <strong>Kafka</strong> to the <strong>Search Indexer</strong> and into Elasticsearch within seconds.</li>
+  <li>Taps and query logs flow to <strong>Analytics &amp; ML</strong> to train the ranking model and rebuild typeahead top-k lists.</li>
+</ol>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+Our architecture diagram uses <strong>Elasticsearch</strong> as the search index, which is the standard open-source choice for this design. Inside Meta, social search has historically run on in-house systems: Facebook publicly described <strong>Unicorn</strong> (a 2013 VLDB paper), an in-memory inverted-index system built for searching the social graph, which powers typeahead and graph-aware search by combining text terms with graph edges (e.g. "people named Maya who are friends of my friends"). Public descriptions of Instagram search emphasise exactly the signals discussed here — the text you type, your activity (accounts you follow, posts you've interacted with) and the popularity of results. Exact infrastructure, thresholds and numbers are internal; treat all figures in this lesson as assumptions.</div>
+<div class="callout instagram"><span class="callout-title">📸 Instagram-specific design choices</span>
+<ul>
+  <li><strong>Hashtags are first-class entities</strong> with their own index, post counts and a hashtag page; banned or unsafe hashtags are filtered or show a warning page.</li>
+  <li><strong>Private accounts are searchable</strong> (by name) but their posts are not — so the users index contains the account, while post/caption search must respect visibility.</li>
+  <li><strong>Usernames are unique and change rarely</strong>, so an exact-match lookup table (username → user_id) answers "@exact" queries without touching the full index.</li>
+  <li><strong>Locations</strong> come from a places database (businesses, landmarks), and geo-tagged posts feed each place's popularity score.</li>
+</ul></div>
+
+<h2>15. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Dedicated search index: benefits</h4><ul>
+    <li>Millisecond full-text, prefix and geo queries over billions of docs</li>
+    <li>Rich relevance (BM25, boosts, function scores, LTR)</li>
+    <li>Scales reads horizontally with replicas</li>
+    <li>Decoupled from the write path — search outages don't block posting</li>
+    <li>Language-aware analysis per field</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs</h4><ul>
+    <li>Another large system to run (merges, shard balancing, upgrades)</li>
+    <li>Eventual consistency — seconds of indexing lag</li>
+    <li>Data duplication and drift vs the source of truth</li>
+    <li>Analyzer/mapping changes require full reindexing</li>
+    <li>Scatter-gather tail latency grows with shard count</li>
+    <li>Memory-hungry, especially n-gram indexes</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Using the search index as the source of truth</strong> — it's a derived, eventually consistent view; always be able to rebuild it from the DB + Kafka.</li>
+  <li><strong>Mismatched analyzers</strong> at index vs query time (e.g. n-gramming the query) → zero or garbage results.</li>
+  <li><strong>Stemming or stop-wording names</strong> — usernames and hashtags need exact and prefix handling, not English grammar.</li>
+  <li><strong>Too many shards</strong> "for future growth" — every query pays the scatter-gather cost today.</li>
+  <li><strong>Dual writes</strong> from the application to DB and index — silent divergence. Use CDC or an outbox.</li>
+  <li><strong>Per-event updates of hot counters</strong> (hashtag counts) — creates hot documents and merge storms; aggregate first.</li>
+  <li><strong>Deep pagination with from/size</strong> — use <code>search_after</code> cursors.</li>
+  <li><strong>Relying on the index for privacy</strong> — re-check blocks and visibility at serve time.</li>
+  <li><strong>No client debouncing</strong> — doubles or triples typeahead load for no user benefit.</li>
+</ul>
+
+<h2>16. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>What it is</th><th>When to use it</th></tr>
+  <tr><td>Apache Lucene</td><td>The Java inverted-index library underneath most engines</td><td>Embedding search inside your own JVM service</td></tr>
+  <tr><td>Elasticsearch / OpenSearch</td><td>Distributed Lucene with JSON API, aggregations, geo, completion suggester</td><td>The default for full-text + typeahead + geo at scale (our diagram's choice)</td></tr>
+  <tr><td>Apache Solr</td><td>Mature distributed Lucene server (SolrCloud)</td><td>Similar use cases; common in enterprise and e-commerce search</td></tr>
+  <tr><td>Vespa</td><td>Search + ML ranking engine (from Yahoo) with built-in tensor ranking</td><td>When large-scale ML re-ranking must run inside the engine</td></tr>
+  <tr><td>Algolia, Typesense, Meilisearch</td><td>Typeahead-optimised hosted / lightweight engines with typo tolerance</td><td>Fast product search for small-to-medium catalogues</td></tr>
+  <tr><td>Redis (sorted sets, RediSearch)</td><td>In-memory prefix → top-k lists; lightweight secondary indexes</td><td>Precomputed typeahead caches, query result caches</td></tr>
+  <tr><td>PostgreSQL full-text (tsvector, GIN, pg_trgm)</td><td>Inverted index inside the relational DB</td><td>Small/medium apps where a separate cluster isn't worth it</td></tr>
+  <tr><td>Debezium + Kafka Connect</td><td>CDC from database logs into Kafka; sink connectors into Elasticsearch</td><td>Keeping the index in sync without dual writes</td></tr>
+  <tr><td>FAISS / ScaNN / HNSW libraries</td><td>Approximate nearest-neighbour vector search</td><td>Semantic search and Explore-style recommendation retrieval</td></tr>
+</table></div>
+
+<h2>17. Interview corner</h2>
+<details class="qa"><summary>Design search for Instagram users, hashtags and places.</summary>
+<p>Separate indices per entity in Elasticsearch, fed by Kafka (CDC from the User DB, post events for hashtags, places DB). Users indexed on username (exact keyword, split parts, edge n-grams) and full name (folded, n-grams), with denormalised follower_count, verified, is_private. The Search Service runs typeahead: personal index first (follows, recents), precomputed top-k for 1–2 character prefixes, edge-n-gram queries for longer ones, then re-ranks ~200 candidates with social and personal features using a learning-to-rank model and filters blocks/policy. Places use geo_point/geohash filters plus distance decay. Index is eventually consistent (~seconds); reindexing via aliases.</p></details>
+<details class="qa"><summary>Explain an inverted index and how a two-word query is executed.</summary>
+<p>It maps each analysed term to a sorted, compressed posting list of document IDs (plus frequencies/positions). For "sunset beach", analyse the query into terms, fetch both posting lists, intersect them with a two-pointer/skip-list walk starting from the shorter list (AND) or union them (OR), score the matching docs with BM25 plus boosts, keep the top-k in a heap. In a sharded cluster each shard does this locally and the coordinator merges per-shard top-k, then fetches the winning documents.</p></details>
+<details class="qa"><summary>Why is Elasticsearch "near-real-time" and not real-time?</summary>
+<p>Indexed documents go to an in-memory buffer and the translog; they become visible to search only when a <em>refresh</em> writes the buffer as a new immutable segment and opens it — by default every 1 second. The translog provides durability before segments are fsync'd (flush). Refreshing more often creates more tiny segments and more merge work, so it's a throughput/freshness trade-off.</p></details>
+<details class="qa"><summary>Document-partitioned or term-partitioned index — which and why?</summary>
+<p>Document-partitioned: each shard is a complete index of a subset of documents. Writes touch one shard, load is balanced, and multi-term intersections are local. The cost is scatter-gather to every shard per query, handled with a moderate shard count, replicas and caching. Term partitioning reduces shards touched per query but makes every write touch many shards, creates hot shards for popular terms, and needs posting lists shipped across the network to intersect.</p></details>
+<details class="qa"><summary>How do you implement typeahead with &lt; 100 ms latency at 400k QPS?</summary>
+<p>Client debouncing and cancellation; instant personal results from a small per-user index; precomputed top-k for very short prefixes (tries/Redis) per locale; edge-n-gram indexes (or an FST completion suggester) for longer prefixes in a small, hot, in-RAM "typeahead" index with many replicas; a result cache for popular prefixes; a lightweight re-rank with social signals; strict timeouts with partial results. Tries with top-k per node make lookup O(prefix length).</p></details>
+<details class="qa"><summary>Explain BM25 and why it beats raw TF-IDF.</summary>
+<p>BM25 scores a document as the sum over query terms of IDF × a saturating TF component normalised by document length: f·(k1+1) / (f + k1·(1−b+b·|d|/avgdl)). Saturation (k1 ≈ 1.2) means repeated occurrences give diminishing returns, so keyword stuffing doesn't win; length normalisation (b ≈ 0.75) means matches in short fields count more. IDF rewards rare terms. Raw TF-IDF grows linearly with TF and favours long documents.</p></details>
+<details class="qa"><summary>How do you keep the index consistent with the database?</summary>
+<p>Never dual-write. Capture changes with CDC (Debezium on the PostgreSQL WAL) or a transactional outbox into Kafka, partitioned by entity ID for per-entity ordering. The indexer bulk-writes with external versioning (source LSN/updated_at) so retries and reordering can't overwrite newer data. Deletes are propagated as deletes. A periodic reconciliation job compares DB and index. Privacy-sensitive checks (blocks, private, banned) are re-applied at query time.</p></details>
+<details class="qa"><summary>How would you find "coffee shops near me"?</summary>
+<p>Index places with a geo_point (geohash/BKD). At query time compute the user's cell at a radius-appropriate precision plus its 8 neighbours (to handle edge effects), filter by those cells or a geo_distance filter, match the text with edge n-grams, and score with text relevance × popularity × distance decay (Gaussian). Widen the radius if too few results. Quadtrees, S2 or H3 are alternatives to geohash.</p></details>
+
+<h2>18. Check your understanding</h2>
+<details class="quiz"><summary>Build the posting list for the term "cat" given: D1 "Cats are great", D2 "A dog and a cat", D3 "Dogs only". (Assume lowercase + stemming.)</summary>
+<p><code>cat → [1, 2]</code>. "Cats" stems to "cat" in D1; D2 contains "cat"; D3 doesn't. Similarly <code>dog → [2, 3]</code>; the query "cat dog" (AND) returns <code>[1,2] ∩ [2,3] = [2]</code>.</p></details>
+<details class="quiz"><summary>Your index stems words at index time, but a developer configured the query to use a "keyword" analyzer. A user searches "Sunsets". What happens?</summary>
+<p>The index contains the term <code>sunset</code>, but the query looks up the literal term <code>Sunsets</code> (not even lowercased) → zero results. Index-time and query-time analysis must be compatible.</p></details>
+<details class="quiz"><summary>With N = 10M documents, term A appears in 100 docs and term B in 5M docs. Using idf = log10(N/df), which term contributes more, and by how much?</summary>
+<p>idf(A) = log10(10M/100) = 5; idf(B) = log10(10M/5M) ≈ 0.30. A contributes ~17× more per occurrence — rare terms carry the meaning.</p></details>
+<details class="quiz"><summary>Under BM25 with k1 = 1.2 on an average-length document, how much more does a term occurring 4 times score compared with once?</summary>
+<p>TF part = f·2.2/(f+1.2): f=1 → 1.0; f=4 → 8.8/5.2 ≈ 1.69. So only ~1.7× more, not 4× — that's TF saturation.</p></details>
+<details class="quiz"><summary>An index has 50 shards with 1 replica. A query asks for the top 20 results. How many (doc, score) pairs does the coordinator merge, and why might you reduce the shard count?</summary>
+<p>50 × 20 = 1,000 pairs (one copy of each shard answers). Every query touches 50 shards, so latency is governed by the slowest of 50, and per-shard overhead is multiplied. If the data fits in fewer shards (~30 GB each), fewer shards plus more replicas gives lower latency and more throughput.</p></details>
+<details class="quiz"><summary>A user changes their username, and for 3 seconds the old name still appears in search. Is this a bug?</summary>
+<p>No — it's the expected eventual consistency of a derived index (CDC lag + Kafka + bulk batching + 1 s refresh). It would be a bug if it persisted for hours (pipeline lag or a dropped event — monitor consumer lag and run reconciliation), or if a <em>privacy</em> change (block, deactivate) were not enforced at serve time.</p></details>
+<details class="quiz"><summary>Why do you query a geohash cell <em>and</em> its 8 neighbours instead of just the user's own cell?</summary>
+<p>Because two points can be metres apart yet fall in different cells (and share a much shorter prefix) when they straddle a cell boundary. Searching only the user's cell would miss nearby places just across the edge — like Colaba being in te7g8 while the Gateway of India is in te7g9.</p></details>
+<details class="quiz"><summary>The typeahead query for prefix "a" is the most expensive and most frequent. What do you do?</summary>
+<p>Don't run it against the index at all: precompute top-k results for all 1–2 character prefixes per locale (from popularity and query logs), store them in memory/Redis, refresh periodically, and add personal results from the user's own network on top. Client debouncing also means a single "a" is often never sent.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>An <strong>inverted index</strong> maps terms → sorted, compressed posting lists; queries are lookups and intersections, independent of corpus size.</li>
+    <li><strong>Analysis</strong> (tokenize, lowercase, fold, stem, handle hashtags/emoji/scripts) decides what matches; index and query analysis must agree, and changes require reindexing.</li>
+    <li>Elasticsearch = <strong>shards</strong> (scale data) + <strong>replicas</strong> (scale reads, HA) of immutable Lucene <strong>segments</strong>; <strong>refresh</strong> gives near-real-time search, <strong>merges</strong> compact.</li>
+    <li>Rank with <strong>BM25</strong> + field boosts, then re-rank with <strong>popularity, social graph and personal</strong> signals via learning-to-rank.</li>
+    <li><strong>Typeahead</strong> = debounced client + personal index + precomputed <strong>top-k</strong> for short prefixes + <strong>edge n-grams/tries</strong> for longer ones; places add <strong>geohash</strong> filtering with distance decay.</li>
+    <li>Feed the index from <strong>Kafka/CDC</strong> with external versioning; accept seconds of lag, but enforce privacy at serve time. Search (query-driven) ≠ Explore (recommendation).</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="indexing.html">Database Indexing &amp; Storage Engines</a> — B-trees vs LSM-trees; segments and merges are LSM ideas</li>
+  <li><a href="message-queues.html">Message Queues &amp; Kafka</a> — the event stream and CDC that feed the indexer</li>
+  <li><a href="sharding.html">Sharding</a> — document vs term partitioning is sharding applied to search</li>
+  <li><a href="replication.html">Replication</a> — how replicas provide failover and read throughput</li>
+  <li><a href="caching.html">Caching</a> — query result caches, top-k caches and hot keys</li>
+  <li><a href="social-graph.html">Social Graph</a> — the follow edges used to personalise people search</li>
+  <li><a href="analytics-ml.html">Analytics &amp; ML Ranking</a> — learning-to-rank models and the Explore recommendation system</li>
+  <li><a href="cap-consistency.html">CAP &amp; Consistency Models</a> — why an eventually consistent index is acceptable</li>
+  <li><a href="request-flows.html">End-to-End Request Flows</a> — a search request traced through the whole architecture</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

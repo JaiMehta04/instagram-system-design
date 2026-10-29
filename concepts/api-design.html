@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>API Design: REST, gRPC, GraphQL &amp; WebSockets — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="api-design">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>An API is a <strong>contract</strong> between clients and servers. Good APIs are predictable, consistent, evolvable and hard to misuse — and for a mobile app, they must keep working for <strong>years-old app versions</strong>.</li>
+    <li><strong>REST</strong> models the system as <em>resources</em> (nouns) manipulated with HTTP <em>verbs</em>, statelessly. It's the default for public/client APIs.</li>
+    <li>Use <strong>cursor (keyset) pagination</strong> for feeds, <strong>idempotency keys</strong> for retry-safe writes, a <strong>consistent error format</strong>, and an explicit <strong>versioning</strong> strategy.</li>
+    <li><strong>gRPC</strong> (protobuf over HTTP/2) is typical for fast internal service-to-service calls; <strong>GraphQL</strong> (created at Facebook) lets clients fetch exactly the fields a screen needs.</li>
+    <li>For real-time features choose between <strong>short polling, long polling, SSE and WebSockets</strong> — Instagram DMs need bidirectional, low-latency WebSockets (or MQTT-like persistent connections).</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why API design matters so much for Instagram</h2>
+<p>Every feature you see in the Instagram app — the feed, likes, comments, stories, search, DMs — is the app calling an API. Those APIs are the most <em>permanent</em> part of the system:</p>
+<ul>
+  <li><strong>Old clients live forever.</strong> A web page can be redeployed in minutes, but once an iOS/Android app version is installed, it may keep calling your API for years. Millions of phones never update. A careless rename of a JSON field can crash all of them.</li>
+  <li><strong>Mobile networks are unreliable.</strong> Requests time out, get retried, arrive twice. If "post a comment" isn't safe to retry, users get duplicate comments.</li>
+  <li><strong>Scale magnifies inefficiency.</strong> An API that returns 30 KB when 3 KB would do, multiplied by ~100 billion calls a day, is petabytes of wasted mobile data and server CPU.</li>
+  <li><strong>Many teams, one product.</strong> Hundreds of engineers build endpoints. Without conventions (naming, errors, pagination), the API becomes a maze that's hard to use and easy to break.</li>
+</ul>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  An API is a restaurant <strong>menu</strong>. Customers (clients) don't walk into the kitchen; they order from the menu using an agreed format ("one Margherita, large"). The kitchen (services) can change its chefs, ovens and suppliers freely — as long as the menu stays the same. If the restaurant suddenly renames "Margherita" to "Pizza #3", every regular customer's usual order fails. Good API design is about writing a clear menu and changing it without confusing existing customers.
+</div>
+
+<h2>2. REST principles</h2>
+<p><strong>REST</strong> (Representational State Transfer, from Roy Fielding's 2000 dissertation) is an architectural style for APIs over HTTP. In practice, "RESTful" APIs follow these principles:</p>
+
+<h3>2.1 Resources (nouns), identified by URLs</h3>
+<p>Model your domain as <strong>resources</strong> — users, posts, comments, likes, stories — each with a URL. URLs are nouns; the action comes from the HTTP method.</p>
+<pre><code>/v1/users/42                    a user
+/v1/users/42/posts              collection: posts by user 42
+/v1/posts/987                   a post
+/v1/posts/987/comments          collection: comments on post 987
+/v1/posts/987/likes             collection: likes on post 987
+
+Avoid verbs in paths:  POST /v1/createPost   ✖     POST /v1/posts   ✔
+                       GET  /v1/getFeed      ✖     GET  /v1/feed    ✔</code></pre>
+<p>Conventions: plural nouns for collections, lowercase with hyphens, nesting only one or two levels deep (beyond that, use a top-level resource with a filter: <code>/v1/comments?post_id=987</code>). Some actions don't map neatly to CRUD — model them as sub-resources (<code>POST /v1/users/42/follow</code>) rather than inventing verbs.</p>
+
+<h3>2.2 HTTP verbs and their semantics</h3>
+<div class="table-wrap"><table>
+  <tr><th>Method</th><th>Meaning</th><th>Safe?</th><th>Idempotent?</th><th>Instagram example</th></tr>
+  <tr><td><code>GET</code></td><td>Read a resource or collection</td><td>Yes</td><td>Yes</td><td><code>GET /v1/feed</code></td></tr>
+  <tr><td><code>POST</code></td><td>Create a sub-resource / trigger an action</td><td>No</td><td><strong>No</strong> (make it so with idempotency keys)</td><td><code>POST /v1/posts/987/comments</code></td></tr>
+  <tr><td><code>PUT</code></td><td>Replace a resource entirely (create at known URL)</td><td>No</td><td>Yes</td><td><code>PUT /v1/posts/987/likes/me</code> (alternative like design)</td></tr>
+  <tr><td><code>PATCH</code></td><td>Partially update a resource</td><td>No</td><td>Not guaranteed</td><td><code>PATCH /v1/users/42 {"bio": "…"}</code></td></tr>
+  <tr><td><code>DELETE</code></td><td>Remove a resource</td><td>No</td><td>Yes</td><td><code>DELETE /v1/posts/987/likes</code> (unlike)</td></tr>
+</table></div>
+<p><strong>Safe</strong> = doesn't change server state (so caches, prefetchers and crawlers can call it freely). <strong>Idempotent</strong> = doing it N times has the same effect as doing it once — critical because networks cause retries. Liking twice should still be one like; deleting twice should still leave it deleted.</p>
+
+<h3>2.3 Statelessness</h3>
+<p>Each request carries everything the server needs to process it — the access token, the cursor, the parameters. The server keeps <strong>no per-client conversation state in memory</strong> between requests. This is what lets any of thousands of <a href="microservices.html">stateless service instances</a> behind the <a href="load-balancer.html">load balancer</a> handle any request, and lets you add or remove instances freely. (Data obviously lives in databases — "stateless" refers to the server process, not the system.)</p>
+
+<h3>2.4 The other REST constraints, briefly</h3>
+<ul>
+  <li><strong>Uniform interface</strong> — standard methods, status codes, media types (<code>application/json</code>).</li>
+  <li><strong>Cacheable</strong> — responses declare cacheability (<code>Cache-Control</code>, <code>ETag</code>) so clients/CDNs can reuse them.</li>
+  <li><strong>Layered system</strong> — the client can't tell whether it's talking to the server, a <a href="cdn.html">CDN</a> or an <a href="api-gateway.html">API gateway</a>.</li>
+  <li><strong>HATEOAS</strong> (hypermedia links in responses telling the client what it can do next) — part of the original definition but rarely used strictly in mobile APIs; a <code>next_cursor</code> is a lightweight version of the idea.</li>
+</ul>
+
+<h2>3. The Instagram API</h2>
+<p>Here is a representative public API surface for our Instagram design (an interview-style design, not Instagram's literal private API):</p>
+<div class="table-wrap"><table>
+  <tr><th>Endpoint</th><th>Purpose</th><th>Handled by</th></tr>
+  <tr><td><code>POST /v1/media/upload-url</code></td><td>Get a pre-signed URL to upload a photo/video directly to object storage</td><td>Upload Service</td></tr>
+  <tr><td><code>POST /v1/posts</code></td><td>Create a post from uploaded media + caption</td><td>Upload Service</td></tr>
+  <tr><td><code>GET /v1/feed?cursor=&amp;limit=</code></td><td>Home feed page</td><td>News Feed Service</td></tr>
+  <tr><td><code>GET /v1/users/{id}/posts?cursor=</code></td><td>A user's profile grid</td><td>Post metadata (via Upload/Post service)</td></tr>
+  <tr><td><code>GET /v1/posts/{id}</code></td><td>One post with counts</td><td>Post service</td></tr>
+  <tr><td><code>POST /v1/posts/{id}/likes</code> / <code>DELETE</code></td><td>Like / unlike</td><td>Like &amp; Comment Service</td></tr>
+  <tr><td><code>GET /v1/posts/{id}/comments?cursor=</code></td><td>List comments</td><td>Like &amp; Comment Service</td></tr>
+  <tr><td><code>POST /v1/posts/{id}/comments</code></td><td>Add a comment</td><td>Like &amp; Comment Service</td></tr>
+  <tr><td><code>POST /v1/users/{id}/follow</code> / <code>DELETE</code></td><td>Follow / unfollow (or request, if private)</td><td>Follow/Graph Service</td></tr>
+  <tr><td><code>GET /v1/users/{id}/followers?cursor=</code></td><td>Follower list</td><td>Follow/Graph Service</td></tr>
+  <tr><td><code>GET /v1/search?q=&amp;type=</code></td><td>Search users, hashtags, places</td><td>Search Service</td></tr>
+  <tr><td><code>POST /v1/stories</code></td><td>Post a story (expires in 24 h)</td><td>Stories Service</td></tr>
+  <tr><td><code>GET /v1/stories/tray</code></td><td>The row of story avatars at the top of the feed</td><td>Stories Service</td></tr>
+  <tr><td><code>WebSocket /v1/dm</code></td><td>Real-time direct messages, typing indicators, read receipts</td><td>Direct Messaging</td></tr>
+  <tr><td><code>POST /v1/auth/login</code>, <code>/v1/auth/token</code></td><td>Login and token refresh</td><td>User/Auth Service</td></tr>
+</table></div>
+
+<h3>3.1 Uploading and creating a post (two steps)</h3>
+<p>Media bytes never flow through the API servers. The client first asks for an upload URL, uploads directly to <a href="object-storage.html">object storage</a>, then creates the post. See <a href="media-upload.html">Media Upload</a>.</p>
+<pre><code>POST /v1/media/upload-url
+Authorization: Bearer eyJ…
+Content-Type: application/json
+
+{ "media_type": "image/jpeg", "size_bytes": 3481200, "sha256": "9f3a1c…" }
+
+201 Created
+{
+  "media_id": "3209876543210987654",
+  "upload_url": "https://upload.example-storage.com/raw/3209876543210987654?X-Signature=…&amp;X-Expires=900",
+  "method": "PUT",
+  "expires_in": 900
+}</code></pre>
+<pre><code>POST /v1/posts
+Idempotency-Key: 6f1c7a2e-1b9d-4c55-9b8e-2f0d7c1e4a11
+{
+  "media_ids": ["3209876543210987654"],
+  "caption": "Sunset at Marine Drive 🌅 #mumbai",
+  "location_id": "212988663",
+  "user_tags": [{ "user_id": "77", "x": 0.42, "y": 0.61 }]
+}
+
+201 Created
+Location: /v1/posts/3209876600000001234
+{
+  "id": "3209876600000001234",
+  "author": { "id": "42", "username": "alice" },
+  "status": "processing",          // media pipeline still creating renditions
+  "created_at": "2026-10-23T09:20:11Z"
+}</code></pre>
+<p>Note: IDs are returned as <strong>strings</strong>. Instagram-style 64-bit IDs (see <a href="id-generation.html">ID generation</a>) exceed JavaScript's safe integer range (2<sup>53</sup>), so a JSON number would silently lose precision in the web client.</p>
+
+<h3>3.2 Reading the feed</h3>
+<pre><code>GET /v1/feed?limit=10&amp;cursor=eyJ0cyI6MTc5MzA5ODkwMCwiaWQiOiIzMjA5In0
+
+200 OK
+{
+  "items": [
+    {
+      "id": "3209876600000001234",
+      "author": { "id": "42", "username": "alice", "avatar_url": "https://cdn…/a42_150.jpg" },
+      "media": [{
+        "type": "image",
+        "renditions": [
+          { "width": 1080, "url": "https://cdn…/p/9f3a1c/1080.jpg?oh=…&amp;oe=…" },
+          { "width": 640,  "url": "https://cdn…/p/9f3a1c/640.jpg?oh=…&amp;oe=…" }
+        ]
+      }],
+      "caption": "Sunset at Marine Drive 🌅 #mumbai",
+      "like_count": 10431,
+      "comment_count": 212,
+      "viewer_has_liked": false,
+      "created_at": "2026-10-23T09:20:11Z"
+    }
+  ],
+  "next_cursor": "eyJ0cyI6MTc5MzA5NTEwMCwiaWQiOiIzMTk4In0",
+  "has_more": true
+}</code></pre>
+
+<h3>3.3 Likes, comments and follows</h3>
+<pre><code>POST /v1/posts/3209876600000001234/likes          → 200 { "liked": true,  "like_count": 10432 }
+POST /v1/posts/3209876600000001234/likes  (again) → 200 { "liked": true,  "like_count": 10432 }   # idempotent
+DELETE /v1/posts/3209876600000001234/likes        → 200 { "liked": false, "like_count": 10431 }
+
+POST /v1/posts/3209876600000001234/comments
+Idempotency-Key: 0b8e…
+{ "text": "Gorgeous! 😍", "reply_to_comment_id": null }
+→ 201 { "id": "18000000000000077", "text": "Gorgeous! 😍", "author": {…}, "created_at": "…" }
+
+POST /v1/users/99/follow
+→ 200 { "status": "following" }          # public account
+→ 200 { "status": "requested" }          # private account: pending approval
+
+GET /v1/search?q=sunset&amp;type=hashtag&amp;limit=5
+→ 200 { "results": [ { "type": "hashtag", "name": "sunset", "post_count": 312000000 }, … ] }
+
+GET /v1/stories/tray
+→ 200 { "tray": [ { "user": {"id":"42","username":"alice"}, "has_unseen": true,
+                    "latest_reel_at": "…", "items_count": 3 }, … ] }</code></pre>
+
+<h2>4. Status codes and a consistent error format</h2>
+<div class="table-wrap"><table>
+  <tr><th>Code</th><th>Meaning</th><th>When Instagram's API returns it</th></tr>
+  <tr><td><code>200 OK</code></td><td>Success with body</td><td>Feed page, like toggled</td></tr>
+  <tr><td><code>201 Created</code></td><td>New resource created (+ <code>Location</code> header)</td><td>New post, new comment</td></tr>
+  <tr><td><code>202 Accepted</code></td><td>Accepted for async processing</td><td>Video post accepted; transcoding in progress</td></tr>
+  <tr><td><code>204 No Content</code></td><td>Success, no body</td><td>Delete a comment</td></tr>
+  <tr><td><code>304 Not Modified</code></td><td>Cached version still valid (<code>ETag</code>)</td><td>Config/feature-flag fetch unchanged</td></tr>
+  <tr><td><code>400 Bad Request</code></td><td>Malformed or invalid input</td><td>Caption too long, bad cursor</td></tr>
+  <tr><td><code>401 Unauthorized</code></td><td>Not authenticated / token expired</td><td>Access token expired → refresh</td></tr>
+  <tr><td><code>403 Forbidden</code></td><td>Authenticated but not allowed</td><td>Commenting where comments are restricted</td></tr>
+  <tr><td><code>404 Not Found</code></td><td>Doesn't exist (or you may not know it exists)</td><td>Deleted post; private post you can't see</td></tr>
+  <tr><td><code>409 Conflict</code></td><td>State conflict</td><td>Username already taken; idempotency key reused with a different body</td></tr>
+  <tr><td><code>413 Payload Too Large</code></td><td>Body too big</td><td>Oversized request body</td></tr>
+  <tr><td><code>422 Unprocessable Entity</code></td><td>Well-formed but semantically invalid</td><td>Media ID not finished uploading</td></tr>
+  <tr><td><code>426 Upgrade Required</code></td><td>Client version no longer supported</td><td>Ancient app version → force-update screen</td></tr>
+  <tr><td><code>429 Too Many Requests</code></td><td><a href="rate-limiting.html">Rate limited</a></td><td>Too many follows in an hour</td></tr>
+  <tr><td><code>500</code> / <code>502</code> / <code>503</code> / <code>504</code></td><td>Server error / bad gateway / overloaded / upstream timeout</td><td>Retry with backoff (only if the operation is idempotent)</td></tr>
+</table></div>
+<p>Rule: <strong>4xx = the client must change something; 5xx = the server failed and a retry may succeed.</strong> Clients' retry logic depends on this distinction, so never return 200 with an error inside the body.</p>
+<p>Every error should use <strong>one consistent shape</strong> across all services (the gateway can enforce this):</p>
+<pre><code>HTTP/1.1 400 Bad Request
+Content-Type: application/json
+X-Request-Id: 7f3c9e21-…
+
+{
+  "error": {
+    "code": "CAPTION_TOO_LONG",                 // stable, machine-readable; clients switch on this
+    "message": "Captions can be at most 2,200 characters.",   // human-readable, localisable
+    "details": [ { "field": "caption", "issue": "max_length", "limit": 2200 } ],
+    "request_id": "7f3c9e21-…",                 // lets support/engineers find the trace
+    "retryable": false,
+    "doc_url": "/docs/errors#CAPTION_TOO_LONG"
+  }
+}</code></pre>
+<p>Clients should switch on the stable <code>code</code>, never on the English <code>message</code>. RFC 9457 "Problem Details for HTTP APIs" (<code>application/problem+json</code>) standardises a similar format with <code>type</code>, <code>title</code>, <code>status</code>, <code>detail</code>. Don't leak internals (stack traces, SQL) in errors.</p>
+
+<h2>5. Pagination in depth</h2>
+<p>No endpoint should return an unbounded list — a celebrity has hundreds of millions of followers; a viral post has millions of comments. Lists are returned a <strong>page</strong> at a time.</p>
+
+<h3>5.1 Offset pagination</h3>
+<pre><code>GET /v1/users/42/posts?limit=12&amp;offset=24          (page 3)
+
+SELECT id, caption, created_at
+FROM posts
+WHERE author_id = 42
+ORDER BY created_at DESC, id DESC
+LIMIT 12 OFFSET 24;</code></pre>
+<p>Simple, supports "jump to page 50", and is fine for small, stable lists. But it has two serious problems:</p>
+<ol>
+  <li><strong>Performance degrades with depth.</strong> <code>OFFSET 100000</code> means the database reads and throws away 100,000 rows before returning 12. Deep pages get linearly slower (O(offset + limit)).</li>
+  <li><strong>Items shift when data changes.</strong> If a new post is inserted at the top while you're paging, everything shifts down by one: the first item of page 2 is the last item you already saw on page 1 (duplicate). If an item is deleted, you skip one (missing item). On a feed where new content arrives every second, this happens constantly.</li>
+</ol>
+<pre class="ascii">
+ Page 1 fetched (offset 0, limit 3):     [P10, P9, P8]
+ New post P11 arrives at the top.        list is now [P11, P10, P9, P8, P7, P6 ...]
+ Page 2 fetched (offset 3, limit 3):     [P8, P7, P6]   ← P8 shown TWICE
+</pre>
+
+<h3>5.2 Cursor / keyset pagination</h3>
+<p>Instead of "skip N rows", the client says "give me items <strong>after this one</strong>". The server returns an opaque <strong>cursor</strong> encoding the sort key of the last item; the next query uses it in a <code>WHERE</code> clause that an index can jump to directly.</p>
+<pre><code>-- first page
+SELECT id, caption, created_at
+FROM posts
+WHERE author_id = 42
+ORDER BY created_at DESC, id DESC
+LIMIT 12;
+
+-- next page: last item seen had created_at = '2026-10-20 18:03:11', id = 3198000000000000999
+SELECT id, caption, created_at
+FROM posts
+WHERE author_id = 42
+  AND (created_at, id) &lt; ('2026-10-20 18:03:11', 3198000000000000999)   -- row-value comparison
+ORDER BY created_at DESC, id DESC
+LIMIT 12;
+
+-- supporting index
+CREATE INDEX idx_posts_author_time ON posts (author_id, created_at DESC, id DESC);</code></pre>
+<ul>
+  <li>The <strong>tie-breaker</strong> (<code>id</code>) is essential: two posts can share a timestamp; without it you'd skip or repeat items. With time-ordered 64-bit IDs (Snowflake-style, see <a href="id-generation.html">ID generation</a>), the ID alone can be the sort key: <code>WHERE author_id = 42 AND id &lt; :last_id ORDER BY id DESC</code>.</li>
+  <li>The cursor sent to the client is <strong>opaque</strong>: e.g. Base64 of <code>{"ts":…,"id":…}</code>, ideally signed or encrypted so clients don't depend on (or tamper with) its contents and you can change the format later.</li>
+  <li>In Cassandra (post metadata), the same idea is a clustering-key range query: <code>WHERE user_id = 42 AND post_id &lt; ? LIMIT 12</code>; Cassandra also has its own paging-state token.</li>
+  <li>For Redis timelines (sorted sets scored by time), it's <code>ZREVRANGEBYSCORE timeline:42 (last_score -inf LIMIT 0 10</code>.</li>
+</ul>
+
+<div class="diagram">
+<svg viewBox="0 0 800 250" width="800" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-api-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <text x="200" y="22" text-anchor="middle" font-weight="700">OFFSET 100000 LIMIT 12</text>
+  <text x="600" y="22" text-anchor="middle" font-weight="700">WHERE id &lt; cursor LIMIT 12</text>
+  <g>
+    <rect x="40" y="40" width="320" height="150" rx="8" fill="#fff8e1" stroke="#f9a825"/>
+    <rect x="50" y="50" width="300" height="104" rx="4" fill="#fdecea" stroke="#c62828"/>
+    <text x="200" y="98" text-anchor="middle" font-weight="600">100,000 rows read</text>
+    <text x="200" y="118" text-anchor="middle" font-size="12">and thrown away</text>
+    <rect x="50" y="160" width="300" height="22" rx="4" fill="#e8f5e9" stroke="#2e7d32"/>
+    <text x="200" y="176" text-anchor="middle" font-size="12">12 rows returned</text>
+  </g>
+  <g>
+    <rect x="440" y="40" width="320" height="150" rx="8" fill="#fff8e1" stroke="#f9a825"/>
+    <text x="600" y="70" text-anchor="middle" font-size="12">B-tree index (author_id, id)</text>
+    <path d="M600,80 L600,150" stroke="#555" stroke-width="1.5" marker-end="url(#ar-api-1)" fill="none"/>
+    <text x="610" y="118" font-size="12">seek directly</text>
+    <rect x="450" y="160" width="300" height="22" rx="4" fill="#e8f5e9" stroke="#2e7d32"/>
+    <text x="600" y="176" text-anchor="middle" font-size="12">12 rows read, 12 returned</text>
+  </g>
+  <text x="200" y="222" text-anchor="middle" font-size="12" fill="#c62828">cost grows with page depth: O(offset + limit)</text>
+  <text x="600" y="222" text-anchor="middle" font-size="12" fill="#2e7d32">constant cost per page: O(log n + limit)</text>
+</svg>
+<div class="caption">Offset pagination scans and discards rows; keyset pagination seeks straight to the right place in the index.</div>
+</div>
+
+<h3>5.3 Offset vs cursor compared</h3>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Offset / page number</th><th>Cursor / keyset</th></tr>
+  <tr><td><b>Deep-page performance</b></td><td>Degrades linearly</td><td>Constant (index seek)</td></tr>
+  <tr><td><b>Stable under inserts/deletes</b></td><td>No — duplicates and gaps</td><td>Yes — anchored to the last item seen</td></tr>
+  <tr><td><b>Jump to arbitrary page</b></td><td>Yes</td><td>No (only next/previous)</td></tr>
+  <tr><td><b>Total count / "page 7 of 40"</b></td><td>Natural (but <code>COUNT(*)</code> is expensive at scale)</td><td>Not natural</td></tr>
+  <tr><td><b>Works across sharded / non-SQL stores</b></td><td>Poorly (global offsets across shards are expensive)</td><td>Well (each shard can seek by key)</td></tr>
+  <tr><td><b>Best for</b></td><td>Admin tables, small result sets, search result pages</td><td>Feeds, timelines, comments, followers, infinite scroll</td></tr>
+</table></div>
+<div class="callout tip"><span class="callout-title">💡 Why cursor wins for feeds</span>
+A feed is an <strong>infinite scroll</strong> over a list where new items constantly arrive at the top — exactly where offsets produce duplicates — and users never "jump to page 37". Ranked feeds add a twist: the ranking can change between requests, so the <a href="news-feed.html">Feed service</a> often snapshots the ranked candidate list for a session in cache and the cursor encodes a position in that snapshot (plus the IDs already served), guaranteeing no repeats.</div>
+
+<h2>6. Idempotency keys</h2>
+<p>A user taps "Post comment" on a train. The request reaches the server and the comment is saved, but the response is lost in a tunnel. The app times out and retries. Without protection, the comment is posted <strong>twice</strong>. <code>GET</code>, <code>PUT</code> and <code>DELETE</code> are idempotent by design; <code>POST</code> is not. The fix is an <strong>idempotency key</strong>: a unique ID (UUID v4) the client generates <em>once per user action</em> and sends with every retry of that action.</p>
+<pre class="ascii">
+ App                                   Comment Service                    dedupe table
+  |-- POST /comments  Key: K1 -------&gt;  | INSERT key K1 (in_progress) ---&gt;| ok (new)
+  |                                     | create comment C77               |
+  |                                     | UPDATE K1 → done, response=201 C77
+  |   ✖ response lost (timeout)         |                                  |
+  |-- retry POST /comments Key: K1 ---&gt; | INSERT K1 → conflict, exists ---&gt;| status=done
+  |&lt;-- 201 C77 (stored response replayed, no second comment) ------------|
+</pre>
+<h3>6.1 Implementing it with a dedupe table</h3>
+<pre><code>CREATE TABLE idempotency_keys (
+  user_id        BIGINT       NOT NULL,
+  idem_key       UUID         NOT NULL,
+  request_hash   BYTEA        NOT NULL,     -- hash of method+path+body, to detect key reuse with different payload
+  status         VARCHAR(12)  NOT NULL,     -- in_progress | completed
+  response_code  SMALLINT,
+  response_body  JSONB,
+  created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, idem_key)           -- scoped per user so keys can't collide across users
+);
+-- expire rows after e.g. 24 h with a TTL job (or use Redis SET NX EX / Cassandra TTL)</code></pre>
+<pre><code>def handle_create_comment(user_id, key, request):
+    h = sha256(request.method + request.path + request.body)
+    inserted = db.execute("""INSERT INTO idempotency_keys (user_id, idem_key, request_hash, status)
+                             VALUES (%s, %s, %s, 'in_progress')
+                             ON CONFLICT DO NOTHING""", user_id, key, h).rowcount == 1
+    if not inserted:
+        row = db.get_key(user_id, key)
+        if row.request_hash != h:      return 422/409 "Idempotency key reused with different request"
+        if row.status == "in_progress": return 409 "Request in progress, retry shortly"
+        return Response(row.response_code, row.response_body)      # replay original result
+
+    try:
+        with db.transaction():                                   # ideally same DB/transaction as the write
+            comment = comments.insert(...)
+            db.update_key(user_id, key, status="completed", code=201, body=serialize(comment))
+        return Response(201, comment)
+    except RetryableError:
+        db.delete_key(user_id, key)     # let the client retry for real
+        raise</code></pre>
+<ul>
+  <li><strong>Atomicity:</strong> the best case is writing the business row and the key in the same transaction. If they're in different stores (comment in Cassandra, key in Redis), there's a small window for inconsistency — mitigate by deriving the comment's ID deterministically from the key (e.g. <code>comment_id = hash(user_id, key)</code>) so a duplicate write becomes an idempotent upsert.</li>
+  <li><strong>Natural idempotency:</strong> sometimes you don't need a key. A like is a set membership (<code>(post_id, user_id)</code> primary key) — inserting it twice is harmless. A follow is an edge — same. Design writes as upserts where possible.</li>
+  <li><strong>Client discipline:</strong> generate the key when the user acts, persist it with the pending action (so it survives an app restart), and reuse it for every retry.</li>
+</ul>
+
+<h2>7. Versioning strategies</h2>
+<p>Eventually you'll need a <strong>breaking change</strong>: remove a field, change a type, change semantics. Versioning lets old clients keep the old contract while new clients get the new one.</p>
+<div class="table-wrap"><table>
+  <tr><th>Strategy</th><th>Example</th><th>Pros</th><th>Cons</th></tr>
+  <tr><td><b>URI path</b></td><td><code>/v1/feed</code>, <code>/v2/feed</code></td><td>Explicit, visible in logs, easy routing at the gateway, easy to cache</td><td>Coarse: whole API bumps; URLs aren't "pure" resource IDs</td></tr>
+  <tr><td><b>Query parameter</b></td><td><code>/feed?api_version=2</code></td><td>Easy to add</td><td>Easy to forget; messy caching</td></tr>
+  <tr><td><b>Header</b></td><td><code>Accept: application/vnd.instagram.v2+json</code> or <code>Api-Version: 2026-10-01</code></td><td>Clean URLs; fine-grained</td><td>Less visible; harder to test in a browser</td></tr>
+  <tr><td><b>Date-based versions</b></td><td><code>Stripe-Version: 2024-06-20</code></td><td>Each account pinned to a version; small incremental changes</td><td>Server keeps transformation layers for every date</td></tr>
+  <tr><td><b>No versions, additive-only evolution</b></td><td>Add fields; never remove/rename; GraphQL deprecations</td><td>No version explosion</td><td>Requires strict discipline; cruft accumulates</td></tr>
+</table></div>
+<p>A practical combo: a <strong>major version in the path</strong> (<code>/v1</code>) changed very rarely, plus <strong>additive, backward-compatible evolution</strong> within it, plus the <strong>client app version</strong> sent in a header (<code>User-Agent</code> / <code>X-App-Version: 312.0.0</code>) so the server can adapt behaviour or responses for specific old builds.</p>
+
+<h2>8. Filtering, sorting, field selection and partial responses</h2>
+<pre><code>GET /v1/users/42/posts?media_type=video&amp;since=2026-01-01&amp;limit=12         # filtering
+GET /v1/posts/987/comments?sort=top                                      # sorting (top vs newest)
+GET /v1/users/42?fields=id,username,avatar_url,follower_count            # field selection (sparse fieldsets)
+GET /v1/posts/987?expand=author,top_comments                              # embed related resources</code></pre>
+<ul>
+  <li><strong>Field selection</strong> (sparse fieldsets / partial responses) lets a client ask for only what it renders — e.g. the follower list needs <code>id, username, avatar_url</code>, not bios and counts. Google APIs use <code>fields=</code>; JSON:API uses <code>fields[users]=</code>. This is a lightweight answer to over-fetching; GraphQL generalises it.</li>
+  <li><strong>Expansion</strong> (<code>expand=author</code>) avoids N+1 client calls by embedding related objects.</li>
+  <li><strong>Whitelist</strong> filterable/sortable fields — arbitrary filters let clients construct queries your indexes can't serve (slow queries, DoS). Every allowed filter should map to an index.</li>
+  <li><strong>Partial responses on failure:</strong> if a non-critical dependency fails (e.g. "top comments"), return the post without it plus an indication, rather than failing the whole request.</li>
+  <li><strong>Compression and conditional requests:</strong> <code>Accept-Encoding: br, gzip</code> shrinks JSON 70–90%; <code>ETag</code>/<code>If-None-Match</code> avoids resending unchanged data.</li>
+</ul>
+
+<h2>9. gRPC: fast internal service-to-service calls</h2>
+<p><strong>gRPC</strong> (open-sourced by Google in 2015) is an RPC framework: you call a method on a remote service as if it were a local function. Its building blocks:</p>
+<ul>
+  <li><strong>Protocol Buffers (protobuf)</strong> — a schema language and compact binary encoding. Messages are typically 3–10× smaller than equivalent JSON and much faster to parse. Fields are identified by <em>numbers</em>, not names, which makes evolution safe: add new field numbers, never reuse old ones.</li>
+  <li><strong>HTTP/2</strong> transport — multiplexes many concurrent calls over one TCP connection, header compression, flow control.</li>
+  <li><strong>Code generation</strong> — client stubs and server interfaces generated for Go, Java, C++, Python, etc. Strongly typed contracts across languages.</li>
+  <li><strong>Four call types:</strong> unary (request → response), server streaming, client streaming, and bidirectional streaming.</li>
+  <li><strong>Deadlines and cancellation</strong> propagate across calls — essential for <a href="resilience-patterns.html">resilience</a>.</li>
+</ul>
+<pre><code>syntax = "proto3";
+package graph.v1;
+
+service GraphService {
+  rpc GetFollowers (GetFollowersRequest) returns (GetFollowersResponse);              // unary
+  rpc CheckRelationships (CheckRelationshipsRequest) returns (CheckRelationshipsResponse);
+  rpc StreamFollowers (GetFollowersRequest) returns (stream User);                    // server streaming
+}
+
+message GetFollowersRequest {
+  int64  user_id = 1;
+  string cursor  = 2;
+  int32  limit   = 3;
+}
+message User { int64 id = 1; string username = 2; string avatar_url = 3; }
+message GetFollowersResponse { repeated User users = 1; string next_cursor = 2; }
+
+message CheckRelationshipsRequest { int64 viewer_id = 1; repeated int64 target_ids = 2; }
+message CheckRelationshipsResponse { map&lt;int64, Relationship&gt; relationships = 1; }
+message Relationship { bool following = 1; bool blocked_either_way = 2; bool close_friend = 3; }</code></pre>
+<p>Why it's typical <em>internally</em>: the Feed service may call the Graph service, Post service and ranking service dozens of times per feed request; binary encoding, persistent multiplexed connections and generated typed clients save CPU and latency at that volume. Why it's less common <em>for public/browser clients</em>: browsers can't speak native gRPC (they need gRPC-Web via a proxy), binary payloads are harder to debug, and HTTP caching/CDNs don't apply naturally. The <a href="api-gateway.html">API gateway</a> often translates external JSON/REST into internal gRPC. Meta internally uses its own Thrift-based RPC framework — the same idea (IDL + binary encoding + generated clients); Thrift itself was created at Facebook.</p>
+
+<h2>10. GraphQL</h2>
+<p><strong>GraphQL</strong> was created at Facebook in 2012 to power its mobile News Feed and open-sourced in 2015. It's a query language plus runtime: the server publishes a typed <strong>schema</strong>; the client sends a <strong>query</strong> naming exactly the fields it needs, usually to a single endpoint (<code>POST /graphql</code>).</p>
+<h3>10.1 Over-fetching and under-fetching</h3>
+<ul>
+  <li><strong>Over-fetching:</strong> <code>GET /v1/users/42</code> returns 40 fields; the follower-list row needs 3. Wasted bytes on mobile.</li>
+  <li><strong>Under-fetching:</strong> the post-detail screen needs the post, its author, the first comments with their authors, and whether you follow the author — several REST calls (or a bespoke endpoint).</li>
+</ul>
+<pre><code>query PostDetail($id: ID!) {
+  post(id: $id) {
+    id
+    caption
+    likeCount
+    viewerHasLiked
+    author { id username avatarUrl(size: 150) viewerIsFollowing }
+    comments(first: 3) {
+      edges { node { id text author { username } } }
+      pageInfo { endCursor hasNextPage }       # cursor pagination built into the Relay spec
+    }
+  }
+}
+
+mutation Like($id: ID!) { likePost(postId: $id) { post { id likeCount viewerHasLiked } } }</code></pre>
+<p>Also: <strong>mutations</strong> for writes, <strong>subscriptions</strong> for real-time updates (typically over WebSockets), introspection for tooling, and the Relay <strong>connection</strong> spec standardising cursor pagination.</p>
+<h3>10.2 GraphQL challenges</h3>
+<ul>
+  <li><strong>Caching:</strong> one POST endpoint defeats HTTP/CDN caching; use client-side normalised caches (Relay/Apollo) and <strong>persisted queries</strong> (clients send a hash of a pre-registered query — smaller requests, GET-cacheable, and only approved queries can run).</li>
+  <li><strong>Expensive queries:</strong> a nested query can explode (followers → their followers → …). Enforce depth/complexity limits and cost-based rate limiting.</li>
+  <li><strong>N+1 resolvers:</strong> batch with DataLoader.</li>
+  <li><strong>Errors:</strong> responses are often HTTP 200 with an <code>errors</code> array — monitoring must look inside the body.</li>
+</ul>
+
+<h2>11. REST vs gRPC vs GraphQL</h2>
+<div class="table-wrap"><table>
+  <tr><th></th><th>REST (JSON over HTTP)</th><th>gRPC</th><th>GraphQL</th></tr>
+  <tr><td><b>Model</b></td><td>Resources + HTTP verbs</td><td>Remote procedure calls (methods)</td><td>Typed graph; client-specified queries</td></tr>
+  <tr><td><b>Payload</b></td><td>JSON (text)</td><td>Protobuf (binary, compact)</td><td>JSON response shaped like the query</td></tr>
+  <tr><td><b>Transport</b></td><td>HTTP/1.1, 2 or 3</td><td>HTTP/2 (required)</td><td>Usually HTTP POST; WebSocket for subscriptions</td></tr>
+  <tr><td><b>Contract</b></td><td>Optional (OpenAPI)</td><td>Mandatory <code>.proto</code>, code-generated</td><td>Mandatory schema, introspectable</td></tr>
+  <tr><td><b>Fetching efficiency</b></td><td>Over/under-fetching common</td><td>Fixed messages per method</td><td>Exactly the fields requested</td></tr>
+  <tr><td><b>Streaming</b></td><td>Limited (SSE, chunked)</td><td>Native: client, server, bidirectional</td><td>Subscriptions</td></tr>
+  <tr><td><b>HTTP caching / CDN</b></td><td>Excellent (GET + Cache-Control/ETag)</td><td>Poor</td><td>Poor unless persisted GET queries</td></tr>
+  <tr><td><b>Browser support</b></td><td>Native</td><td>Needs gRPC-Web proxy</td><td>Native</td></tr>
+  <tr><td><b>Debuggability</b></td><td>Easy (curl, readable)</td><td>Needs tooling (grpcurl)</td><td>Good tooling (GraphiQL)</td></tr>
+  <tr><td><b>Best for</b></td><td>Public APIs, simple CRUD, cacheable reads</td><td>Internal microservice calls, low latency, polyglot</td><td>Client-driven UIs with many screens and nested data</td></tr>
+  <tr><td><b>In our Instagram design</b></td><td>Public mobile/web API (this lesson's table)</td><td>Feed ↔ Graph ↔ Post ↔ Ranking services</td><td>Gateway/BFF layer for complex screens</td></tr>
+</table></div>
+
+<h2>12. Real-time: polling, long polling, SSE and WebSockets</h2>
+<p>HTTP is request/response: the client asks, the server answers. But DMs, typing indicators, "X is live" banners and new-comment counts need the <strong>server to push</strong>. Four techniques:</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 300" width="820" xmlns="http://www.w3.org/2000/svg" font-size="12">
+  <defs><marker id="ar-api-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="700" font-size="13" text-anchor="middle">
+    <text x="105" y="20">Short polling</text><text x="305" y="20">Long polling</text><text x="505" y="20">SSE</text><text x="705" y="20">WebSocket</text>
+  </g>
+  <g fill="#555" text-anchor="middle" font-size="11">
+    <text x="45" y="40">client</text><text x="165" y="40">server</text>
+    <text x="245" y="40">client</text><text x="365" y="40">server</text>
+    <text x="445" y="40">client</text><text x="565" y="40">server</text>
+    <text x="645" y="40">client</text><text x="765" y="40">server</text>
+  </g>
+  <g stroke="#90a4ae" stroke-width="2">
+    <path d="M45,48 V285"/><path d="M165,48 V285"/><path d="M245,48 V285"/><path d="M365,48 V285"/>
+    <path d="M445,48 V285"/><path d="M565,48 V285"/><path d="M645,48 V285"/><path d="M765,48 V285"/>
+  </g>
+  <g stroke="#0277bd" stroke-width="1.4" fill="none" marker-end="url(#ar-api-2)">
+    <path d="M45,60 L163,70"/><path d="M45,120 L163,130"/><path d="M45,180 L163,190"/><path d="M45,240 L163,250"/>
+    <path d="M245,60 L363,70"/><path d="M245,190 L363,200"/>
+    <path d="M445,60 L563,70"/>
+    <path d="M645,60 L763,70"/><path d="M645,170 L763,180"/><path d="M645,250 L763,260"/>
+  </g>
+  <g stroke="#2e7d32" stroke-width="1.4" fill="none" marker-end="url(#ar-api-2)">
+    <path d="M165,75 L47,85"/><path d="M165,135 L47,145"/><path d="M165,195 L47,205"/><path d="M165,255 L47,265"/>
+    <path d="M365,170 L247,180"/><path d="M365,275 L247,283"/>
+    <path d="M565,110 L447,120"/><path d="M565,170 L447,180"/><path d="M565,240 L447,250"/>
+    <path d="M765,100 L647,110"/><path d="M765,140 L647,150"/><path d="M765,210 L647,220"/>
+  </g>
+  <g font-size="10.5" fill="#555">
+    <text x="105" y="102" text-anchor="middle">"nothing new"</text>
+    <text x="105" y="162" text-anchor="middle">"nothing new"</text>
+    <text x="305" y="120" text-anchor="middle">server holds</text>
+    <text x="305" y="135" text-anchor="middle">request open…</text>
+    <text x="305" y="168" text-anchor="middle">event!</text>
+    <text x="505" y="95" text-anchor="middle">one HTTP response,</text>
+    <text x="505" y="108" text-anchor="middle">events streamed</text>
+    <text x="705" y="90" text-anchor="middle">upgrade, then both</text>
+    <text x="705" y="128" text-anchor="middle">directions anytime</text>
+  </g>
+</svg>
+<div class="caption">Blue = client → server, green = server → client. Polling wastes requests; long polling waits; SSE streams one way; WebSockets are full duplex.</div>
+</div>
+
+<h3>12.1 Short polling</h3>
+<p>The client asks every N seconds: <code>GET /v1/dm/threads/55/messages?after=msg_900</code>. Trivial to build and works everywhere, but most responses are empty and latency averages N/2. Worked example: 50M online users polling every 5 s = <strong>10M requests/s</strong>, nearly all returning "nothing new" — and still up to 5 s delay. Fine for rarely-changing data (badge counts refreshed every minute).</p>
+<h3>12.2 Long polling</h3>
+<p>The client sends a request; the server <strong>holds it open</strong> until there's new data (or ~30 s timeout), then responds; the client immediately re-requests. Near-instant delivery with plain HTTP, but each event costs a full request/response cycle, and the server must hold many idle connections. Was common before WebSockets were widely supported (early Facebook chat used it).</p>
+<h3>12.3 Server-Sent Events (SSE)</h3>
+<p>The client opens <code>GET /v1/live/events</code> with <code>Accept: text/event-stream</code>; the server keeps the response open and writes events as lines of text (<code>data: {...}\n\n</code>). Built into browsers (<code>EventSource</code>) with automatic reconnection and <code>Last-Event-ID</code> resume. <strong>One-way</strong> (server → client) — the client sends data via normal HTTP requests. Great for live like counters, notifications, live-stream comment feeds.</p>
+<h3>12.4 WebSockets</h3>
+<p>The client sends an HTTP request with <code>Upgrade: websocket</code>; after the <code>101 Switching Protocols</code> handshake, the TCP connection becomes a <strong>persistent, full-duplex</strong> channel carrying small frames in both directions (2–14 bytes of framing overhead per message). Ideal for chat, typing indicators, presence and multiplayer.</p>
+<pre><code>// client → server over WebSocket /v1/dm
+{ "type": "send_message", "client_msg_id": "c-81f2", "thread_id": "55", "text": "On my way!" }
+// server → client (ack, carries server-assigned ID and ordering)
+{ "type": "ack", "client_msg_id": "c-81f2", "message_id": "3209900000000000777", "ts": 1793099901 }
+// server → recipient
+{ "type": "new_message", "thread_id": "55", "message_id": "3209900000000000777", "from": "42", "text": "On my way!" }
+{ "type": "typing", "thread_id": "55", "user_id": "42", "state": "start" }</code></pre>
+<p>Costs: stateful connections (a DM server must track which user is connected to which machine — see <a href="direct-messaging.html">Direct Messaging</a>), load balancers must support long-lived connections, deploys must drain connections gracefully, and mobile OSes kill background sockets (so offline users get <a href="notifications.html">push notifications</a> via APNs/FCM instead). Client-generated <code>client_msg_id</code>s make sends idempotent across reconnects.</p>
+
+<h3>12.5 Comparison</h3>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Short polling</th><th>Long polling</th><th>SSE</th><th>WebSockets</th></tr>
+  <tr><td><b>Direction</b></td><td>Client pulls</td><td>Client pulls (server delays answer)</td><td>Server → client</td><td>Both ways</td></tr>
+  <tr><td><b>Latency</b></td><td>Up to the poll interval</td><td>Near real-time</td><td>Real-time</td><td>Real-time</td></tr>
+  <tr><td><b>Overhead</b></td><td>High (many empty requests)</td><td>Medium (request per event)</td><td>Low</td><td>Lowest per message</td></tr>
+  <tr><td><b>Server state</b></td><td>None</td><td>Held requests</td><td>Open connections</td><td>Open connections + session</td></tr>
+  <tr><td><b>Infra friendliness</b></td><td>Works everywhere</td><td>Works everywhere; timeouts to tune</td><td>Plain HTTP; HTTP/2 friendly</td><td>Needs LB/proxy support for upgrades and long-lived connections</td></tr>
+  <tr><td><b>Instagram use</b></td><td>Infrequent refresh (e.g. config)</td><td>Fallback when sockets blocked</td><td>Live counters / notifications on web</td><td>DMs, typing, presence, live interactions</td></tr>
+</table></div>
+<p>Note: Facebook Messenger and Instagram's mobile messaging have publicly been described as using <strong>MQTT</strong> (a lightweight publish/subscribe protocol designed for unreliable networks) over persistent connections — the same "persistent bidirectional connection" idea as WebSockets, optimised for battery and bandwidth. Our diagram labels it simply as WebSocket.</p>
+
+<h2>13. Backward compatibility for old mobile clients</h2>
+<p>Assume ~10% of active users run an app version older than 6 months, and some phones never update. Rules that keep them working:</p>
+<div class="cards">
+  <div class="card"><h4>➕ Additive changes only</h4><p>Add new optional fields, endpoints and enum values. Never remove or rename fields or change their types/meaning within a version.</p></div>
+  <div class="card"><h4>🧭 Tolerant reader</h4><p>Clients must ignore unknown fields and handle unknown enum values with a sensible default (e.g. unknown media type → "update the app to view").</p></div>
+  <div class="card"><h4>🔢 Send the app version</h4><p>Every request carries <code>X-App-Version</code>; the server/BFF can tailor responses (e.g. don't send Reels to builds that can't render them).</p></div>
+  <div class="card"><h4>🚩 Feature flags</h4><p>Server-driven flags turn features on per version/user, decoupling releases from deployments.</p></div>
+  <div class="card"><h4>📉 Deprecation telemetry</h4><p>Measure traffic per endpoint per app version; only remove an old path when its usage is negligible.</p></div>
+  <div class="card"><h4>⛔ Minimum supported version</h4><p>For truly unsupported builds (security fixes), return <code>426</code> / a force-upgrade payload that old apps were designed to display.</p></div>
+</div>
+<p>Contract tests (e.g. golden JSON responses per supported app version, protobuf breaking-change detectors like <code>buf breaking</code>) catch accidental breaks in CI. With protobuf: never reuse a field number, mark removed fields <code>reserved</code>. With GraphQL: mark fields <code>@deprecated</code> and track usage before removal.</p>
+
+<h2>14. API security basics</h2>
+<ul>
+  <li><strong>TLS everywhere</strong> (HTTPS only, HSTS on web, certificate pinning in mobile apps). See <a href="networking-basics.html">Networking Basics</a>.</li>
+  <li><strong>Authentication</strong> via <code>Authorization: Bearer</code> tokens validated at the gateway; never put tokens in URLs (they end up in logs and referrers). See <a href="authentication.html">Authentication</a>.</li>
+  <li><strong>Object-level authorization in every handler</strong> — prevent IDOR (the #1 item in the OWASP API Security Top 10, "Broken Object Level Authorization").</li>
+  <li><strong>Input validation</strong> — types, lengths, allowed values; parameterised queries (no SQL injection); output encoding for anything rendered in web views.</li>
+  <li><strong>Avoid mass assignment</strong> — <code>PATCH /v1/users/42 {"is_verified": true}</code> must not let a user grant themselves a blue tick; whitelist writable fields.</li>
+  <li><strong>Return only needed data</strong> — don't serialise whole DB rows (emails, phone numbers) and rely on the client to hide them ("excessive data exposure").</li>
+  <li><strong><a href="rate-limiting.html">Rate limiting</a></strong> and payload size limits; pagination caps (<code>limit</code> ≤ 50).</li>
+  <li><strong>Non-enumerable IDs and uniform errors</strong> to slow scraping and user enumeration.</li>
+  <li><strong>CORS</strong> restricted to your web origins; CSRF protection for cookie-authenticated web endpoints.</li>
+  <li><strong>Signed, expiring URLs</strong> for media upload/download (<a href="cdn.html">CDN</a>, <a href="object-storage.html">object storage</a>).</li>
+  <li><strong>Audit logs</strong> for sensitive actions; no secrets or tokens in logs. See <a href="security.html">Security</a>.</li>
+</ul>
+
+<h2>15. How Instagram uses these API styles</h2>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+Instagram's apps talk to a private HTTP/JSON API (historically served by its Django/Python backend under paths like <code>/api/v1/…</code>) and, increasingly, GraphQL — which Meta created for exactly this mobile use case. Internally, Meta services communicate over Thrift-based RPC, and Instagram/Messenger messaging has been publicly described as using MQTT over persistent connections. Our course design maps these onto: <strong>REST/JSON (and GraphQL) at the edge, gRPC-style RPC between services, WebSockets for DMs</strong>.</div>
+
+<div class="flow">
+  <div class="fnode client">📱 App<small>REST/JSON or GraphQL</small></div><div class="farrow">→<small>HTTPS</small></div>
+  <div class="fnode edge">API Gateway / BFF<small>auth, version, transcoding</small></div><div class="farrow">→<small>gRPC</small></div>
+  <div class="fnode svc">Feed Service</div><div class="farrow">→<small>gRPC (batch)</small></div>
+  <div class="fnode svc">Graph / Post / Ranking</div><div class="farrow">→</div>
+  <div class="fnode store">Redis · Cassandra · PostgreSQL</div>
+</div>
+
+<h3>15.1 Opening the app: one feed request</h3>
+<ol class="steps">
+  <li>App sends <code>GET /v1/feed?limit=10</code> with <code>Authorization</code>, <code>X-App-Version</code>, <code>Accept-Encoding: br</code>.</li>
+  <li>Gateway authenticates, rate limits, routes to the Feed service (translating JSON ↔ gRPC if needed).</li>
+  <li>Feed service reads the user's precomputed timeline from Redis (post IDs), calls the ranking service, then hydrates posts with batched gRPC calls: <code>Post.GetPosts(ids)</code>, <code>Graph.CheckRelationships(viewer, authors)</code>, <code>Likes.GetCounts(ids)</code>.</li>
+  <li>It filters anything the viewer can't see, builds signed CDN URLs, and returns 10 items with a <code>next_cursor</code> that encodes the position in the ranked snapshot.</li>
+  <li>The app renders, fetches images from the <a href="cdn.html">CDN</a>, and as the user nears the end, requests the next page with the cursor. A like taps <code>POST /v1/posts/{id}/likes</code> — naturally idempotent.</li>
+</ol>
+<h3>15.2 Rough numbers: payload size matters</h3>
+<pre><code>Assume 500M DAU × 30 feed pages/day = 15B feed responses/day.
+JSON page with full objects: ~40 KB; with field selection + brotli: ~8 KB.
+Saving: 32 KB × 15B ≈ 480 TB/day of mobile egress (≈ 44 Gbps average) — for one endpoint.
+Internal: one feed page → ~5 batched RPCs; protobuf vs JSON cuts serialization CPU by several ×
+across ~75B internal calls/day.</code></pre>
+
+<h2>16. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Good API design gives you</h4><ul>
+    <li>Clients and services that evolve independently</li>
+    <li>Safe retries on flaky mobile networks (idempotency)</li>
+    <li>Stable, fast pagination over huge, changing lists</li>
+    <li>Smaller payloads, less battery and data use</li>
+    <li>Fewer security bugs through consistent conventions</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Tensions to manage</h4><ul>
+    <li>Flexibility (GraphQL) vs cacheability and cost control (REST)</li>
+    <li>Efficiency (gRPC binary) vs debuggability and browser support</li>
+    <li>Supporting old clients vs accumulating compatibility cruft</li>
+    <li>Real-time push vs stateful connection infrastructure</li>
+    <li>Cursor pagination's speed vs no random page access</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Offset pagination on feeds</strong> → duplicates, gaps and slow deep pages.</li>
+  <li><strong>Non-idempotent POSTs retried</strong> by clients or gateways → duplicate posts/comments/payments.</li>
+  <li><strong>Breaking changes inside a version</strong> (renaming a field) → crashes in old app builds.</li>
+  <li><strong>64-bit IDs as JSON numbers</strong> → precision loss in JavaScript.</li>
+  <li><strong>200 OK with an error body</strong> → clients and monitoring can't tell failures apart.</li>
+  <li><strong>Chatty APIs</strong> — many tiny calls per screen over high-latency mobile links; aggregate or use GraphQL/BFF.</li>
+  <li><strong>Unbounded <code>limit</code></strong> or unindexed filters → one request scans millions of rows.</li>
+  <li><strong>Polling at scale</strong> when a push channel is needed — millions of empty requests per second.</li>
+</ul>
+
+<h2>17. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>What it's for</th><th>When to use</th></tr>
+  <tr><td><b>OpenAPI (Swagger)</b></td><td>Describe REST APIs; generate docs, clients, validators</td><td>Any REST API with multiple consumers</td></tr>
+  <tr><td><b>gRPC + Protocol Buffers, buf</b></td><td>RPC framework, schema, breaking-change checks</td><td>Internal service-to-service calls</td></tr>
+  <tr><td><b>Apache Thrift</b></td><td>RPC/IDL framework created at Facebook</td><td>Similar to gRPC; common in older large-scale stacks</td></tr>
+  <tr><td><b>GraphQL (Relay, Apollo, graphql-java, Hot Chocolate)</b></td><td>Client-driven queries, federation</td><td>Product UIs with many screens and nested data</td></tr>
+  <tr><td><b>WebSocket servers (Socket.IO, Netty, uWebSockets), MQTT brokers</b></td><td>Persistent bidirectional connections</td><td>Chat, presence, live updates</td></tr>
+  <tr><td><b>SSE (EventSource)</b></td><td>Simple server push over HTTP</td><td>One-way live feeds and notifications on web</td></tr>
+  <tr><td><b>Postman, curl, grpcurl, GraphiQL</b></td><td>Testing and exploration</td><td>Development and debugging</td></tr>
+</table></div>
+
+<h2>18. Interview corner</h2>
+<details class="qa"><summary>Design the core APIs for Instagram.</summary>
+<p>Resources: users, posts, media, comments, likes, follows, stories, feed, search, DMs. Endpoints: <code>POST /v1/media/upload-url</code> (pre-signed upload), <code>POST /v1/posts</code> (with Idempotency-Key; returns 201/202 while processing), <code>GET /v1/feed?cursor&amp;limit</code>, <code>GET /v1/users/{id}/posts?cursor</code>, <code>POST|DELETE /v1/posts/{id}/likes</code>, <code>GET|POST /v1/posts/{id}/comments</code>, <code>POST|DELETE /v1/users/{id}/follow</code>, <code>GET /v1/search?q&amp;type</code>, <code>GET /v1/stories/tray</code>, WebSocket <code>/v1/dm</code>. Cross-cutting: Bearer tokens, cursor pagination everywhere, string IDs, a consistent error envelope, 429 with Retry-After, path versioning with additive evolution, signed CDN URLs in responses rather than media bytes.</p></details>
+<details class="qa"><summary>Offset or cursor pagination for the feed? Explain with SQL.</summary>
+<p>Cursor/keyset. Offset (<code>LIMIT 10 OFFSET 1000</code>) scans and discards rows, so deep pages get slower, and inserts at the top shift items causing duplicates/gaps during infinite scroll. Keyset uses the last seen sort key: <code>WHERE (created_at, id) &lt; (:ts, :id) ORDER BY created_at DESC, id DESC LIMIT 10</code> with an index on <code>(author_id, created_at, id)</code> — an index seek, constant cost, stable under inserts. Return an opaque, signed cursor. For a ranked feed, the cursor encodes a position in a cached ranked snapshot.</p></details>
+<details class="qa"><summary>How do you make "create post" safe to retry?</summary>
+<p>Client generates an Idempotency-Key (UUID) per user action and resends it on every retry. Server inserts <code>(user_id, key, request_hash, in_progress)</code> into a dedupe table with a unique constraint; if it already exists and is completed, replay the stored response; if in progress, return 409; if the request hash differs, reject. Perform the post creation and mark the key completed atomically (same transaction, or deterministic post IDs derived from the key so duplicate writes are upserts). Expire keys after ~24 h.</p></details>
+<details class="qa"><summary>When would you use gRPC vs REST vs GraphQL in this system?</summary>
+<p>REST/JSON for the public mobile/web API — universally supported, cacheable, easy to debug, natural with a gateway. gRPC for internal service-to-service calls: compact protobuf, HTTP/2 multiplexing, generated typed clients, deadlines and streaming — matters when one feed request makes dozens of internal calls. GraphQL at the edge/BFF for complex client screens to avoid over/under-fetching and multiple round trips, with persisted queries and cost limits.</p></details>
+<details class="qa"><summary>How would you deliver DMs in real time? Why not polling?</summary>
+<p>Persistent bidirectional connections (WebSockets, or MQTT on mobile) from the app to a gateway tier of connection servers; a session registry maps user → connection server; messages are persisted to the message store, then routed to the recipient's connection; offline recipients get push notifications. Polling at 50M concurrent users every 5 s would be 10M req/s of mostly empty responses with seconds of latency; long polling helps latency but still costs a request per event. SSE is one-way, and chat needs client → server typing/read events too.</p></details>
+<details class="qa"><summary>You need to rename a field in the feed response. Millions of users run old app versions. What do you do?</summary>
+<p>Don't rename in place. Add the new field alongside the old one (populate both), ship app versions that read the new field, monitor usage of the old field by app version, and remove it only when traffic from versions that need it is negligible — or in the next major API version. Alternatively, have the mobile BFF shape responses per <code>X-App-Version</code>. Add contract tests to prevent accidental breaks.</p></details>
+
+<h2>19. Check your understanding</h2>
+<details class="quiz"><summary>Which of these are idempotent: (a) <code>GET /v1/feed</code>, (b) <code>POST /v1/posts/9/comments</code>, (c) <code>DELETE /v1/posts/9/likes</code>, (d) <code>PUT /v1/users/42/settings</code>?</summary>
+<p>(a), (c) and (d). Repeating them leaves the server in the same state. (b) creates a new comment each time unless you add an idempotency key.</p></details>
+<details class="quiz"><summary>Offset pagination: the query <code>LIMIT 20 OFFSET 200000</code> takes 900 ms while page 1 takes 3 ms. Why, and what's the fix?</summary>
+<p>The database must walk and discard 200,000 rows before returning 20 — cost grows with the offset. Switch to keyset pagination (<code>WHERE id &lt; :last_id ORDER BY id DESC LIMIT 20</code>) backed by an index; every page then costs about the same as page 1.</p></details>
+<details class="quiz"><summary>A post ID is 3209876600000001234. Why return it as a JSON string?</summary>
+<p>JavaScript numbers are IEEE-754 doubles, exact only up to 2<sup>53</sup> − 1 ≈ 9.007 × 10<sup>15</sup>. This ID (~3.2 × 10<sup>18</sup>) would be rounded, so the web client would request the wrong post. Strings preserve every digit.</p></details>
+<details class="quiz"><summary>The client gets a 503 on <code>POST /v1/posts</code> with no idempotency key. Should it retry automatically?</summary>
+<p>Not safely. A 503 (or a timeout) doesn't tell you whether the post was created before the failure. Retrying could create a duplicate. With an idempotency key, retrying is safe — the server replays the original result if it already succeeded.</p></details>
+<details class="quiz"><summary>40M users are online; you consider short polling every 10 s for new-notification badges. How many requests/s is that, and what alternatives exist?</summary>
+<p>40M / 10 s = 4M requests/s, mostly empty. Alternatives: piggyback badge counts on other responses, use a push channel (the existing DM/MQTT/WebSocket connection, or SSE on web), or poll much less often with push notifications for urgent events.</p></details>
+<details class="quiz"><summary>Which real-time technique fits each: (a) live like counter on a web post page, (b) DMs with typing indicators, (c) refreshing remote config once an hour?</summary>
+<p>(a) SSE — one-way server push, simple over HTTP. (b) WebSockets (or MQTT) — bidirectional, low-latency. (c) Short polling — infrequent and simple; push infrastructure isn't worth it.</p></details>
+<details class="quiz"><summary>A client sends <code>PATCH /v1/users/42 {"bio": "hi", "is_verified": true}</code> and becomes verified. Name the vulnerability and the fix.</summary>
+<p>Mass assignment. The handler blindly copied request fields onto the model. Fix: whitelist client-writable fields (bio, display name, etc.) per endpoint and ignore or reject anything else; enforce authorization on sensitive fields server-side.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Design APIs as <strong>stable contracts</strong>: resources + verbs, stateless requests, string IDs, consistent errors and status codes.</li>
+    <li><strong>Cursor/keyset pagination</strong> for feeds and lists; <strong>idempotency keys</strong> (dedupe table) for retry-safe writes.</li>
+    <li>Evolve <strong>additively</strong>, send the app version, and only break things in a new major version — old mobile clients live for years.</li>
+    <li><strong>REST at the edge, gRPC inside, GraphQL for flexible client screens</strong>; pick by audience and constraints.</li>
+    <li>For real-time, choose by direction and scale: <strong>polling → long polling → SSE → WebSockets</strong>; DMs need persistent bidirectional connections.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="api-gateway.html">API Gateway</a> — routes, authenticates and translates these APIs</li>
+  <li><a href="authentication.html">Authentication &amp; Authorization</a> — Bearer tokens and object-level checks behind every endpoint</li>
+  <li><a href="rate-limiting.html">Rate Limiting</a> — 429s and quotas on the API</li>
+  <li><a href="news-feed.html">News Feed</a> — the service behind <code>GET /v1/feed</code> and its ranked cursors</li>
+  <li><a href="media-upload.html">Media Upload &amp; Pre-signed URLs</a> — the two-step upload API</li>
+  <li><a href="direct-messaging.html">Real-time Direct Messaging</a> — the WebSocket channel in depth</li>
+  <li><a href="id-generation.html">Unique ID Generation</a> — the 64-bit IDs used as cursors</li>
+  <li><a href="networking-basics.html">Networking Basics</a> — HTTP/1.1 vs HTTP/2, TLS and TCP under these protocols</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

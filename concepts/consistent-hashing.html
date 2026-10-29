@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Consistent Hashing — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="consistent-hashing">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>Routing keys with <code>hash(key) mod N</code> is perfectly even — until N changes: going from 4 to 5 servers moves <strong>~80% of all keys</strong>, which for a cache means a sudden flood of misses onto the database.</li>
+    <li><strong>Consistent hashing</strong> places both servers and keys on a <strong>ring</strong> (the hash space bent into a circle). A key belongs to the <strong>first server clockwise</strong> from it, found by <strong>binary search</strong> over sorted server positions.</li>
+    <li>Adding or removing a server moves only the keys in one arc — about <strong>K/N</strong> keys (≈20% when going from 4 to 5), and they move only to/from the changed server.</li>
+    <li><strong>Virtual nodes</strong> (many ring positions per server) fix uneven arcs, spread a failed server's load across all survivors, and let bigger machines take proportionally more keys. <strong>Replicas</strong> are the next N <em>distinct</em> servers clockwise.</li>
+    <li>Used by Cassandra, Dynamo/Riak, memcached clients (ketama), load balancers (Envoy, HAProxy, Nginx) and CDNs. Alternatives: <strong>rendezvous (HRW)</strong>, <strong>jump consistent hash</strong>, and <strong>consistent hashing with bounded loads</strong>. At Instagram it underpins cache clusters and Cassandra's token ring.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why <code>hash(key) mod N</code> breaks when N changes</h2>
+<p>Instagram's <a href="caching.html">feed cache</a> spreads hundreds of millions of keys (timelines, counters, profile objects) across many Redis/Memcached servers. Each app server must decide, with no coordination, which cache server holds a key. The obvious answer:</p>
+<pre><code>server_index = hash(key) mod N        # N = number of cache servers</code></pre>
+<p>It's fast, stateless and — with a good hash — spreads keys evenly. The problem is what happens when <strong>N changes</strong>: a server crashes (N decreases) or you add capacity before a big event (N increases). Almost every key's <code>mod N</code> result changes, so almost every key is now "on the wrong server".</p>
+
+<h3>1.1 Worked example: 12 keys, 4 → 5 servers</h3>
+<p>Take keys whose hashes are 0–11 for simplicity:</p>
+<div class="table-wrap"><table>
+  <tr><th>hash(key)</th><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th><th>9</th><th>10</th><th>11</th></tr>
+  <tr><td><b>mod 4</b></td><td>0</td><td>1</td><td>2</td><td>3</td><td>0</td><td>1</td><td>2</td><td>3</td><td>0</td><td>1</td><td>2</td><td>3</td></tr>
+  <tr><td><b>mod 5</b></td><td>0</td><td>1</td><td>2</td><td>3</td><td>4</td><td>0</td><td>1</td><td>2</td><td>3</td><td>4</td><td>0</td><td>1</td></tr>
+  <tr><td><b>Moved?</b></td><td>–</td><td>–</td><td>–</td><td>–</td><td>✘</td><td>✘</td><td>✘</td><td>✘</td><td>✘</td><td>✘</td><td>✘</td><td>✘</td></tr>
+</table></div>
+<p>8 of 12 keys moved (67%) here. In general a key stays put only if <code>h mod 4 = h mod 5</code>, which is true for 4 out of every 20 consecutive hash values — so over many keys, <strong>80% move</strong>. The general rule for going from N to N+1 servers with mod hashing: only about <strong>1/(N+1)</strong> of keys stay; the fraction that moves is <strong>N/(N+1)</strong>. The bigger the cluster, the worse it gets: going from 100 to 101 servers moves ~99% of keys — to add 1% capacity!</p>
+<pre><code>Assume Instagram's cache tier: 100 M hot keys on 4 servers, 95% hit ratio, 1 M reads/s.
+Add a 5th server with mod-N routing:
+  80 M keys are now looked up on the "wrong" server → miss
+  hit ratio collapses from 95% to roughly 0.95 × 20% ≈ 19%
+  database reads jump from 50,000/s (5% misses) to ~810,000/s  → the database falls over.
+
+Removing a failed server (4 → 3) is just as bad: a key stays only if h mod 4 = h mod 3,
+true for 3 of every 12 values → 75% of keys move, at exactly the moment you're already degraded.</code></pre>
+<p>For a database (rather than a cache), "moving" means physically copying 80% of the data across the network while serving traffic. We need a mapping where <strong>adding or removing one server moves only the keys that must move</strong> — ideally just 1/N of them. That's what consistent hashing provides (Karger et al., 1997, originally designed for distributed web caching — the work that led to Akamai's CDN).</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy: a round table of hosts</span>
+  Picture a big round table with numbered seats 0–359. A few <strong>hosts</strong> sit at fixed seats (say 20, 110, 200, 290). Each arriving <strong>guest</strong> is assigned a seat number by a lottery and then walks <strong>clockwise</strong> to the first host they meet — that host serves them. If a new host sits down at seat 150, only the guests between seats 110 and 150 switch to the new host; everyone else keeps their host. If a host leaves, only their guests walk on to the next host. Compare "guest number mod number of hosts": one new host and almost everyone is reassigned.
+</div>
+
+<h2>2. The hash ring</h2>
+<p>Take a hash function that outputs, say, a 32-bit number: 0 to 2<sup>32</sup> − 1 (≈ 4.3 billion). Now imagine bending that number line into a <strong>circle</strong>, so that after 2<sup>32</sup> − 1 comes 0 again. This is the <strong>hash ring</strong> (Cassandra's Murmur3 ring uses the 64-bit range −2<sup>63</sup> … 2<sup>63</sup> − 1).</p>
+<ol class="steps">
+  <li><strong>Place the nodes.</strong> Hash each server's identifier (e.g. <code>hash("cache-a")</code> or its IP) to get its position on the ring. Each node's position is called its <strong>token</strong>.</li>
+  <li><strong>Place the keys.</strong> Hash each key (<code>hash("user:42:timeline")</code>) with the <em>same</em> function to get its position.</li>
+  <li><strong>Assign ownership.</strong> Each key belongs to the <strong>first node at or after its position, moving clockwise</strong> — the key's <strong>successor</strong>. Equivalently, each node owns the arc of the ring from the previous node's position (exclusive) up to its own position (inclusive).</li>
+</ol>
+<pre class="ascii">
+                       0 / 2^32
+                  .-----  ●A (pos 20) -----.
+             k4 •'                          `• k1  ──► owned by B
+           ●D  /                              \
+        (290)  |      ring positions          |
+   k3 • ──► D  |      increase clockwise      •  k5 ──► B
+               \                              /
+                `.                          .● B (pos 110)
+                  `-----  ●C (200) -----• k2 ──► C
+ Rule: walk clockwise from the key's position; the first node you meet owns it.
+ A owns (290, 20],  B owns (20, 110],  C owns (110, 200],  D owns (200, 290]
+</pre>
+<p>Note that the <em>hash of a node</em> and the <em>hash of a key</em> live in the same space, and nothing about a key's position depends on how many nodes exist. That independence is the whole trick.</p>
+
+<h2>3. Lookup: clockwise successor via binary search</h2>
+<p>Implementation is simple: keep the node positions in a <strong>sorted array</strong>. To find a key's owner, hash the key and <strong>binary-search</strong> for the first position greater than (or equal to) the key's hash. If you run off the end of the array, <strong>wrap around</strong> to index 0 (that's the "ring").</p>
+<pre><code>positions = [20, 110, 200, 290]          # sorted node tokens
+owner     = {20: "A", 110: "B", 200: "C", 290: "D"}
+
+lookup(hash = 75):   first position &gt; 75   → 110 → "B"
+lookup(hash = 290):  first position &gt;= 290 → 290 → "D"   (bisect_left treats equal as owned)
+lookup(hash = 300):  nothing &gt; 300         → wrap to index 0 → 20 → "A"</code></pre>
+<div class="flow">
+  <div class="fnode svc">key<small>"user:42:timeline"</small></div><div class="farrow">→<small>hash</small></div>
+  <div class="fnode svc">position<small>e.g. 1,734,221,009</small></div><div class="farrow">→<small>binary search</small></div>
+  <div class="fnode svc">successor token<small>wrap at end</small></div><div class="farrow">→<small>map</small></div>
+  <div class="fnode store">node<small>cache-c</small></div>
+</div>
+<p><strong>Cost:</strong> with M total positions on the ring, a lookup is <strong>O(log M)</strong> — for 100 servers × 200 virtual nodes = 20,000 positions, that's about 15 comparisons, i.e. well under a microsecond. Adding a node is O(M) with a sorted array (insertion) or O(log M) with a balanced tree — irrelevant in practice because membership changes are rare. Every client computes the same answer independently, as long as everyone has the same <strong>membership list</strong> (distributed via config service, gossip, or a ZooKeeper/etcd watch).</p>
+
+<h2>4. Adding and removing nodes: only ~K/N keys move</h2>
+<p>Suppose a new node <strong>E</strong> hashes to a position between B and C. Which keys change owner?</p>
+<ul>
+  <li>Keys in the arc <strong>(B, E]</strong> previously walked clockwise past E's (empty) spot to C. Now they hit E first → they <strong>move from C to E</strong>.</li>
+  <li>Every other key still meets the same first node → <strong>unchanged</strong>.</li>
+</ul>
+<p>So adding a node only steals keys from <em>one</em> neighbour, and removing a node only hands its keys to <em>one</em> neighbour (its successor). With K keys and N nodes evenly spread, a change moves about <strong>K/N</strong> keys — the theoretical minimum, since the new node must end up with its fair share.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 380" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <text x="205" y="22" text-anchor="middle" font-weight="700">Before: 4 nodes</text>
+  <text x="615" y="22" text-anchor="middle" font-weight="700">After: node E added</text>
+  <circle cx="205" cy="190" r="135" fill="none" stroke="#90a4ae" stroke-width="3"/>
+  <circle cx="615" cy="190" r="135" fill="none" stroke="#90a4ae" stroke-width="3"/>
+  <path d="M741.9,236.2 A135,135 0 0,1 626.8,324.5" fill="none" stroke="#ef6c00" stroke-width="8" stroke-opacity="0.55"/>
+  <g font-weight="700" text-anchor="middle" font-size="13">
+    <circle cx="251.2" cy="63.1" r="16" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/><text x="251.2" y="68">A</text>
+    <circle cx="331.9" cy="236.2" r="16" fill="#e1f5fe" stroke="#0277bd" stroke-width="2"/><text x="331.9" y="241">B</text>
+    <circle cx="158.8" cy="316.9" r="16" fill="#fff8e1" stroke="#f9a825" stroke-width="2"/><text x="158.8" y="322">C</text>
+    <circle cx="78.1" cy="143.8" r="16" fill="#f3e5f5" stroke="#6a1b9a" stroke-width="2"/><text x="78.1" y="149">D</text>
+    <circle cx="661.2" cy="63.1" r="16" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/><text x="661.2" y="68">A</text>
+    <circle cx="741.9" cy="236.2" r="16" fill="#e1f5fe" stroke="#0277bd" stroke-width="2"/><text x="741.9" y="241">B</text>
+    <circle cx="568.8" cy="316.9" r="16" fill="#fff8e1" stroke="#f9a825" stroke-width="2"/><text x="568.8" y="322">C</text>
+    <circle cx="488.1" cy="143.8" r="16" fill="#f3e5f5" stroke="#6a1b9a" stroke-width="2"/><text x="488.1" y="149">D</text>
+    <circle cx="626.8" cy="324.5" r="16" fill="#ffebee" stroke="#c62828" stroke-width="2.5"/><text x="626.8" y="329">E</text>
+  </g>
+  <g>
+    <circle cx="321.9" cy="122.5" r="6" fill="#0277bd"/><circle cx="339.5" cy="178.2" r="6" fill="#0277bd"/>
+    <circle cx="272.5" cy="306.9" r="6" fill="#f9a825"/><circle cx="78.1" cy="236.2" r="6" fill="#6a1b9a"/>
+    <circle cx="158.8" cy="63.1" r="6" fill="#2e7d32"/>
+    <circle cx="731.9" cy="122.5" r="6" fill="#0277bd"/><circle cx="749.5" cy="178.2" r="6" fill="#0277bd"/>
+    <circle cx="682.5" cy="306.9" r="6" fill="#c62828"/><circle cx="488.1" cy="236.2" r="6" fill="#6a1b9a"/>
+    <circle cx="568.8" cy="63.1" r="6" fill="#2e7d32"/>
+  </g>
+  <g font-size="12" fill="#333">
+    <text x="343" y="112">k1→B</text><text x="355" y="183">k5→B</text><text x="285" y="330">k2→C</text>
+    <text x="22" y="250">k3→D</text><text x="112" y="46">k4→A</text>
+    <text x="753" y="112">k1→B</text><text x="765" y="183">k5→B</text>
+    <text x="432" y="250">k3→D</text><text x="522" y="46">k4→A</text>
+  </g>
+  <text x="694" y="338" font-size="12" fill="#c62828" font-weight="700">k2→E ✱</text>
+  <g text-anchor="middle" font-size="12" fill="#555">
+    <text x="205" y="182">positions grow</text><text x="205" y="199">clockwise ↻</text>
+    <text x="615" y="182">only arc (B, E]</text><text x="615" y="199">changes owner</text>
+  </g>
+  <text x="410" y="372" text-anchor="middle" font-size="12" fill="#555">Orange arc = keys that moved from C to E. All other keys keep their owner.</text>
+</svg>
+<div class="caption">The ring before and after adding node E. Keys (dots) are coloured by owner. Only k2, which lies in the arc between B and E, changes owner (C → E). With mod-N hashing most keys would have moved.</div>
+</div>
+
+<h3>4.1 Worked example: 1,000,000 keys</h3>
+<div class="table-wrap"><table>
+  <tr><th>Change</th><th>mod-N hashing: keys moved</th><th>Consistent hashing (ideal): keys moved</th></tr>
+  <tr><td>4 → 5 nodes (add)</td><td>800,000 (80%)</td><td>200,000 (1/5 = 20%), all to the new node</td></tr>
+  <tr><td>4 → 3 nodes (one fails)</td><td>750,000 (75%)</td><td>250,000 (the failed node's 1/4), all to survivors</td></tr>
+  <tr><td>10 → 11 nodes</td><td>~909,000 (91%)</td><td>~91,000 (1/11 ≈ 9%)</td></tr>
+  <tr><td>100 → 101 nodes</td><td>~990,000 (99%)</td><td>~9,900 (1/101 ≈ 1%)</td></tr>
+</table></div>
+<p>The Python demo in Section 7 measures this on 100,000 real keys: adding a 5th node to 4 moved <strong>19.6%</strong> of keys (ideal 20%), and every moved key went to the new node; mod-N would have moved 80%.</p>
+<div class="callout warn"><span class="callout-title">⚠️ The catch with one position per node</span>
+With a single token per node, the arcs between randomly placed nodes are very uneven, and when a node leaves, its <em>entire</em> load lands on one neighbour — which may then overload and fail too, cascading around the ring. Both problems are solved by virtual nodes.</div>
+
+<h2>5. Virtual nodes: balance and heterogeneous capacity</h2>
+
+<h3>5.1 Why one point per node is unbalanced</h3>
+<p>N random points split a circle into arcs whose lengths vary a lot: the largest arc is typically several times the average (on the order of log N times). Measured on 200,000 keys and 10 nodes using the implementation below:</p>
+<div class="table-wrap"><table>
+  <tr><th>Ring positions per node</th><th>Std-dev of load (as % of mean)</th><th>Busiest node vs mean</th><th>Least-busy node vs mean</th></tr>
+  <tr><td>1</td><td>122%</td><td>3.63×</td><td>0.07×</td></tr>
+  <tr><td>10</td><td>34%</td><td>1.81×</td><td>0.52×</td></tr>
+  <tr><td>100</td><td>8.0%</td><td>1.13×</td><td>0.88×</td></tr>
+  <tr><td>1,000</td><td>2.2%</td><td>1.04×</td><td>0.97×</td></tr>
+</table></div>
+<p>With one position each, one server got 3.6× its fair share while another got almost nothing. The spread shrinks roughly like <strong>1/√V</strong> where V is the number of positions per node.</p>
+
+<h3>5.2 The fix: many virtual nodes per physical node</h3>
+<p>Give each physical node <strong>V virtual nodes</strong> (vnodes): hash <code>"cache-a#0"</code>, <code>"cache-a#1"</code>, …, <code>"cache-a#99"</code> to get 100 positions, all owned by cache-a. Lookup is unchanged — find the successor position, then map it to its physical node.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 370" width="820" xmlns="http://www.w3.org/2000/svg" font-size="12">
+  <defs><marker id="ar-ch-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#c62828"/></marker></defs>
+  <circle cx="230" cy="185" r="140" fill="none" stroke="#90a4ae" stroke-width="3"/>
+  <path d="M346.7,68.3 A165,165 0 0,1 312.5,327.9" fill="none" stroke="#c62828" stroke-width="1.8" stroke-dasharray="6 4" marker-end="url(#ar-ch-1)"/>
+  <g font-weight="700" text-anchor="middle">
+    <circle cx="230" cy="45" r="15" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/><text x="230" y="49">A1</text>
+    <circle cx="370" cy="185" r="15" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/><text x="370" y="189">A2</text>
+    <circle cx="160" cy="306.2" r="15" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/><text x="160" y="310">A3</text>
+    <circle cx="108.8" cy="115" r="15" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/><text x="108.8" y="119">A4</text>
+    <circle cx="351.2" cy="115" r="15" fill="#e1f5fe" stroke="#0277bd" stroke-width="2"/><text x="351.2" y="119">B1</text>
+    <circle cx="351.2" cy="255" r="15" fill="#e1f5fe" stroke="#0277bd" stroke-width="2"/><text x="351.2" y="259">B2</text>
+    <circle cx="108.8" cy="255" r="15" fill="#e1f5fe" stroke="#0277bd" stroke-width="2"/><text x="108.8" y="259">B3</text>
+    <circle cx="160" cy="63.8" r="15" fill="#e1f5fe" stroke="#0277bd" stroke-width="2"/><text x="160" y="68">B4</text>
+    <circle cx="300" cy="63.8" r="15" fill="#fff8e1" stroke="#f9a825" stroke-width="2"/><text x="300" y="68">C1</text>
+    <circle cx="300" cy="306.2" r="15" fill="#fff8e1" stroke="#f9a825" stroke-width="2"/><text x="300" y="310">C2</text>
+    <circle cx="230" cy="325" r="15" fill="#fff8e1" stroke="#f9a825" stroke-width="2"/><text x="230" y="329">C3</text>
+    <circle cx="90" cy="185" r="15" fill="#fff8e1" stroke="#f9a825" stroke-width="2"/><text x="90" y="189">C4</text>
+  </g>
+  <circle cx="329" cy="86" r="6" fill="#c62828"/>
+  <text x="312" y="100" font-weight="700" fill="#c62828" text-anchor="end">key K</text>
+  <text x="430" y="34" fill="#c62828" font-size="11.5" text-anchor="end">walk clockwise</text>
+  <rect x="440" y="40" width="370" height="290" rx="10" fill="#eceff1" stroke="#455a64"/>
+  <g font-size="12.5">
+    <text x="455" y="65" font-weight="700">3 physical nodes × 4 vnodes each</text>
+    <text x="455" y="85" fill="#555">(real systems use ~16–256 per node)</text>
+    <text x="455" y="115">• Each node owns many small, scattered arcs</text>
+    <text x="467" y="133">→ load evens out (std-dev ≈ 1/√V)</text>
+    <text x="455" y="160">• If C fails, its 4 arcs pass to 4 different</text>
+    <text x="467" y="178">successors → load spreads over A and B</text>
+    <text x="455" y="205">• Bigger server? Give it more vnodes</text>
+    <text x="467" y="223">(weight 2 → twice the positions → ~2× keys)</text>
+    <text x="455" y="250">• Key K → first vnode clockwise = B1 (primary)</text>
+    <text x="455" y="277">• Replicas (N = 3): keep walking, skip nodes</text>
+    <text x="467" y="295">already chosen: B1, A2, (B2 skip), C2</text>
+    <text x="467" y="313" font-weight="700">→ replica set [B, A, C]</text>
+  </g>
+</svg>
+<div class="caption">Virtual nodes: each physical node (A, B, C) appears at several ring positions. Ownership arcs interleave, so load is balanced and a failure spreads its keys across many survivors. The dashed arrow shows the clockwise walk used to pick N = 3 distinct replicas for key K.</div>
+</div>
+
+<p>Benefits of virtual nodes:</p>
+<ul>
+  <li><strong>Even load.</strong> Many small arcs average out (see the table: 100 vnodes → ~8% spread).</li>
+  <li><strong>Graceful failure.</strong> When a node dies, its many arcs are absorbed by <em>many different</em> successors, so each survivor takes a small, roughly equal slice instead of one neighbour taking it all.</li>
+  <li><strong>Faster recovery/rebuild.</strong> A new or replacement node streams data from many peers in parallel rather than from one.</li>
+  <li><strong>Heterogeneous capacity (weights).</strong> A server with twice the RAM gets twice as many vnodes and therefore ~twice the keys — <code>add_node("cache-big", weight=2)</code> in the implementation below.</li>
+</ul>
+<p>Costs: a bigger ring (N × V positions — still tiny: 1,000 servers × 256 = 256,000 sorted integers), and in databases, more token ranges to repair and stream. Cassandra used <code>num_tokens: 256</code> by default for years; Cassandra 4.0 lowered the default to 16 with a smarter token-allocation algorithm that places tokens to balance load deliberately rather than randomly.</p>
+
+<h2>6. Replication along the ring</h2>
+<p>To store each key on N replicas (see <a href="replication.html">Replication</a>), Dynamo-style systems use the ring itself: the key's <strong>primary</strong> is its successor node, and the other replicas are the <strong>next distinct physical nodes clockwise</strong>. The ordered list is called the key's <strong>preference list</strong>.</p>
+<ol class="steps">
+  <li>Hash the key; find the first vnode clockwise → its physical node is replica #1.</li>
+  <li>Keep walking clockwise. For each vnode, if its physical node is <strong>already in the list, skip it</strong> (otherwise two "replicas" could be the same machine — no redundancy).</li>
+  <li>Stop when you have N distinct physical nodes. Optionally also skip nodes in the same <strong>rack or availability zone</strong> until each replica is in a different failure domain — Cassandra's <code>NetworkTopologyStrategy</code> does this per data center, placing replicas on distinct racks.</li>
+</ol>
+<p>Nice properties: every node can compute any key's replica set locally; when a node joins or leaves, preference lists change only for keys near it on the ring; and during a temporary failure, the next node in the walk can accept writes on its behalf (the <em>sloppy quorum</em> and <em>hinted handoff</em> covered in Replication).</p>
+
+<h2>7. A complete Python implementation</h2>
+<p>The whole algorithm fits in ~60 lines: a sorted list of vnode positions, a dict from position to physical node, and <code>bisect</code> for the binary search. It supports weights, removal and replica sets.</p>
+<pre><code>import bisect
+import hashlib
+from collections import Counter
+
+
+def _hash(value: str) -&gt; int:
+    """Map a string to a point on the ring: 0 .. 2**32 - 1."""
+    digest = hashlib.md5(value.encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big")
+
+
+class ConsistentHashRing:
+    def __init__(self, vnodes_per_weight: int = 100):
+        self.vnodes_per_weight = vnodes_per_weight
+        self._points = []          # sorted list of vnode positions
+        self._owner = {}           # position -&gt; physical node name
+        self._nodes = {}           # physical node -&gt; list of its positions
+
+    def add_node(self, node: str, weight: int = 1) -&gt; None:
+        positions = []
+        for i in range(self.vnodes_per_weight * weight):
+            pos = _hash(f"{node}#vn{i}")
+            if pos in self._owner:          # extremely rare collision: skip it
+                continue
+            self._owner[pos] = node
+            bisect.insort(self._points, pos)
+            positions.append(pos)
+        self._nodes[node] = positions
+
+    def remove_node(self, node: str) -&gt; None:
+        for pos in self._nodes.pop(node):
+            del self._owner[pos]
+            idx = bisect.bisect_left(self._points, pos)
+            self._points.pop(idx)
+
+    def get_node(self, key: str) -&gt; str:
+        if not self._points:
+            raise RuntimeError("ring is empty")
+        h = _hash(key)
+        idx = bisect.bisect_left(self._points, h)    # first vnode at or clockwise of h
+        if idx == len(self._points):                 # past the last point: wrap to 0
+            idx = 0
+        return self._owner[self._points[idx]]
+
+    def get_nodes(self, key: str, n: int) -&gt; list:
+        """Replica set: walk clockwise, collecting n DISTINCT physical nodes."""
+        if n &gt; len(self._nodes):
+            raise ValueError("not enough physical nodes")
+        result = []
+        idx = bisect.bisect_left(self._points, _hash(key))
+        while len(result) &lt; n:
+            if idx == len(self._points):
+                idx = 0
+            node = self._owner[self._points[idx]]
+            if node not in result:                   # skip other vnodes of chosen nodes
+                result.append(node)
+            idx += 1
+        return result
+
+
+if __name__ == "__main__":
+    ring = ConsistentHashRing(vnodes_per_weight=100)
+    for name in ["cache-a", "cache-b", "cache-c", "cache-d"]:
+        ring.add_node(name)
+
+    keys = [f"user:{i}:timeline" for i in range(100_000)]
+    before = {k: ring.get_node(k) for k in keys}
+    print("Load with 4 nodes:", sorted(Counter(before.values()).items()))
+
+    ring.add_node("cache-e")
+    after = {k: ring.get_node(k) for k in keys}
+    moved = sum(1 for k in keys if before[k] != after[k])
+    print("Load with 5 nodes:", sorted(Counter(after.values()).items()))
+    print(f"Keys moved: {moved} ({moved / len(keys):.1%}); ideal = 1/5 = 20.0%")
+    print("All moved keys went to cache-e:",
+          all(after[k] == "cache-e" for k in keys if before[k] != after[k]))
+
+    naive_moved = sum(1 for i in range(100_000) if i % 4 != i % 5)
+    print(f"Naive mod-N would move: {naive_moved} ({naive_moved / 100_000:.1%})")
+
+    print("Replicas for user:42:timeline -&gt;", ring.get_nodes("user:42:timeline", 3))
+
+    ring.remove_node("cache-b")
+    gone = {k: ring.get_node(k) for k in keys}
+    moved_b = sum(1 for k in keys if after[k] != gone[k])
+    print(f"Removing cache-b moved {moved_b} keys, all previously on cache-b:",
+          all(after[k] == "cache-b" for k in keys if after[k] != gone[k]))</code></pre>
+<p>Actual output (Python 3, deterministic because MD5 is deterministic):</p>
+<pre><code>Load with 4 nodes: [('cache-a', 26028), ('cache-b', 22725), ('cache-c', 23324), ('cache-d', 27923)]
+Load with 5 nodes: [('cache-a', 20640), ('cache-b', 19816), ('cache-c', 18519), ('cache-d', 21391), ('cache-e', 19634)]
+Keys moved: 19634 (19.6%); ideal = 1/5 = 20.0%
+All moved keys went to cache-e: True
+Naive mod-N would move: 80000 (80.0%)
+Replicas for user:42:timeline -&gt; ['cache-b', 'cache-d', 'cache-e']
+Removing cache-b moved 19816 keys, all previously on cache-b: True</code></pre>
+<p>What to notice:</p>
+<ul>
+  <li><strong>Balance:</strong> with 100 vnodes per node, each of 4 nodes holds 23–28% (ideal 25%); after adding cache-e each holds 18.5–21.4% (ideal 20%).</li>
+  <li><strong>Minimal movement:</strong> 19.6% of keys moved — essentially exactly the new node's fair share — and <em>only</em> onto the new node. Mod-N would have moved 80%.</li>
+  <li><strong>Removal:</strong> deleting cache-b moved exactly the 19,816 keys cache-b owned, and nothing else; thanks to vnodes, they were spread across all four survivors.</li>
+  <li><strong>Replicas:</strong> <code>get_nodes</code> returned three <em>distinct</em> physical nodes.</li>
+</ul>
+<div class="callout tip"><span class="callout-title">💡 Production details</span>
+Use a fast non-cryptographic hash (MurmurHash3, xxHash) rather than MD5 if you hash millions of keys per second — any well-mixed hash works, but <strong>every client must use exactly the same hash function, vnode naming and membership list</strong>, or they'll disagree about owners. Python's built-in <code>hash()</code> is randomised per process for strings, so it must never be used for this.</div>
+
+<h2>8. Where consistent hashing is used</h2>
+<div class="table-wrap"><table>
+  <tr><th>System</th><th>How it uses consistent hashing</th></tr>
+  <tr><td><b>Apache Cassandra / ScyllaDB</b></td><td>Token ring with Murmur3 partitioner (64-bit tokens); each node owns several token ranges (vnodes, <code>num_tokens</code>); replicas = next distinct nodes clockwise, rack/DC-aware. Adding a node streams only its new ranges.</td></tr>
+  <tr><td><b>Amazon Dynamo (2007 paper), Riak, Voldemort</b></td><td>The canonical design: ring + virtual nodes + preference lists + sloppy quorums. Riak uses a fixed number of equal-sized partitions on the ring.</td></tr>
+  <tr><td><b>Amazon DynamoDB</b></td><td>Descends from Dynamo's ideas (hash-partitioned by partition key), though the managed service maps partitions via its own metadata rather than a client-visible ring.</td></tr>
+  <tr><td><b>Memcached clients — ketama</b></td><td>libketama (Last.fm, 2007) popularised client-side consistent hashing for memcached pools; it's implemented by most memcached client libraries and proxies (twemproxy, Nginx <code>hash … consistent</code>). Adding a cache server invalidates only ~1/N of keys.</td></tr>
+  <tr><td><b>Load balancers</b></td><td>Session/cache affinity: Envoy's <code>RING_HASH</code> and <code>MAGLEV</code> policies, HAProxy <code>hash-type consistent</code> (with optional bounded loads), Nginx <code>hash $key consistent</code>, Google's Maglev. Requests for the same user/URL go to the same backend, and backend changes reshuffle few clients. See <a href="load-balancer.html">Load Balancing</a>.</td></tr>
+  <tr><td><b>CDNs and web caches</b></td><td>Inside a PoP, the URL is hashed to pick which cache server stores it, so the PoP's total cache is the union (not N copies) of server caches. The 1997 consistent-hashing paper was written for exactly this problem. See <a href="cdn.html">CDN</a>.</td></tr>
+  <tr><td><b>Distributed hash tables, chat and messaging</b></td><td>Chord/Kademlia DHTs (peer-to-peer), routing chat rooms or user sessions to a stateful server (e.g. which WebSocket node handles a conversation — see <a href="direct-messaging.html">Direct Messaging</a>).</td></tr>
+</table></div>
+<p>Contrast: <strong>Redis Cluster</strong> uses 16,384 fixed <em>hash slots</em> (<code>CRC16(key) mod 16384</code>) assigned to nodes — the "fixed number of logical partitions" approach from <a href="sharding.html">Sharding</a>, which achieves the same goal (move slots, not keys) with an explicit slot map instead of a ring.</p>
+
+<h2>9. Alternatives and refinements</h2>
+
+<h3>9.1 Rendezvous hashing (Highest Random Weight, HRW)</h3>
+<p>For each key, compute a score for <strong>every</strong> node — <code>score = hash(node_id + key)</code> — and pick the node with the <strong>highest</strong> score. For N replicas, take the top-N scores.</p>
+<pre><code>def hrw_owner(key: str, nodes: list) -&gt; str:
+    return max(nodes, key=lambda node: _hash(f"{node}:{key}"))</code></pre>
+<ul>
+  <li>✅ Remove a node → only keys whose top choice was that node move (each to its own second choice, so load spreads evenly across survivors). Add a node → it wins ~1/N of keys. Same minimal-disruption property as the ring.</li>
+  <li>✅ Naturally balanced <strong>without virtual nodes</strong>; no ring to store; trivially gives an ordered replica list; supports weights (e.g. <code>score = −weight / ln(h)</code> with h normalised to (0,1)).</li>
+  <li>❌ Lookup is <strong>O(N)</strong> hashes per key — fine for tens or hundreds of nodes, costly for thousands (can be made hierarchical).</li>
+  <li>Used by: Apache Ignite, GitHub's load balancer (GLB) director, many CDN/cache routing schemes, Microsoft's CARP proxy-array protocol.</li>
+</ul>
+
+<h3>9.2 Jump consistent hash</h3>
+<p>Google's <strong>jump consistent hash</strong> (Lamping &amp; Veach, 2014) maps a 64-bit key to a bucket number in <code>[0, num_buckets)</code> with a tiny loop, <strong>no memory</strong>, O(ln N) time and near-perfect balance:</p>
+<pre><code>def jump_hash(key: int, num_buckets: int) -&gt; int:
+    b, j = -1, 0
+    while j &lt; num_buckets:
+        b = j
+        key = (key * 2862933555777941757 + 1) &amp; 0xFFFFFFFFFFFFFFFF   # 64-bit LCG step
+        j = int((b + 1) * (float(1 &lt;&lt; 31) / float((key &gt;&gt; 33) + 1)))
+    return b</code></pre>
+<ul>
+  <li>✅ Going from n to n+1 buckets moves exactly ~1/(n+1) of keys, all to the new bucket (measured: 10 → 11 buckets moved 8.98% of 100,000 keys; ideal 9.09%).</li>
+  <li>✅ Better balance than a ring with vnodes, zero lookup state.</li>
+  <li>❌ Buckets must be numbered <strong>0 … n−1</strong>, and you can only add or remove the <strong>last</strong> bucket. You can't remove an arbitrary failed server — so it fits <strong>sharded storage with numbered, replicated shards</strong> (each "bucket" is a replica group that never disappears), not a pool of individually failing cache nodes.</li>
+</ul>
+
+<h3>9.3 Consistent hashing with bounded loads</h3>
+<p>Even with vnodes, a ring balances <em>keys</em>, not <em>load</em>: a few very hot keys can overload their owner. <strong>Consistent hashing with bounded loads</strong> (Mirrokni, Thorup &amp; Zadimoghaddam, Google, 2016) sets a capacity per node of <code>c = ⌈(1 + ε) × average load⌉</code>. A request goes to its usual successor <em>unless that node is at capacity</em>, in which case it continues clockwise to the next node with room.</p>
+<pre class="ascii">
+ ε = 0.25, 4 servers, 100 active connections  →  average 25, cap = ⌈1.25 × 25⌉ = 32 each
+
+ key K hashes near server B:   B has 32/32 (full) → skip
+                               next clockwise: C has 20/32 → assign to C ✔
+ Guarantee: no server exceeds 1.25× the average, while most keys still land on their
+ "natural" server (good cache affinity) and changes still move few keys.
+</pre>
+<p>Vimeo contributed this to HAProxy (<code>hash-balance-factor</code>) to keep video-cache affinity without overloading any single cache server. It's ideal for <strong>load balancing with affinity</strong>, where load matters more than strict key placement.</p>
+
+<h3>9.4 Comparison</h3>
+<div class="table-wrap"><table>
+  <tr><th>Scheme</th><th>Lookup cost</th><th>Memory</th><th>Balance</th><th>Keys moved on change</th><th>Arbitrary node removal</th><th>Best for</th></tr>
+  <tr><td><b>mod N</b></td><td>O(1)</td><td>None</td><td>Excellent</td><td>~all (N/(N+1))</td><td>Yes, but reshuffles everything</td><td>Fixed-size clusters that never change</td></tr>
+  <tr><td><b>Ring + vnodes</b></td><td>O(log NV)</td><td>N·V positions</td><td>Good (≈1/√V)</td><td>~K/N</td><td>✅ Yes</td><td>Caches, Dynamo-style databases</td></tr>
+  <tr><td><b>Rendezvous (HRW)</b></td><td>O(N)</td><td>Node list</td><td>Excellent</td><td>~K/N</td><td>✅ Yes</td><td>Small/medium node sets; easy replica lists</td></tr>
+  <tr><td><b>Jump hash</b></td><td>O(log N)</td><td>None</td><td>Excellent</td><td>~K/(N+1)</td><td>❌ Only last bucket</td><td>Numbered shards / replica groups</td></tr>
+  <tr><td><b>Bounded loads</b></td><td>O(log NV) + skips</td><td>Ring + load counters</td><td>Guaranteed ≤ (1+ε)×avg</td><td>Small, plus overflow moves</td><td>✅ Yes</td><td>Load balancers with affinity, hot keys</td></tr>
+  <tr><td><b>Maglev</b></td><td>O(1) table lookup</td><td>Lookup table (e.g. 65,537 entries)</td><td>Near-perfect</td><td>Small (slightly more than minimal)</td><td>✅ Yes</td><td>High-throughput L4 load balancers</td></tr>
+  <tr><td><b>Fixed slots (Redis Cluster)</b></td><td>O(1)</td><td>Slot map</td><td>Depends on slot assignment</td><td>Only moved slots</td><td>✅ Yes (reassign slots)</td><td>Databases/caches with a coordinator</td></tr>
+</table></div>
+
+<h2>10. How Instagram uses consistent hashing</h2>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram's architecture</span>
+<ul>
+  <li><strong>Cache clusters.</strong> The Feed Cache (timelines, counters) and object caches sit on many Redis/Memcached servers. Meta's memcache deployment — described publicly in the 2013 paper <em>Scaling Memcache at Facebook</em> — distributes items across memcached servers using <strong>consistent hashing</strong>, and Meta's open-source router <em>mcrouter</em> offers consistent-hashing routes. Instagram runs on Meta's infrastructure since its data-center migration, so the same pattern applies: when a cache server is added or dies, only ~1/N of keys miss, instead of the whole cache going cold.</li>
+  <li><strong>Cassandra's token ring.</strong> Instagram's Cassandra clusters (feeds, activity and other high-write data) place each partition key — e.g. <code>user_id</code> — on the Murmur3 token ring; vnodes balance load and let new nodes join by streaming only their token ranges; replicas (RF = 3) are the next distinct nodes clockwise, on different racks.</li>
+  <li><strong>Stateful routing.</strong> Services that keep per-user state in memory (e.g. which WebSocket gateway holds a user's live DM connection, or which worker owns a user's ranking cache) can use consistent hashing on <code>user_id</code> so most users keep their server when the fleet scales.</li>
+</ul></div>
+
+<h3>10.1 Example: scaling the feed cache before a big event</h3>
+<ol class="steps">
+  <li>Assume 40 Redis timeline servers, 100 vnodes each, and ~400 M cached timelines (~10 M per server). Traffic is forecast to rise 25%, so ops adds 10 servers.</li>
+  <li>The new servers' vnodes are inserted into the ring; the new membership list is published via the config service, and every Feed Service instance rebuilds its ring (a few ms).</li>
+  <li>Each new server takes ~1/50 of the ring → in total 10/50 = <strong>20% of timelines</strong> (≈80 M keys) now map to new servers and miss once. With mod-N, 40/50 = 80% (≈320 M) would have missed.</li>
+  <li>Misses are refilled lazily from Cassandra (or by pre-warming: copying the affected ranges before flipping the membership). Because those 20% are spread evenly over time and users, the database sees a manageable bump instead of a stampede. See <a href="caching.html">Caching</a> for stampede protection.</li>
+</ol>
+
+<h2>11. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Benefits</h4><ul>
+    <li>Minimal key movement (~K/N) when nodes join or leave</li>
+    <li>Fully decentralised: every client computes owners locally</li>
+    <li>With vnodes: good balance, graceful failure spreading, weighted capacity</li>
+    <li>Natural replica placement (next distinct nodes clockwise)</li>
+    <li>Simple: a sorted array and a binary search</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Limitations</h4><ul>
+    <li>Balances keys, not request load — hot keys still overload one node</li>
+    <li>Without vnodes, arcs are very uneven</li>
+    <li>All clients must agree on membership, hash and vnode scheme</li>
+    <li>Range queries are impossible across a hash ring</li>
+    <li>Moved keys are still a cache-miss burst (smaller, not zero)</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Using one point per node</strong> — 3–4× load imbalance with a handful of nodes. Use 100+ vnodes (or a token-allocation algorithm).</li>
+  <li><strong>Inconsistent membership views</strong> — during a rolling config push, half the clients use the old ring and half the new, so the same key is written to two servers and reads flip between them. Version the membership and propagate it quickly; tolerate short windows with TTLs.</li>
+  <li><strong>Language-specific or randomised hashes</strong> (Python <code>hash()</code>, Java <code>String.hashCode()</code> with poor mixing) → different clients disagree or keys cluster.</li>
+  <li><strong>Flapping nodes</strong> — a node bouncing in and out of the ring moves its keys back and forth. Add hysteresis: require sustained health before re-adding.</li>
+  <li><strong>Replicas on the same machine/rack</strong> — forgetting to skip vnodes of already-chosen physical nodes (or racks) when walking the ring.</li>
+  <li><strong>Assuming it solves hot keys</strong> — a celebrity's timeline key still lives on one server. Combine with replication of hot keys, local caching, or bounded-load hashing. See <a href="sharding.html">Sharding</a>.</li>
+  <li><strong>Forgetting data movement in stateful stores</strong> — for a cache, a moved key is just a miss; for a database, the new owner must <em>stream</em> the data before it can serve it.</li>
+</ul>
+
+<h2>12. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>Mechanism</th><th>When to use it</th></tr>
+  <tr><td>Cassandra / ScyllaDB</td><td>Murmur3 token ring, vnodes, rack/DC-aware replica placement</td><td>Distributed database with automatic partitioning and multi-DC replication.</td></tr>
+  <tr><td>Riak, Voldemort</td><td>Dynamo-style ring with fixed partitions</td><td>Highly available key-value stores (largely legacy now).</td></tr>
+  <tr><td>libketama, twemproxy, mcrouter</td><td>Client/proxy-side consistent hashing for memcached/Redis pools</td><td>Sharding a cache tier without a central coordinator.</td></tr>
+  <tr><td>Envoy (<code>RING_HASH</code>, <code>MAGLEV</code>)</td><td>Ring hash with configurable ring size; Maglev table</td><td>Service-mesh load balancing with affinity (e.g. by user ID header).</td></tr>
+  <tr><td>HAProxy (<code>hash-type consistent</code>, <code>hash-balance-factor</code>)</td><td>Consistent hashing, optionally with bounded loads</td><td>Cache affinity at the load balancer without overload.</td></tr>
+  <tr><td>Nginx (<code>hash $key consistent</code>)</td><td>Ketama-compatible ring</td><td>Upstream selection for caches/proxies.</td></tr>
+  <tr><td>Guava <code>Hashing.consistentHash</code></td><td>Jump consistent hash</td><td>Mapping keys to numbered shards in Java.</td></tr>
+  <tr><td>Redis Cluster</td><td>16,384 fixed hash slots (not a ring)</td><td>Sharded Redis with explicit slot migration.</td></tr>
+</table></div>
+
+<h2>13. Interview corner</h2>
+<details class="qa"><summary>Explain consistent hashing and why it's better than hash mod N.</summary>
+<p>With mod N, a key's server depends on N, so changing N remaps about N/(N+1) of keys — 80% when going from 4 to 5 servers — which empties a cache or forces a massive data migration. Consistent hashing hashes both servers and keys onto the same circular space; a key belongs to the first server clockwise. A key's position doesn't depend on how many servers exist, so adding a server only takes over the arc between it and its predecessor (~K/N keys), and removing one only hands its arc to its successor. Lookup is a binary search over sorted server positions, O(log M).</p></details>
+<details class="qa"><summary>What are virtual nodes and why do we need them?</summary>
+<p>Each physical server is placed at many ring positions (e.g. 100–256) by hashing "server#i". With one position each, random arcs are very uneven (a node can get 3–4× its share) and a departing node dumps all its keys on one neighbour. With many vnodes, each server owns many small interleaved arcs, so load evens out (spread ≈ 1/√V), a failure is absorbed by all survivors, a joining node pulls from many peers in parallel, and weights are easy — give bigger machines more vnodes.</p></details>
+<details class="qa"><summary>How do you choose replicas on a consistent hash ring?</summary>
+<p>Walk clockwise from the key's position, collecting the physical nodes of the vnodes you encounter, skipping any physical node (and ideally any rack/AZ) already chosen, until you have N distinct ones — the key's preference list. The first is the coordinator/primary. Every node can compute it locally, and membership changes affect only nearby keys. Cassandra's NetworkTopologyStrategy does this per data center with rack awareness.</p></details>
+<details class="qa"><summary>Your cache cluster uses consistent hashing, but one server is at 95% CPU while others are at 30%. Why, and what do you do?</summary>
+<p>Either the key distribution is uneven (too few vnodes, or a poor hash) or — more likely at Instagram scale — a few hot keys (a celebrity's profile/timeline, a viral post's counter) live on that server; consistent hashing balances keys, not traffic. Check per-key request rates. Fixes: more vnodes or weight adjustments for distribution problems; for hot keys, replicate them to several servers and read randomly among copies, add an in-process L1 cache in app servers, split the key, or use consistent hashing with bounded loads at the routing layer.</p></details>
+<details class="qa"><summary>Compare consistent hashing, rendezvous hashing and jump hash.</summary>
+<p>Ring hashing: O(log M) lookup, needs vnodes for balance, supports arbitrary node add/remove — the classic for caches and Dynamo-style stores. Rendezvous (HRW): score every node with hash(node, key) and take the max; perfectly balanced without vnodes, minimal disruption, easy top-N replicas, but O(N) per lookup. Jump hash: no memory, O(log N), excellent balance and minimal movement, but buckets are numbered 0..n−1 and only the last can be removed — great for numbered shards backed by replica groups, not for individually failing nodes.</p></details>
+<details class="qa"><summary>Is consistent hashing used for Instagram's PostgreSQL shards?</summary>
+<p>Not per Instagram's public description. For PostgreSQL they use a fixed number of logical shards (thousands) mapped to physical servers by a mapping table, with the logical shard ID embedded in every object ID. That achieves the same goal — growing without re-hashing — via explicit shard moves. Consistent hashing shows up where membership changes are frequent and decentralised: cache tiers (memcache/Redis) and Cassandra's token ring.</p></details>
+
+<h2>14. Check your understanding</h2>
+<details class="quiz"><summary>With <code>hash mod N</code>, what fraction of keys move when going from 8 to 9 servers? With an ideal consistent hash?</summary>
+<p>Mod N: a key stays only if <code>h mod 8 = h mod 9</code>, true for 8 of every 72 values → ~11% stay, <strong>~89% move</strong>. Consistent hashing: the new server takes its fair share, <strong>1/9 ≈ 11%</strong>, and nothing else moves.</p></details>
+<details class="quiz"><summary>Ring positions are [100, 400, 700] for nodes [X, Y, Z] on a ring of size 1,000. Who owns keys hashing to 50, 400, 401 and 950?</summary>
+<p>Using "first position ≥ hash": 50 → 100 → <strong>X</strong>; 400 → 400 → <strong>Y</strong>; 401 → 700 → <strong>Z</strong>; 950 → past the end → wrap to 100 → <strong>X</strong>.</p></details>
+<details class="quiz"><summary>In the same ring, node W is added at position 550. Which keys move, from whom, and what fraction (assuming uniform keys)?</summary>
+<p>Keys in (400, 550] move from <strong>Z to W</strong>; nothing else changes. That's 150/1,000 = <strong>15%</strong> of keys. (With only one position per node, the share depends on where W lands — another reason for vnodes.)</p></details>
+<details class="quiz"><summary>A cluster has 10 nodes with 1 token each, and the busiest node has 3.6× the average load. Roughly how many vnodes per node would bring the spread to about ±8%?</summary>
+<p>Spread shrinks roughly like 1/√V. Our measurement showed ~122% std-dev at V = 1 and ~8% at <strong>V = 100</strong> (busiest node ≈ 1.13× average). Real systems use 16–256 vnodes or smarter token allocation.</p></details>
+<details class="quiz"><summary>Why must you skip vnodes when selecting N = 3 replicas by walking the ring? Give a failure scenario if you don't.</summary>
+<p>Consecutive vnodes may belong to the same physical node. Without skipping, a key's "three replicas" could be cache-b, cache-b, cache-d — two copies on one machine. If cache-b dies, two of three replicas vanish and a quorum (2 of 3) becomes impossible, even though "only one node" failed.</p></details>
+<details class="quiz"><summary>You have 3 cache servers: two with 64 GB RAM and one with 128 GB. How do you give the big one its fair share with consistent hashing?</summary>
+<p>Weight vnodes by capacity: e.g. 100 vnodes for each 64 GB server and 200 for the 128 GB server. The big server then owns ~200/400 = <strong>50%</strong> of the ring, the others ~25% each — proportional to RAM.</p></details>
+<details class="quiz"><summary>Why is jump consistent hash a poor fit for a memcached pool where any server may crash, but fine for 64 numbered Cassandra-like replica groups?</summary>
+<p>Jump hash can only shrink by removing the <em>highest-numbered</em> bucket. If server #17 crashes, you can't remove bucket 17 without renumbering (and remapping) everything above it. In a store where each bucket is a replicated group that never disappears (a failed machine is replaced inside the group), bucket numbers are stable and jump hash's zero-memory perfect balance is ideal.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li><code>hash mod N</code> remaps ~N/(N+1) of keys when N changes — catastrophic for caches and databases.</li>
+    <li>Consistent hashing puts nodes and keys on a <strong>ring</strong>; a key's owner is its <strong>clockwise successor</strong>, found by <strong>binary search</strong>.</li>
+    <li>Adding/removing a node moves only <strong>~K/N</strong> keys, only to/from that node.</li>
+    <li><strong>Virtual nodes</strong> give balance (≈1/√V spread), graceful failure and weighted capacity; <strong>replicas</strong> are the next N distinct (rack-aware) nodes clockwise.</li>
+    <li>Know the alternatives: <strong>rendezvous/HRW</strong>, <strong>jump hash</strong>, <strong>bounded loads</strong>, Maglev and fixed slots — and that none of them fixes hot keys on its own.</li>
+    <li>Instagram relies on it for <strong>cache clusters</strong> and <strong>Cassandra's token ring</strong>; its PostgreSQL shards use fixed logical shards instead.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="sharding.html">Sharding</a> — logical shards, hash vs range partitioning and hot keys</li>
+  <li><a href="replication.html">Replication</a> — preference lists, sloppy quorums and hinted handoff on the ring</li>
+  <li><a href="caching.html">Caching</a> — the Redis/Memcached tiers that consistent hashing distributes</li>
+  <li><a href="databases.html">Databases</a> — Cassandra's partition keys and token ring</li>
+  <li><a href="load-balancer.html">Load Balancing</a> — hash-based affinity, ring hash and Maglev</li>
+  <li><a href="cdn.html">CDN</a> — consistent hashing inside a PoP to pick the cache server for a URL</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

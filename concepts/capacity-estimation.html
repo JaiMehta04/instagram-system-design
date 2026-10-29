@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Back-of-the-Envelope Estimation — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="capacity-estimation">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li><strong>Back-of-the-envelope estimation</strong> = quick, rounded arithmetic that tells you the <em>order of magnitude</em> of load, storage, bandwidth and hardware, so you can justify design decisions.</li>
+    <li>Memorise a few anchors: <strong>1 day ≈ 86,400 s ≈ 10<sup>5</sup> s</strong>; <strong>1M/day ≈ 12/s</strong>; <strong>1 PB/day ≈ 12 GB/s ≈ 93 Gbps</strong>; powers of two (2<sup>10</sup> ≈ 10<sup>3</sup>); and latency numbers (memory ~100 ns, same-DC round trip ~0.5 ms, cross-continent ~150 ms).</li>
+    <li>Method: <strong>assumptions → rates (QPS) → sizes (storage, bandwidth) → resources (servers, shards, cache nodes) → sanity check</strong>. Always compute average <em>and</em> peak (2–3×).</li>
+    <li>Instagram under our assumptions: ~1.2K posts/s, ~116K feed reads/s (~350K peak), ~1.1M API req/s peak, ~580 TB/day new media (~212 PB/year logical), ~85 PB/day egress (~8 Tbps) mostly served by the CDN, ~9 TB of cache, ~1.5 GB/s into Kafka.</li>
+    <li>The numbers <em>are</em> the argument: they prove you need a CDN, object storage, sharding, caching and async fan-out.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why estimate at all?</h2>
+<p>Should Instagram's feed be served from the database or from a cache? Will one PostgreSQL server hold all the posts? Do we need a CDN? You cannot answer any of these by intuition alone. "A lot of users" might mean 1,000 requests per second (one server is fine) or 1,000,000 (you need thousands of servers and a completely different design). Estimation turns vague scale into numbers you can reason with — in two to five minutes, with mental arithmetic.</p>
+<p>Estimates are useful precisely because they are <strong>rough</strong>. Nobody cares whether storage is 580 TB/day or 610 TB/day; what matters is that it's "hundreds of terabytes per day", which immediately means "not in a relational database, use object storage", and "over 200 petabytes per year", which means "storage cost and tiering are first-class concerns". Getting the exponent right is the whole game; the leading digit is a bonus.</p>
+<p>Real engineers do this constantly: capacity planning before a launch, checking whether a proposed design can possibly meet its latency target, sanity-checking a cloud bill. Interviewers use it to see whether you can connect requirements to architecture with evidence.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  Planning a wedding. You don't know exactly how many guests will come, but you estimate: ~200 invited, ~80% attend → ~160 people; each eats ~0.5 kg of food → ~80 kg; 10 per table → 16 tables; a bus holds 50 → 4 buses. Every number is approximate, but it's good enough to book the right venue, order roughly the right food and not hire a single taxi for 160 people. If you'd guessed "maybe 20 guests", you'd have booked the wrong building. Capacity estimation is the same: <em>roughly right beats precisely wrong</em>.
+</div>
+
+<h2>2. The toolkit: numbers worth memorising</h2>
+<h3>2.1 Powers of two (and ten)</h3>
+<p>Computers count in powers of two; humans in powers of ten. The happy coincidence 2<sup>10</sup> = 1,024 ≈ 10<sup>3</sup> lets you switch freely between them with ~2–10% error — negligible for estimation.</p>
+<div class="table-wrap"><table>
+  <tr><th>Power of 2</th><th>Exact value</th><th>≈ Power of 10</th><th>Name</th><th>Where you meet it</th></tr>
+  <tr><td>2<sup>8</sup></td><td>256</td><td>—</td><td>1 byte holds 256 values</td><td>A byte; small enums</td></tr>
+  <tr><td>2<sup>10</sup></td><td>1,024</td><td>10<sup>3</sup> (thousand)</td><td>1 KB (KiB)</td><td>A short JSON object; a tweet-sized record</td></tr>
+  <tr><td>2<sup>16</sup></td><td>65,536</td><td>~6.5 × 10<sup>4</sup></td><td>—</td><td>TCP port range; 16-bit counters overflow</td></tr>
+  <tr><td>2<sup>20</sup></td><td>1,048,576</td><td>10<sup>6</sup> (million)</td><td>1 MB (MiB)</td><td>A photo</td></tr>
+  <tr><td>2<sup>30</sup></td><td>~1.07 billion</td><td>10<sup>9</sup> (billion)</td><td>1 GB (GiB)</td><td>A movie; RAM per process</td></tr>
+  <tr><td>2<sup>31</sup></td><td>~2.1 billion</td><td>2 × 10<sup>9</sup></td><td>—</td><td><b>Max signed 32-bit int</b> — fewer than Instagram's ~2B users! IDs must be 64-bit</td></tr>
+  <tr><td>2<sup>32</sup></td><td>~4.3 billion</td><td>4 × 10<sup>9</sup></td><td>—</td><td>IPv4 address space; unsigned 32-bit int</td></tr>
+  <tr><td>2<sup>40</sup></td><td>~1.1 trillion</td><td>10<sup>12</sup> (trillion)</td><td>1 TB (TiB)</td><td>A large SSD; a DB shard</td></tr>
+  <tr><td>2<sup>50</sup></td><td>~1.13 × 10<sup>15</sup></td><td>10<sup>15</sup> (quadrillion)</td><td>1 PB (PiB)</td><td>A day of Instagram-scale media egress is tens of PB</td></tr>
+  <tr><td>2<sup>60</sup></td><td>~1.15 × 10<sup>18</sup></td><td>10<sup>18</sup></td><td>1 EB (EiB)</td><td>Multi-year media archive of a giant platform</td></tr>
+  <tr><td>2<sup>63</sup></td><td>~9.2 × 10<sup>18</sup></td><td>~10<sup>19</sup></td><td>—</td><td>Max signed 64-bit int — room for Snowflake-style IDs (<a href="id-generation.html">ID Generation</a>)</td></tr>
+</table></div>
+<div class="callout tip"><span class="callout-title">💡 Data-size rules of thumb</span>
+ASCII character = 1 byte (UTF-8: 1–4 bytes); integer/ID = 4 or 8 bytes; timestamp = 8 bytes; UUID = 16 bytes; a typical DB row with a few fields = 100 B–1 KB; a compressed phone photo = 100 KB–2 MB; a minute of 720p video ≈ 10–30 MB depending on bitrate. When unsure, round up — real systems carry indexes, replication and overhead.</div>
+
+<h3>2.2 Handy conversions</h3>
+<div class="table-wrap"><table>
+  <tr><th>Fact</th><th>Value</th><th>Shortcut</th></tr>
+  <tr><td>Seconds per day</td><td>86,400</td><td><b>≈ 10<sup>5</sup></b> (overestimates by ~16%, so QPS comes out ~14% low — fine, or use 86,400 when precision matters)</td></tr>
+  <tr><td>Seconds per month</td><td>~2.6 million</td><td>≈ 2.5 × 10<sup>6</sup></td></tr>
+  <tr><td>Seconds per year</td><td>~31.5 million</td><td>≈ π × 10<sup>7</sup> ≈ 3 × 10<sup>7</sup></td></tr>
+  <tr><td>1 million per day</td><td>≈ 11.6 per second</td><td><b>1M/day ≈ 12/s</b></td></tr>
+  <tr><td>1 billion per day</td><td>≈ 11,574 per second</td><td><b>1B/day ≈ 12K/s</b></td></tr>
+  <tr><td>Bits vs bytes</td><td>1 byte = 8 bits</td><td>Network in bits (Gbps), storage in bytes (GB)</td></tr>
+  <tr><td>1 Gbps</td><td>125 MB/s</td><td>≈ 0.1 GB/s</td></tr>
+  <tr><td>1 TB/day</td><td>≈ 11.6 MB/s</td><td>≈ 93 Mbps</td></tr>
+  <tr><td>1 PB/day</td><td>≈ 11.6 GB/s</td><td><b>≈ 93 Gbps</b></td></tr>
+  <tr><td>Peak vs average</td><td>Depends on daily curve</td><td>peak ≈ 2–3 × average (use 3× for safety; viral events more)</td></tr>
+  <tr><td>Concurrent users</td><td>Depends on session length</td><td>≈ DAU × (avg minutes online/day ÷ 1,440)</td></tr>
+</table></div>
+
+<h3>2.3 Latency numbers every programmer should know</h3>
+<p>This famous table (popularised by Jeff Dean and Peter Norvig) gives the cost of basic operations. Exact values vary by hardware generation — modern NVMe SSDs and memory bandwidth have improved several of them — but the <strong>ratios</strong> are what matter: memory is ~1,000× faster than SSD random reads, and the same data centre is ~300× closer than another continent.</p>
+<div class="table-wrap"><table>
+  <tr><th>Operation</th><th>Classic latency</th><th>In µs / ms</th><th>Lesson for design</th></tr>
+  <tr><td>L1 cache reference</td><td>0.5 ns</td><td></td><td rowspan="2">CPU caches are effectively free</td></tr>
+  <tr><td>Branch mispredict</td><td>5 ns</td><td></td></tr>
+  <tr><td>L2 cache reference</td><td>7 ns</td><td></td><td></td></tr>
+  <tr><td>Mutex lock/unlock</td><td>25 ns</td><td></td><td>Contention, not the lock itself, is the cost</td></tr>
+  <tr><td>Main memory reference</td><td>100 ns</td><td>0.1 µs</td><td>RAM is the fast tier → caches (<a href="caching.html">Redis</a>)</td></tr>
+  <tr><td>Compress 1 KB (Snappy/Zippy)</td><td>~3 µs</td><td>3 µs</td><td>Compression is cheap vs network</td></tr>
+  <tr><td>Send 1 KB over 1 Gbps network</td><td>10 µs</td><td>10 µs</td><td>Bandwidth rarely the bottleneck for small payloads</td></tr>
+  <tr><td>Read 4 KB randomly from SSD</td><td>~150 µs (NVMe: ~20–100 µs)</td><td>0.15 ms</td><td>SSD random reads OK; batch them</td></tr>
+  <tr><td>Read 1 MB sequentially from memory</td><td>250 µs (modern: tens of µs)</td><td>0.25 ms</td><td>Sequential is king</td></tr>
+  <tr><td>Round trip within same data centre</td><td>500 µs</td><td>0.5 ms</td><td>Each service hop costs ~0.5–1 ms → limit chatty calls</td></tr>
+  <tr><td>Read 1 MB sequentially from SSD</td><td>1 ms (NVMe: ~0.2 ms)</td><td>1 ms</td><td></td></tr>
+  <tr><td>HDD disk seek</td><td>10 ms</td><td>10 ms</td><td>Avoid random I/O on spinning disks; log-structured storage</td></tr>
+  <tr><td>Read 1 MB sequentially from HDD</td><td>20 ms</td><td>20 ms</td><td>Cheap bulk storage (cold media tier)</td></tr>
+  <tr><td>Packet round trip California → Netherlands → California</td><td>150 ms</td><td>150 ms</td><td>Physics: put data near users (<a href="cdn.html">CDN</a>, <a href="multi-region.html">regions</a>)</td></tr>
+</table></div>
+<p>A few practical system-level numbers to add to the classic list (orders of magnitude, assume rather than quote):</p>
+<ul>
+  <li>Redis/Memcached GET inside a data centre: <strong>~0.2–1 ms</strong> (mostly network). One node: <strong>~100K+ simple ops/s</strong>.</li>
+  <li>Indexed lookup in a well-tuned SQL database (hot in buffer cache): <strong>~1–5 ms</strong>; a single primary handles <strong>roughly 5K–20K writes/s</strong> depending on hardware and row size.</li>
+  <li>Cassandra-style node: <strong>~10K–50K writes/s</strong>; comfortable data per node <strong>~1–2 TB</strong> (to keep compaction and repair manageable).</li>
+  <li>TCP + TLS 1.3 handshake to a server 100 ms away: <strong>~2 round trips ≈ 200 ms</strong> before the first byte — which is why connection reuse and edge termination matter (<a href="networking-basics.html">Networking</a>).</li>
+  <li>A modern server NIC: <strong>10–100 Gbps</strong>. A Kafka broker: <strong>~100 MB/s of sustained produce traffic</strong> per broker is a conservative planning number.</li>
+</ul>
+
+<pre class="ascii">
+ HUMAN-SCALE VERSION: multiply every latency by 2 billion (so L1 = 1 second)
+
+   L1 cache reference ............ 0.5 ns  →  1 second        (a heartbeat)
+   Main memory reference ......... 100 ns  →  3.3 minutes     (make a coffee)
+   SSD random read 4 KB .......... 150 µs  →  3.5 days        (a long weekend)
+   Same-datacenter round trip .... 500 µs  →  11.6 days       (a holiday)
+   HDD seek ...................... 10 ms   →  7.6 months      (a pregnancy, almost)
+   California ⇄ Netherlands ...... 150 ms  →  9.5 years       (primary school)
+
+ → Every network hop or disk access is an eternity to a CPU.
+ → That is why a feed request that does 20 sequential DB queries is slow,
+   and why we pre-compute timelines and keep them in RAM.
+</pre>
+
+<h2>3. The estimation method</h2>
+<div class="diagram">
+<svg viewBox="0 0 820 220" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-cap-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g text-anchor="middle">
+    <rect x="10" y="30" width="145" height="90" rx="8" fill="#e1f5fe" stroke="#0277bd"/>
+    <text x="82" y="55" font-weight="700">1. Assumptions</text><text x="82" y="77" font-size="12">DAU, actions/user</text><text x="82" y="95" font-size="12">object sizes</text><text x="82" y="112" font-size="12">peak factor</text>
+    <rect x="175" y="30" width="145" height="90" rx="8" fill="#fff3e0" stroke="#ef6c00"/>
+    <text x="247" y="55" font-weight="700">2. Rates</text><text x="247" y="77" font-size="12">per day → per sec</text><text x="247" y="95" font-size="12">read vs write</text><text x="247" y="112" font-size="12">avg and peak QPS</text>
+    <rect x="340" y="30" width="145" height="90" rx="8" fill="#fff8e1" stroke="#f9a825"/>
+    <text x="412" y="55" font-weight="700">3. Sizes</text><text x="412" y="77" font-size="12">storage/day, /year</text><text x="412" y="95" font-size="12">× replication</text><text x="412" y="112" font-size="12">bandwidth in/out</text>
+    <rect x="505" y="30" width="145" height="90" rx="8" fill="#e8f5e9" stroke="#2e7d32"/>
+    <text x="577" y="55" font-weight="700">4. Resources</text><text x="577" y="77" font-size="12">servers, shards</text><text x="577" y="95" font-size="12">cache nodes</text><text x="577" y="112" font-size="12">brokers, CDN</text>
+    <rect x="670" y="30" width="140" height="90" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/>
+    <text x="740" y="55" font-weight="700">5. Sanity check</text><text x="740" y="77" font-size="12">per-user, per-box</text><text x="740" y="95" font-size="12">second method</text><text x="740" y="112" font-size="12">→ design impact</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-cap-1)">
+    <path d="M155,75 L173,75"/><path d="M320,75 L338,75"/><path d="M485,75 L503,75"/><path d="M650,75 L668,75"/>
+    <path d="M740,120 C740,190 82,190 82,122" stroke-dasharray="5 3"/>
+  </g>
+  <text x="410" y="178" text-anchor="middle" font-size="12" fill="#555">if a number looks absurd, revisit the assumptions</text>
+  <text x="410" y="210" text-anchor="middle" font-size="12">Formula skeleton: QPS = (users × actions per user per day) ÷ 86,400 · storage = items/day × size × replication × days</text>
+</svg>
+<div class="caption">Estimation is a pipeline: each stage multiplies the previous one by a rate or a size. Sanity checks close the loop.</div>
+</div>
+<ol class="steps">
+  <li><strong>State assumptions explicitly</strong> and round them to friendly numbers (500M not 487M). Write them on the board.</li>
+  <li><strong>Convert per-day counts into per-second rates</strong>, separately for reads and writes. Multiply by a peak factor (2–3×).</li>
+  <li><strong>Multiply counts by sizes</strong> to get storage (per day, per year, over the retention period) and bandwidth (in and out). Remember replication and multiple renditions.</li>
+  <li><strong>Divide by per-machine capacity</strong> to get server, shard and cache-node counts. Add headroom (target ~60–70% utilisation) and redundancy (survive losing a zone).</li>
+  <li><strong>Sanity-check</strong> and, most importantly, <strong>say what the number means for the design</strong>.</li>
+</ol>
+<div class="callout tip"><span class="callout-title">💡 Arithmetic tricks</span>
+Work in scientific notation and add exponents: 500M × 20 = 5×10<sup>8</sup> × 2×10<sup>1</sup> = 10×10<sup>9</sup> = 10<sup>10</sup>. Then 10<sup>10</sup> / 10<sup>5</sup> = 10<sup>5</sup> = 100K/s. Keep one significant digit until the end. Label units on every line (requests/day, bytes/s) — unit mistakes are the most common error.</div>
+
+<h2>4. Full worked example: Instagram</h2>
+<p>We now estimate Instagram end-to-end. All inputs are <strong>assumptions for design purposes</strong> (consistent with the <a href="requirements.html">Requirements</a> lesson), not official statistics. Follow along with a pen — the point is the method.</p>
+
+<h3>4.1 Assumptions</h3>
+<div class="table-wrap"><table>
+  <tr><th>Input</th><th>Assumption</th></tr>
+  <tr><td>Users</td><td>2B MAU, <b>500M DAU</b></td></tr>
+  <tr><td>Posts</td><td><b>100M/day</b>: 85M photo posts, 15M video posts (carousels folded into the average size)</td></tr>
+  <tr><td>Stories</td><td>200M/day</td></tr>
+  <tr><td>Feed page loads</td><td>20 per DAU per day (each page ≈ 10 posts)</td></tr>
+  <tr><td>Profile views, Stories-tray loads</td><td>10 each per DAU per day</td></tr>
+  <tr><td>Likes / comments</td><td>5B/day / 500M/day (10 likes, 1 comment per DAU)</td></tr>
+  <tr><td>Follows</td><td>100M/day; average ~200 followees per user</td></tr>
+  <tr><td>Search queries</td><td>1B/day (2 per DAU)</td></tr>
+  <tr><td>DMs</td><td>2B messages/day</td></tr>
+  <tr><td>Media sizes</td><td>photo upload 1 MB + renditions 0.5 MB; video upload 15 MB + renditions 15 MB; story ~1.5 MB</td></tr>
+  <tr><td>Media consumed</td><td>per DAU per day: ~100 images × 200 KB, ~30 videos × 5 MB (includes Stories and Reels views)</td></tr>
+  <tr><td>Peak factor</td><td>3× average</td></tr>
+</table></div>
+
+<h3>4.2 Requests per second (QPS)</h3>
+<p>Rule: <code>QPS = per-day count ÷ 86,400</code>. Using "1B/day ≈ 12K/s":</p>
+<div class="table-wrap"><table>
+  <tr><th>Operation</th><th>Per day</th><th>Average QPS</th><th>Peak QPS (3×)</th><th>Type</th></tr>
+  <tr><td>Feed page loads</td><td>500M × 20 = 10B</td><td>~116K</td><td>~350K</td><td>Read</td></tr>
+  <tr><td>Profile views</td><td>5B</td><td>~58K</td><td>~174K</td><td>Read</td></tr>
+  <tr><td>Stories tray loads</td><td>5B</td><td>~58K</td><td>~174K</td><td>Read</td></tr>
+  <tr><td>Comment list reads</td><td>2B</td><td>~23K</td><td>~70K</td><td>Read</td></tr>
+  <tr><td>Search queries</td><td>1B</td><td>~12K</td><td>~35K</td><td>Read</td></tr>
+  <tr><td><b>Total reads</b></td><td>23B</td><td><b>~267K</b></td><td><b>~800K</b></td><td></td></tr>
+  <tr><td>Likes</td><td>5B</td><td>~58K</td><td>~174K</td><td>Write</td></tr>
+  <tr><td>DMs sent</td><td>2B</td><td>~23K</td><td>~70K</td><td>Write</td></tr>
+  <tr><td>Comments</td><td>500M</td><td>~5.8K</td><td>~17K</td><td>Write</td></tr>
+  <tr><td>Stories posted</td><td>200M</td><td>~2.3K</td><td>~7K</td><td>Write</td></tr>
+  <tr><td>Posts</td><td>100M</td><td>~1.2K</td><td>~3.5K</td><td>Write</td></tr>
+  <tr><td>Follows</td><td>100M</td><td>~1.2K</td><td>~3.5K</td><td>Write</td></tr>
+  <tr><td><b>Total writes</b></td><td>~7.9B</td><td><b>~91K</b></td><td><b>~275K</b></td><td></td></tr>
+  <tr><td><b>All API requests</b></td><td>~31B</td><td><b>~360K</b></td><td><b>~1.1M</b></td><td></td></tr>
+</table></div>
+<p><strong>What it means:</strong></p>
+<ul>
+  <li>Post creation (~1.2K/s) is <em>tiny</em>. The upload service is not the scaling challenge; what happens <em>after</em> a post is created is.</li>
+  <li>At the API level, reads:writes ≈ <strong>3:1</strong> — because likes are frequent writes. But at the <em>content</em> level: 10B feed pages × 10 posts = <strong>100B post impressions/day vs 100M posts created → ~1,000:1</strong>. The feed read path dominates and must be served from memory.</li>
+  <li>~1.1M requests/s at peak means <strong>thousands of stateless app servers</strong> behind <a href="load-balancer.html">load balancers</a>.</li>
+  <li>Likes at ~174K/s peak are a serious write path: write-optimised store plus asynchronous counters (<a href="likes-comments.html">Likes &amp; Comments</a>).</li>
+</ul>
+
+<h3>4.3 Fan-out write amplification</h3>
+<p>With push-based fan-out (<a href="news-feed.html">News Feed</a>), every post is inserted into each follower's timeline:</p>
+<pre><code>timeline inserts/day = 100M posts × 200 followers (avg) = 2 × 10^10 = 20B/day
+average  = 20B / 86,400 ≈ 231K inserts/s
+peak     ≈ 700K inserts/s
+
+Optimisation: only fan out to followers active in the last ~30 days.
+If ~25% of edges point to recently active users → ~5B/day ≈ 58K/s average.
+Celebrities (say &gt;1M followers) are excluded and pulled at read time —
+one 500M-follower post would otherwise be 500M inserts on its own.</code></pre>
+<p>So each 1 post/s of writes becomes ~200 timeline writes/s — the "small" write rate is amplified 200× inside the system.</p>
+
+<h3>4.4 Media storage</h3>
+<pre><code>Photos:  85M/day × (1 MB original + 0.5 MB renditions) = 85M × 1.5 MB  = 127.5 TB/day
+Videos:  15M/day × (15 MB original + 15 MB renditions) = 15M × 30 MB   = 450   TB/day
+                                                     Total posts media ≈ 580 TB/day (logical)
+
+Per year:   580 TB × 365  ≈ 212 PB/year   (logical, one copy)
+Replicated: × 3 copies    ≈ 635 PB/year   (classic 3× replication)
+   — or with erasure coding (~1.5× overhead, as large blob stores use) ≈ 318 PB/year raw
+
+5 years, flat volume:      212 PB × 5   ≈ 1.06 EB logical  → ~1.6 EB (EC) … ~3.2 EB (3×)
+5 years, +20% growth/yr:   212 PB × (1 + 1.2 + 1.44 + 1.73 + 2.07) = 212 × 7.44
+                                       ≈ 1.6 EB logical    → ~2.4 EB (EC) … ~4.7 EB (3×)
+
+Stories: 200M × (1.5 MB + 0.5 MB renditions) ≈ 400 TB/day, but expire after 24 h
+         → a rolling ~400 TB hot footprint (× replication), unless archived.</code></pre>
+<p><strong>What it means:</strong> hundreds of PB per year is far beyond any database — media must live in <a href="object-storage.html">object storage</a>, with only <em>keys</em> in the metadata DB. Video is ~15% of posts but ~78% of bytes, so video codec efficiency and rendition choices dominate storage cost. Old media is rarely viewed → move it to cheaper "cold" tiers; this one decision changes the storage bill more than anything else.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 820 260" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <text x="20" y="24" font-weight="700">New data per year (logical), log scale — each grid line is 10×</text>
+  <g stroke="#ddd">
+    <path d="M200,40 L200,215"/><path d="M300,40 L300,215"/><path d="M400,40 L400,215"/><path d="M500,40 L500,215"/><path d="M600,40 L600,215"/><path d="M700,40 L700,215"/><path d="M800,40 L800,215"/>
+  </g>
+  <g font-size="11" fill="#555" text-anchor="middle">
+    <text x="200" y="232">1 TB</text><text x="300" y="232">10 TB</text><text x="400" y="232">100 TB</text><text x="500" y="232">1 PB</text><text x="600" y="232">10 PB</text><text x="700" y="232">100 PB</text><text x="800" y="232">1 EB</text>
+  </g>
+  <text x="20" y="62">Media (posts)</text>
+  <rect x="200" y="48" width="533" height="22" fill="#fff8e1" stroke="#f9a825"/><text x="725" y="64" text-anchor="end" font-size="12">~212 PB</text>
+  <text x="20" y="97">DM messages</text>
+  <rect x="200" y="83" width="216" height="22" fill="#fff8e1" stroke="#f9a825"/><text x="424" y="99" font-size="12">~146 TB</text>
+  <text x="20" y="132">Likes</text>
+  <rect x="200" y="118" width="196" height="22" fill="#fff8e1" stroke="#f9a825"/><text x="404" y="134" font-size="12">~91 TB</text>
+  <text x="20" y="167">Comments</text>
+  <rect x="200" y="153" width="174" height="22" fill="#fff8e1" stroke="#f9a825"/><text x="382" y="169" font-size="12">~55 TB</text>
+  <text x="20" y="202">Post metadata</text>
+  <rect x="200" y="188" width="156" height="22" fill="#fff8e1" stroke="#f9a825"/><text x="364" y="204" font-size="12">~37 TB</text>
+  <text x="410" y="252" text-anchor="middle" font-size="12" fill="#555">Media outweighs all metadata combined by ~650× — different problems, different storage systems.</text>
+</svg>
+<div class="caption">On a log scale the difference is stark: metadata is "big data", media is "enormous data".</div>
+</div>
+
+<h3>4.5 Metadata storage</h3>
+<div class="table-wrap"><table>
+  <tr><th>Data</th><th>Row size (assume)</th><th>Volume</th><th>Per day</th><th>Per year (logical)</th></tr>
+  <tr><td>Posts</td><td>~1 KB (ids, caption ~200 B, media keys, location, timestamps, indexes)</td><td>100M/day</td><td>100 GB</td><td>~37 TB</td></tr>
+  <tr><td>Likes</td><td>~50 B (post_id 8 + user_id 8 + timestamp 8 + overhead)</td><td>5B/day</td><td>250 GB</td><td>~91 TB</td></tr>
+  <tr><td>Comments</td><td>~300 B</td><td>500M/day</td><td>150 GB</td><td>~55 TB</td></tr>
+  <tr><td>DMs</td><td>~200 B (text messages; media goes to object storage)</td><td>2B/day</td><td>400 GB</td><td>~146 TB</td></tr>
+  <tr><td>Follow graph</td><td>~30 B per edge, stored in both directions</td><td>2B users × 200 = 400B edges</td><td>—</td><td>~24 TB total (not per year)</td></tr>
+  <tr><td>Users</td><td>~1 KB (+ indexes ≈ 2 KB)</td><td>2B</td><td>—</td><td>~2–4 TB total</td></tr>
+  <tr><td><b>Total growth</b></td><td></td><td></td><td><b>~0.9 TB/day</b></td><td><b>~330 TB/year → ~1 PB/year with 3× replication</b></td></tr>
+</table></div>
+<p><strong>What it means:</strong> metadata is ~650× smaller than media but still far too big for one machine (a single database server comfortably holds ~1–2 TB of hot data). Over 5 years the posts+likes+comments set reaches ~0.9 PB logical → it must be <a href="sharding.html">sharded</a> across hundreds of nodes (see section 4.10). Notice that <strong>likes outweigh posts</strong>: small rows × huge counts add up.</p>
+
+<h3>4.6 Bandwidth: ingress and egress</h3>
+<pre><code>INGRESS (uploads)
+  posts:   85M × 1 MB + 15M × 15 MB = 85 TB + 225 TB  = 310 TB/day
+  stories: 200M × 1.5 MB                              = 300 TB/day
+  total ≈ 610 TB/day  →  610 × 10^12 B / 86,400 s ≈ 7 GB/s ≈ 56 Gbps avg  (~170 Gbps peak)
+
+EGRESS (media views)
+  images: 500M DAU × 100 × 200 KB  = 10 PB/day
+  videos: 500M DAU × 30  × 5 MB    = 75 PB/day
+  total ≈ 85 PB/day  →  85 × 10^15 / 86,400 ≈ 984 GB/s ≈ 7.9 Tbps avg  (~24 Tbps peak)
+
+API (JSON) egress
+  10B feed pages × ~20 KB = 200 TB/day ≈ 2.3 GB/s ≈ 19 Gbps   (~0.2% of media egress)
+
+Egress : ingress ≈ 85 PB : 0.61 PB ≈ 140 : 1</code></pre>
+<p><strong>What it means:</strong> ~8 Tbps average (~24 Tbps peak) of media cannot be served from a handful of data centres — it needs a globally distributed <a href="cdn.html">CDN</a>. API traffic is a rounding error by comparison, which is why the API path and the media path are designed separately.</p>
+
+<h3>4.7 CDN vs origin traffic</h3>
+<p>The CDN absorbs most egress; only cache misses reach object storage (the <em>origin</em>):</p>
+<div class="table-wrap"><table>
+  <tr><th>CDN cache hit ratio</th><th>Origin egress per day</th><th>Origin bandwidth</th><th>Reduction vs no CDN</th></tr>
+  <tr><td>90%</td><td>8.5 PB</td><td>~98 GB/s ≈ 790 Gbps</td><td>10×</td></tr>
+  <tr><td>95%</td><td>4.25 PB</td><td>~49 GB/s ≈ 394 Gbps</td><td>20×</td></tr>
+  <tr><td>99%</td><td>0.85 PB</td><td>~9.8 GB/s ≈ 79 Gbps</td><td>100×</td></tr>
+</table></div>
+<div class="diagram">
+<svg viewBox="0 0 820 190" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-cap-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <rect x="20" y="50" width="150" height="70" rx="8" fill="#e1f5fe" stroke="#0277bd"/>
+  <text x="95" y="80" text-anchor="middle" font-weight="700">500M users</text><text x="95" y="100" text-anchor="middle" font-size="12">85 PB/day of views</text>
+  <rect x="300" y="35" width="200" height="100" rx="8" fill="#fff3e0" stroke="#ef6c00"/>
+  <text x="400" y="65" text-anchor="middle" font-weight="700">CDN edges</text><text x="400" y="87" text-anchor="middle" font-size="12">serve 95% from cache</text><text x="400" y="107" text-anchor="middle" font-size="12">≈ 80.75 PB/day</text>
+  <path d="M630,60 a60,10 0 0,0 160,0 a60,10 0 0,0 -160,0 v60 a60,10 0 0,0 160,0 v-60" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="710" y="98" text-anchor="middle" font-weight="700">Origin (S3)</text><text x="710" y="116" text-anchor="middle" font-size="12">4.25 PB/day</text>
+  <path d="M172,85 L298,85" stroke="#555" stroke-width="10" marker-end="url(#ar-cap-2)" fill="none" opacity=".35"/>
+  <path d="M502,85 L628,85" stroke="#555" stroke-width="2" marker-end="url(#ar-cap-2)" fill="none"/>
+  <text x="235" y="72" text-anchor="middle" font-size="11" fill="#555">≈ 7.9 Tbps</text>
+  <text x="565" y="72" text-anchor="middle" font-size="11" fill="#555">≈ 0.4 Tbps (misses)</text>
+  <text x="410" y="170" text-anchor="middle" font-size="12" fill="#555">Arrow thickness ≈ traffic. A 95% hit ratio turns an impossible origin load into a manageable one.</text>
+</svg>
+<div class="caption">CDN offload at a 95% hit ratio.</div>
+</div>
+<p>How many edge servers? If one edge cache server can serve ~40 Gbps of real traffic, peak ~24 Tbps needs at least ~600 servers — and in practice many more, because traffic must be served from hundreds of locations near users, each sized for its local peak plus failover. That's why at this scale companies either buy from the largest CDN providers or, like Meta, build their own edge network.</p>
+
+<h3>4.8 Cache memory sizing (the 80/20 rule)</h3>
+<p>The <strong>Pareto (80/20) rule</strong> says ~20% of items receive ~80% of requests. So caching the hottest ~20% of the data gives a high hit ratio at a fraction of the memory. There are two ways to size a cache; the second is more reliable.</p>
+<p><strong>(a) The classic interview formula — and its trap:</strong></p>
+<pre><code>cache ≈ 20% × (read requests/day × response size)
+      = 0.2 × 10B feed pages × 20 KB = 40 TB      ← overestimate!</code></pre>
+<p>This counts the same popular post millions of times. Caches store <em>distinct objects</em>, so size by distinct hot objects instead.</p>
+<p><strong>(b) Bottom-up, per data structure:</strong></p>
+<div class="table-wrap"><table>
+  <tr><th>Cached data</th><th>Calculation</th><th>Memory</th></tr>
+  <tr><td>Feed timelines (post IDs + scores) for DAU</td><td>500M users × 500 entries × 16 B = 4 TB; × ~2 for data-structure overhead</td><td><b>~8 TB</b></td></tr>
+  <tr><td>Hot post metadata (80/20)</td><td>~1B distinct posts viewed/day × 1 KB = 1 TB; cache hottest 20%</td><td>~200 GB</td></tr>
+  <tr><td>User profiles of DAU</td><td>500M × 1 KB</td><td>~500 GB</td></tr>
+  <tr><td>Like/comment counters for hot posts</td><td>1B posts × ~50 B (key + 2 counters + overhead)</td><td>~50 GB</td></tr>
+  <tr><td>Sessions / auth tokens</td><td>500M × 200 B</td><td>~100 GB</td></tr>
+  <tr><td><b>Total</b></td><td></td><td><b>~9 TB</b></td></tr>
+</table></div>
+<pre><code>Nodes by memory:     9 TB / ~50 GB usable per node (on a 64 GB box) ≈ 180 primaries
+Nodes by throughput: feed hydration ≈ 350K pages/s × ~20 lookups = 7M ops/s (peak)
+                     + fan-out inserts ~0.7M/s  ≈ 8M ops/s ÷ ~100K ops/s per node ≈ 80 nodes
+→ memory is the binding constraint: ~180 primaries, ×2 with one replica each ≈ 360 cache nodes</code></pre>
+<p><strong>What it means:</strong> the entire hot working set fits in a few hundred RAM-heavy machines — which is why serving the feed from <a href="caching.html">Redis</a> is feasible at all. Note the timelines dominate; capping them (e.g. 500 entries, older items fetched on demand) is a key cost lever.</p>
+
+<h3>4.9 Kafka event throughput</h3>
+<p>Every domain action publishes an event to <a href="message-queues.html">Kafka</a>; clients also emit analytics events (impressions, scrolls, video watch time) that feed ranking models.</p>
+<pre><code>DOMAIN EVENTS (post, story, like, comment, follow, DM events)
+  ≈ total writes ≈ 91K events/s avg (~275K/s peak) × ~1 KB  ≈ 91 MB/s avg (~275 MB/s peak)
+
+ANALYTICS / CLIENT EVENTS
+  500M DAU × ~500 events/day = 250B events/day ≈ 2.9M events/s × ~500 B ≈ 1.45 GB/s avg
+  peak ≈ 4.3 GB/s
+
+TOTAL produce ≈ 1.5 GB/s avg, ~4.6 GB/s peak
+With replication factor 3, brokers write ≈ 4.6 GB/s avg, ~14 GB/s peak to disk.
+
+Brokers:   ~14 GB/s ÷ ~100 MB/s per broker (conservative) ≈ 140 brokers  → ~150–200 with headroom,
+           typically split into separate clusters (critical domain events vs bulk analytics)
+Retention: domain events 7 days:  91 MB/s × 604,800 s ≈ 55 TB  × 3 ≈ 165 TB
+           analytics 3 days:      1.45 GB/s × 259,200 s ≈ 376 TB × 3 ≈ 1.1 PB
+Partitions: domain topics ≈ 275 MB/s ÷ ~10 MB/s per consumer partition ≈ 28 minimum;
+           choose e.g. 128–256 so hundreds of fan-out workers can consume in parallel.</code></pre>
+<p><strong>What it means:</strong> the "important" event stream is modest (~100 MB/s); analytics is ~15× bigger. Separating them prevents a flood of impression events from delaying fan-out or notifications. Partition count is driven by <em>consumer parallelism</em>, not just throughput.</p>
+
+<h3>4.10 Number of application servers</h3>
+<pre><code>Peak API load                     ≈ 1.1M requests/s
+Assume one app server handles     ≈ 1,000 req/s   (I/O-bound handlers calling caches/DBs;
+                                                   could be 200/s in Python, 5,000/s in Go/Java)
+Raw servers                       = 1.1M / 1,000             ≈ 1,100
+Target 70% CPU utilisation        = 1,100 / 0.7              ≈ 1,570
+Survive loss of 1 of 3 zones      = × 3/2                    ≈ 2,360  → plan ~2,400 servers
+
+DM WebSocket gateways: assume 50M concurrent connections at peak
+                       ÷ ~100K connections per server        ≈ 500 servers (+ headroom)</code></pre>
+<p>The per-server number is the softest assumption — say so, and show how the answer scales with it: if a server only handles 250 req/s, you need ~4× as many (~9,500). That sensitivity is itself a design insight — efficient runtimes and fewer downstream calls per request save thousands of machines.</p>
+
+<h3>4.11 Number of database shards</h3>
+<p>Shard count is driven by whichever constraint is <strong>tightest</strong>: storage, write throughput, or read throughput. Compute all three and take the max.</p>
+<div class="table-wrap"><table>
+  <tr><th>Store</th><th>By storage</th><th>By write throughput</th><th>Result</th></tr>
+  <tr><td><b>User DB (PostgreSQL)</b></td><td>2B users × ~2 KB + other relational tables ≈ 10 TB; ÷ ~1 TB per shard ≈ 10</td><td>User writes are rare (profile edits, sign-ups ~ hundreds/s) → 1 shard would do</td><td>~10 → plan <b>16 primaries</b> (room to grow), each with 2 replicas = 48 servers; map thousands of <em>logical</em> shards onto them so you can rebalance later</td></tr>
+  <tr><td><b>Posts + likes + comments (Cassandra)</b></td><td>~183 TB/yr × 5 yr ≈ 0.9 PB × RF 3 ≈ 2.7 PB ÷ ~2 TB per node ≈ <b>1,370 nodes</b></td><td>Peak ≈ 195K writes/s × RF 3 ≈ 585K replica writes/s ÷ ~20K per node ≈ 30 nodes</td><td><b>Storage-bound: ~1,400 nodes</b> (throughput would need only ~30)</td></tr>
+  <tr><td><b>Messages store</b></td><td>146 TB/yr × 5 × 3 ≈ 2.2 PB ÷ 2 TB ≈ 1,100 nodes</td><td>~70K msgs/s peak × 3 ÷ 20K ≈ 11 nodes</td><td>Storage-bound; retention policy is the lever</td></tr>
+</table></div>
+<p><strong>What it means:</strong> for Instagram-like data, <strong>storage</strong> usually drives the node count of the write-heavy stores, while <strong>RAM</strong> drives the cache tier and <strong>QPS</strong> drives the app tier. Knowing which constraint binds tells you which optimisation matters (compression and TTLs for storage-bound stores; more replicas for read-bound ones). Instagram's publicly described approach of many logical shards mapped onto fewer physical PostgreSQL servers is exactly the "plan for growth" trick in the first row — see <a href="sharding.html">Sharding</a>.</p>
+
+<h3>4.12 Summary table</h3>
+<div class="table-wrap"><table>
+  <tr><th>Quantity</th><th>Estimate</th><th>Design consequence</th></tr>
+  <tr><td>DAU / MAU</td><td>500M / 2B</td><td>64-bit IDs; sharded user DB</td></tr>
+  <tr><td>Post writes</td><td>~1.2K/s avg, ~3.5K/s peak</td><td>Upload service is not the bottleneck</td></tr>
+  <tr><td>Timeline inserts (fan-out)</td><td>~231K/s avg (~58K/s if only active followers)</td><td>Async fan-out workers on Kafka; hybrid push/pull</td></tr>
+  <tr><td>Feed reads</td><td>~116K/s avg, ~350K/s peak</td><td>Pre-computed timelines in Redis</td></tr>
+  <tr><td>Total API</td><td>~360K/s avg, ~1.1M/s peak</td><td>~2,400 stateless app servers behind LBs</td></tr>
+  <tr><td>Likes</td><td>~58K/s avg, ~174K/s peak</td><td>Write-optimised store, async counters</td></tr>
+  <tr><td>New media</td><td>~580 TB/day; ~212 PB/yr logical; ~1–1.6 EB logical in 5 yrs</td><td>Object storage, erasure coding, cold tiering</td></tr>
+  <tr><td>New metadata</td><td>~0.9 TB/day; ~330 TB/yr logical</td><td>Sharded Cassandra (~1,400 nodes for 5 yrs)</td></tr>
+  <tr><td>Ingress</td><td>~610 TB/day ≈ 56 Gbps avg</td><td>Direct-to-S3 pre-signed uploads</td></tr>
+  <tr><td>Media egress</td><td>~85 PB/day ≈ 7.9 Tbps avg, ~24 Tbps peak</td><td>Global CDN mandatory</td></tr>
+  <tr><td>Origin egress (95% CHR)</td><td>~4.25 PB/day ≈ 0.4 Tbps</td><td>Origin shield; maximise hit ratio</td></tr>
+  <tr><td>Cache memory</td><td>~9 TB → ~360 nodes with replicas</td><td>Redis cluster, capped timelines</td></tr>
+  <tr><td>Kafka</td><td>~1.5 GB/s produce avg; ~150–200 brokers</td><td>Separate clusters for domain vs analytics events</td></tr>
+  <tr><td>User DB</td><td>~10 TB → 16 primaries × 3</td><td>Logical shards for future rebalancing</td></tr>
+</table></div>
+
+<h2>5. Sanity-check techniques</h2>
+<p>Estimates go wrong by factors of 1,000 through a single slipped unit. Before you rely on a number, check it with at least one of these:</p>
+<ol class="steps">
+  <li><strong>Per-user check.</strong> Divide the total by the number of users. 85 PB/day ÷ 500M DAU = 170 MB per user per day — about 30 short videos plus 100 photos. Plausible for a heavy media app on mobile. If you'd got 170 GB per user per day, something is off by 1,000×.</li>
+  <li><strong>Per-machine check.</strong> Does any single box need to do something impossible? "One database handling 350K reads/s" or "one server pushing 8 Tbps" → wrong design or wrong number.</li>
+  <li><strong>Two methods.</strong> Compute top-down (DAU × actions) and bottom-up (requests per screen × screens per session × sessions). If they disagree by more than ~3×, find out why.</li>
+  <li><strong>Ratios.</strong> Does the read:write ratio match the product's nature? Does egress:ingress (~140:1) fit "each post viewed hundreds of times"?</li>
+  <li><strong>Known anchors.</strong> Compare with physical limits you know: a 100 Gbps NIC, a ~2 TB comfortable DB node, ~100K ops/s per Redis node, 86,400 seconds per day.</li>
+  <li><strong>Units on every line.</strong> Bits vs bytes (×8), per day vs per second (×86,400), KB vs MB (×1,000). Write the unit next to every number.</li>
+  <li><strong>Order-of-magnitude rounding.</strong> If rounding an input up or down by 2× changes your design decision, the decision is sensitive — say so and pick the safe side.</li>
+</ol>
+
+<h2>6. Cheat sheet</h2>
+<pre><code>TIME                          RATES                          SIZE
+1 day   ≈ 86,400 s ≈ 10^5 s   1M/day  ≈ 12/s                 char 1 B · int 4 B · long/ID 8 B
+1 month ≈ 2.5 × 10^6 s        1B/day  ≈ 12K/s                UUID 16 B · row 100 B–1 KB
+1 year  ≈ 3 × 10^7 s          peak    ≈ 2–3 × average        photo ~200 KB–2 MB · 1 min video ~10–30 MB
+
+BANDWIDTH                     STORAGE                        CAPACITY (rough, per machine)
+1 Gbps = 125 MB/s             2^10 ≈ 10^3 (KB), 2^20 (MB)    app server:  ~200–5,000 req/s
+1 TB/day ≈ 12 MB/s ≈ 93 Mbps  2^30 (GB), 2^40 (TB)           Redis node:  ~100K ops/s, ~50 GB usable
+1 PB/day ≈ 12 GB/s ≈ 93 Gbps  2^50 (PB), 2^60 (EB)           SQL primary: ~5–20K writes/s, ~1–2 TB
+                              2^31 ≈ 2.1B (int32 limit!)     Cassandra:   ~10–50K writes/s, ~2 TB
+LATENCY                                                      Kafka broker: ~100 MB/s
+RAM 100 ns · SSD 0.1 ms · same-DC RTT 0.5 ms                 WebSocket gw: ~100K connections
+HDD seek 10 ms · cross-continent RTT 150 ms
+
+FORMULAS
+QPS          = daily count ÷ 86,400          storage   = count/day × size × replicas × days
+bandwidth    = QPS × payload size            servers   = peak QPS ÷ (per-server QPS × utilisation)
+cache        = distinct hot objects × size   in-flight = QPS × latency  (Little's law)</code></pre>
+
+<h2>7. How Instagram uses estimation</h2>
+<p>Each box in the Instagram diagram can be justified by a number from section 4:</p>
+<div class="table-wrap"><table>
+  <tr><th>Box in the diagram</th><th>The number that justifies it</th></tr>
+  <tr><td>CDN</td><td>~85 PB/day (~8 Tbps) of media egress — no origin could serve it</td></tr>
+  <tr><td>Object Storage (S3)</td><td>~580 TB/day of new media; ~212 PB/year</td></tr>
+  <tr><td>Feed Cache (Redis)</td><td>~350K feed reads/s peak with a p99 &lt; 300 ms target; working set ~9 TB fits in RAM</td></tr>
+  <tr><td>Feed Fan-out Workers + Kafka</td><td>~20B timeline inserts/day — too many to do synchronously inside a ~1K/s upload request</td></tr>
+  <tr><td>Sharded Cassandra</td><td>~0.9 PB of post/like/comment data over 5 years; ~195K writes/s peak</td></tr>
+  <tr><td>Sharded PostgreSQL + replicas</td><td>2B user rows (exceeds int32 IDs, ~10 TB); reads are far more frequent than writes</td></tr>
+  <tr><td>Stateless app services + load balancer</td><td>~1.1M API requests/s at peak → thousands of servers</td></tr>
+  <tr><td>Separate analytics pipeline</td><td>~250B client events/day (~1.45 GB/s) — 15× the domain event volume</td></tr>
+</table></div>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+Two public Instagram engineering facts show estimation thinking in action. First, their widely cited sharded-ID scheme uses <strong>64-bit IDs</strong> (41 bits of milliseconds since a custom epoch, 13 bits of logical shard ID, 10 bits of per-shard sequence). Do the maths: 2<sup>13</sup> = 8,192 logical shards; 2<sup>10</sup> = 1,024 IDs per shard per millisecond → ~1M IDs per second per shard; 2<sup>41</sup> ms ≈ 69.7 years of timestamps. Those bit widths are a capacity estimate frozen into a format (see <a href="id-generation.html">ID Generation</a>). Second, the decision to create <strong>thousands of logical shards up front</strong> and map them onto a small number of physical PostgreSQL servers was explicitly about growth: moving a logical shard to a new machine is easy; re-splitting data later is hard. Both decisions came from asking "how big will this get?" before it got big.</div>
+
+<h2>8. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Why estimation is worth it</h4><ul>
+    <li>Turns "it needs to scale" into specific, defensible decisions</li>
+    <li>Catches impossible designs early (one DB at 350K QPS)</li>
+    <li>Reveals which constraint binds: storage, RAM, CPU or network</li>
+    <li>Identifies the biggest cost drivers (video storage, egress)</li>
+    <li>Quick: 3–5 minutes with mental arithmetic</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Limits</h4><ul>
+    <li>Garbage in, garbage out — assumptions dominate the result</li>
+    <li>Averages hide skew (celebrities, viral posts, hot shards)</li>
+    <li>Per-server capacity numbers vary 10× by language and workload</li>
+    <li>Easy to burn interview time on precision nobody needs</li>
+    <li>Real capacity planning needs load tests and production metrics</li>
+  </ul></div>
+</div>
+<h4>Common mistakes</h4>
+<ul>
+  <li><strong>Bits vs bytes.</strong> 1 Gbps is 125 MB/s, not 1 GB/s — an 8× error.</li>
+  <li><strong>Forgetting peak.</strong> Sizing for the average means falling over every evening.</li>
+  <li><strong>Forgetting replication and renditions.</strong> Raw storage is 1.5–3× logical; each photo exists in 4–8 sizes/formats; videos in a whole bitrate ladder.</li>
+  <li><strong>Forgetting write amplification.</strong> 1 post = ~200 timeline writes, plus index updates, plus replicas.</li>
+  <li><strong>Mixing up DAU and MAU</strong>, or using MAU to size daily traffic.</li>
+  <li><strong>Over-precision.</strong> "1,157.407 QPS" wastes time and signals the wrong priorities. Say "~1.2K/s".</li>
+  <li><strong>Computing numbers that drive nothing.</strong> Every estimate should end with "…therefore we need X".</li>
+  <li><strong>The naive 80/20 cache formula</strong> applied to request volume rather than distinct objects (overestimates by orders of magnitude).</li>
+  <li><strong>Ignoring the skew.</strong> The average user has 200 followers; the top account has hundreds of millions. Hot keys, not averages, break systems.</li>
+  <li><strong>Not saying "assume".</strong> Present inputs as assumptions, not as facts about a real company.</li>
+</ul>
+
+<h2>9. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Tool</th><th>What it helps estimate or verify</th><th>When to use it</th></tr>
+  <tr><td>Spreadsheet / notebook (Excel, Google Sheets, Jupyter)</td><td>Capacity models with adjustable assumptions</td><td>Real capacity planning; sensitivity analysis</td></tr>
+  <tr><td>Cloud pricing calculators (AWS, GCP, Azure)</td><td>Converting storage/egress/compute estimates into cost</td><td>Budgeting; build-vs-buy decisions</td></tr>
+  <tr><td>Load-testing tools (k6, Locust, Gatling, wrk)</td><td>Measured per-server QPS and latency (replacing the "1,000 req/s" assumption)</td><td>Before launch; after major changes</td></tr>
+  <tr><td>Benchmarks (redis-benchmark, cassandra-stress, pgbench, Kafka perf tools)</td><td>Per-node capacity of data stores</td><td>Choosing node sizes and shard counts</td></tr>
+  <tr><td>Monitoring (Prometheus, Grafana, Datadog, CloudWatch)</td><td>Real peak factors, growth rates, hit ratios, utilisation</td><td>Continuous capacity planning in production</td></tr>
+  <tr><td>Queueing / simulation models</td><td>Latency vs utilisation curves, tail behaviour</td><td>When headroom decisions are expensive</td></tr>
+</table></div>
+
+<h2>10. Interview corner</h2>
+<details class="qa"><summary>Estimate the peak QPS of Instagram's home feed.</summary>
+<p>Assume 500M DAU, each loading ~20 feed pages a day (opening the app several times and scrolling). That's 10B pages/day. Divide by ~86,400 s: ~116K/s average. Traffic is uneven through the day, so peak ≈ 3× → ~350K/s. Implication: we can't compute feeds from the database per request; timelines must be pre-computed and kept in memory, with each page hydrated from caches.</p></details>
+<details class="qa"><summary>How much storage does Instagram need for new media per year?</summary>
+<p>Assume 100M posts/day: 85M photos at ~1.5 MB including renditions (~128 TB/day) and 15M videos at ~30 MB including the bitrate ladder (~450 TB/day) → ~580 TB/day, ~212 PB/year logical. With erasure coding (~1.5×) that's ~320 PB raw per year, or ~640 PB with 3× replication. Conclusions: object storage, not databases; video dominates (~78% of bytes); cold-tiering old media is the biggest cost lever.</p></details>
+<details class="qa"><summary>How would you size the Redis cluster for feed timelines?</summary>
+<p>Store, per active user, the latest ~500 post IDs with a score: 500 × 16 B = 8 KB, ~16 KB with data-structure overhead. For 500M DAU that's ~8 TB. Add hot post metadata (~200 GB by 80/20 on distinct posts), profiles (~500 GB) and counters (~50 GB): ~9 TB total. At ~50 GB usable per node → ~180 primaries, ~360 nodes with replicas. Check throughput too: ~8M ops/s peak ÷ ~100K ops/s per node ≈ 80 nodes — so memory, not throughput, is the binding constraint.</p></details>
+<details class="qa"><summary>Why is it misleading to say Instagram has a read:write ratio of 100:1?</summary>
+<p>Because it depends on what you count. At the API level, likes and DMs are frequent writes, so reads:writes is only ~3:1 under our assumptions. At the content level, each post is viewed ~1,000 times (100B impressions vs 100M posts per day), and media bytes out vs in is ~140:1. The content ratio justifies caching, pre-computed feeds and CDNs; the API ratio warns that the like path needs a write-optimised design.</p></details>
+<details class="qa"><summary>How many app servers do you need, and what's the weakest assumption?</summary>
+<p>Peak ~1.1M API requests/s. If one server handles ~1,000 req/s, that's 1,100 servers; at a 70% utilisation target ~1,570; to survive losing one of three zones, ×1.5 → ~2,400. The per-server throughput is the weakest assumption — it varies from ~200 req/s (an interpreted language with many downstream calls) to several thousand. I'd replace it with a load-test number as soon as possible, and note that halving per-request work halves the fleet.</p></details>
+<details class="qa"><summary>How do you estimate Kafka capacity for Instagram?</summary>
+<p>Domain events ≈ total writes ≈ 91K/s × ~1 KB ≈ 91 MB/s average. Client analytics events dominate: ~250B/day ≈ 2.9M/s × 500 B ≈ 1.45 GB/s. With RF 3 and peak 3×, brokers write ~14 GB/s; at ~100 MB/s per broker that's ~140 brokers, ~150–200 with headroom, preferably in separate clusters so analytics floods don't delay fan-out. Partition counts follow consumer parallelism (e.g. 128–256 for post events). Retention × throughput × RF gives disk: ~165 TB for 7 days of domain events.</p></details>
+<details class="qa"><summary>How do you decide the number of Cassandra nodes for posts, likes and comments?</summary>
+<p>Compute both constraints. Storage: ~183 TB/year logical × 5 years × RF 3 ≈ 2.7 PB; at ~2 TB per node ≈ 1,400 nodes. Throughput: ~195K writes/s peak × RF 3 ≈ 585K replica writes/s; at ~20K per node ≈ 30 nodes. Storage binds, so ~1,400 nodes; the levers are compression, shorter retention for derived data (like rows could be compacted into counts for old posts), and tiering.</p></details>
+
+<h2>11. Check your understanding</h2>
+<details class="quiz"><summary>Numeric: 300M events per day. Average events per second?</summary>
+<p>300M ÷ 86,400 ≈ <strong>3,500/s</strong> (shortcut: 1M/day ≈ 12/s → 300 × 12 ≈ 3,600/s). Peak ≈ 7–10K/s.</p></details>
+<details class="quiz"><summary>Numeric: a service sends 2 PB per day. What's that in Gbps?</summary>
+<p>1 PB/day ≈ 11.6 GB/s ≈ 93 Gbps, so 2 PB/day ≈ 23 GB/s ≈ <strong>~185 Gbps</strong> average.</p></details>
+<details class="quiz"><summary>Why can't Instagram's user ID be a signed 32-bit integer?</summary>
+<p>2<sup>31</sup> − 1 ≈ 2.1 billion — barely above ~2B users and far below the number of posts, likes or messages. IDs must be 64-bit (max ≈ 9.2 × 10<sup>18</sup>).</p></details>
+<details class="quiz"><summary>Numeric: Your CDN hit ratio improves from 95% to 99%. By how much does origin egress fall?</summary>
+<p>Misses fall from 5% to 1% of requests — a <strong>5× reduction</strong> (from ~4.25 PB/day to ~0.85 PB/day for 85 PB/day of egress).</p></details>
+<details class="quiz"><summary>Scenario: a candidate says "cache = 20% of daily read traffic = 40 TB". What's wrong?</summary>
+<p>The 80/20 rule applies to <em>distinct objects</em>, not request volume. 10B feed responses mostly reference the same popular posts; caching each response separately would duplicate them. Size by distinct hot items (timelines per DAU, hot posts, profiles) → ~9 TB here.</p></details>
+<details class="quiz"><summary>Numeric: 100M posts/day, average 200 followers each, push fan-out. Timeline inserts per second?</summary>
+<p>100M × 200 = 20B/day ÷ 86,400 ≈ <strong>231K inserts/s</strong> average (~700K/s peak). That's ~200× the post rate — the write amplification of fan-out on write.</p></details>
+<details class="quiz"><summary>Using the "human-scale" latency analogy, why is a feed request that makes 20 sequential DB calls slow?</summary>
+<p>Each same-DC round trip is ~0.5 ms (plus query time ~1–5 ms) — an eternity relative to memory access. 20 sequential calls ≈ 20–100 ms just waiting, before any tail effects. Batch or parallelise the calls and read from in-memory caches.</p></details>
+<details class="quiz"><summary>You compute 170 GB of media egress per user per day. What should you do?</summary>
+<p>Sanity-check: that's hours of 4K video per user per day — implausible for an average user. Look for a unit slip (KB vs MB, or per-day vs per-second). The intended estimate here is ~170 MB per user per day.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Estimation is about <strong>orders of magnitude</strong> — round aggressively, state assumptions, label units.</li>
+    <li>Anchors: <strong>10<sup>5</sup> s/day, 1B/day ≈ 12K/s, 1 PB/day ≈ 93 Gbps, 2<sup>10</sup> ≈ 10<sup>3</sup></strong>, RAM ≪ SSD ≪ network ≪ cross-continent.</li>
+    <li>Method: <strong>assumptions → rates → sizes → resources → sanity check</strong>; always include peak, replication, renditions and write amplification.</li>
+    <li>Instagram: ~1.2K posts/s but ~350K feed reads/s peak; ~580 TB/day new media; ~8 Tbps egress → CDN; ~9 TB cache; ~1.5 GB/s Kafka.</li>
+    <li>Compute every constraint (storage, throughput, RAM) — <strong>the tightest one sets the machine count</strong>.</li>
+    <li>Always finish with "<strong>…therefore the design needs X</strong>".</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="requirements.html">Requirements</a> — where the scale assumptions come from</li>
+  <li><a href="core-principles.html">Core Principles</a> — Little's law, utilisation, percentiles and availability maths</li>
+  <li><a href="cdn.html">CDN</a> — how the 85 PB/day of egress is actually served</li>
+  <li><a href="object-storage.html">Object Storage</a> — replication vs erasure coding, storage tiers</li>
+  <li><a href="caching.html">Caching</a> — eviction, hit ratios and cache cluster design</li>
+  <li><a href="sharding.html">Sharding</a> — turning a shard count into a partitioning scheme</li>
+  <li><a href="message-queues.html">Message Queues &amp; Kafka</a> — partitions, consumer groups and retention</li>
+  <li><a href="news-feed.html">News Feed</a> — fan-out write amplification in practice</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Caching (Redis &amp; Memcached) — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="caching">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>A <strong>cache</strong> is a small, fast copy of data whose source of truth lives somewhere slower. Reading RAM over the network (~0.2–0.5&nbsp;ms) is 10–100× faster than a database query that touches disk, and it costs a fraction of the CPU.</li>
+    <li>Caches exist at <strong>every layer</strong>: the phone, the <a href="cdn.html">CDN</a>, the gateway, inside each service process, a distributed cache tier (Redis/Memcached) and the database's own buffer pool.</li>
+    <li>The workhorse pattern is <strong>cache-aside</strong>: read the cache, on a miss read the DB and fill the cache; on a write, update the DB and then <strong>delete</strong> (not update) the cache key.</li>
+    <li>When the cache is full, an <strong>eviction policy</strong> (LRU, LFU, FIFO, TTL) decides what to drop; <strong>invalidation</strong> decides when cached data is no longer true. Invalidation and races are the hard part — Facebook's public <em>Scaling Memcache</em> paper solves them with <strong>leases</strong>.</li>
+    <li>Know the classic failure modes and fixes: <strong>stampede</strong> (coalescing, locks, early expiration), <strong>hot keys</strong> (replicas, local L1), <strong>penetration</strong> (negative caching, Bloom filters) and <strong>avalanche</strong> (jittered TTLs).</li>
+    <li>Instagram's <strong>Feed Cache (Redis)</strong> holds pre-computed timelines, counters and seen-state; it is what makes opening the app feel instant.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why cache at all?</h2>
+<p>Open Instagram and, within a few hundred milliseconds, the app shows your home feed: 10–20 posts, each with an author name and avatar, a like count, a comment count, the first comments, whether <em>you</em> already liked it, and the story tray at the top showing which stories you have not yet seen. Behind that single screen sit <strong>hundreds of small data lookups</strong>. Instagram is also overwhelmingly <strong>read-heavy</strong>: a post is written once but read thousands or millions of times. If every one of those reads went to the primary databases (sharded PostgreSQL and Cassandra in our diagram), three bad things would happen:</p>
+<ul>
+  <li><strong>Latency adds up.</strong> A database read that misses the DB's memory and touches SSD costs ~1–10&nbsp;ms including query parsing, locking and network. Do 200 of them, even partly in parallel, and the feed takes seconds.</li>
+  <li><strong>Databases are expensive to scale.</strong> A database node does a lot of work per query (parsing, planning, transactions, durability). A cache node does almost nothing: hash the key, copy bytes from RAM to the socket. A single Redis node serves ~100,000+ simple operations per second; a database node might serve a few thousand complex queries per second.</li>
+  <li><strong>Popularity is skewed.</strong> A celebrity's post or profile is read millions of times per minute. Without a cache, the single database shard holding that row would melt (a <em>hot spot</em> — see <a href="sharding.html">Sharding</a>).</li>
+</ul>
+
+<h3>1.1 Latency numbers that motivate caching</h3>
+<p>The reason caching works is that storage media differ in speed by <em>orders of magnitude</em>. These are approximate, order-of-magnitude figures (often called "latency numbers every programmer should know"); exact values depend on hardware, but the ratios are what matter:</p>
+<div class="table-wrap"><table>
+  <tr><th>Operation</th><th>Approx. latency</th><th>Relative to a RAM read</th><th>Where you meet it</th></tr>
+  <tr><td>CPU L1 cache reference</td><td>~1 ns</td><td>0.01×</td><td>Hot loops inside a process</td></tr>
+  <tr><td>Main memory (RAM) reference</td><td>~100 ns</td><td>1×</td><td>In-process cache (a hash map in the service)</td></tr>
+  <tr><td>Read 1 MB sequentially from RAM</td><td>~10–250 µs</td><td>100–2,500×</td><td>Copying a cached value</td></tr>
+  <tr><td>Random 4 KB read from NVMe SSD</td><td>~20–150 µs</td><td>200–1,500×</td><td>DB page not in the buffer pool</td></tr>
+  <tr><td>Round trip inside one data center</td><td>~0.2–0.5 ms</td><td>2,000–5,000×</td><td>Any call to Redis/Memcached or another service</td></tr>
+  <tr><td>Read 1 MB sequentially from SSD</td><td>~0.5–1 ms</td><td>~5,000–10,000×</td><td>Scanning data on disk</td></tr>
+  <tr><td>Typical indexed DB query (end to end)</td><td>~1–10 ms</td><td>10,000–100,000×</td><td>PostgreSQL / Cassandra read</td></tr>
+  <tr><td>Spinning-disk seek</td><td>~5–10 ms</td><td>~100,000×</td><td>Cold archival storage, old HDD databases</td></tr>
+  <tr><td>Round trip across a continent / ocean</td><td>~70–150 ms</td><td>~1,000,000×</td><td>Cross-region calls, user → far data center</td></tr>
+</table></div>
+<p>So the hierarchy is: <strong>in-process RAM ≫ network RAM (distributed cache) ≫ SSD-backed database ≫ disk ≫ cross-region network</strong>. Every caching decision is about moving a frequently read piece of data one or more rungs up this ladder.</p>
+
+<h3>1.2 Why it works: locality and skew</h3>
+<p>Caching only pays off if the same data is read repeatedly. Two properties make that true for Instagram:</p>
+<ul>
+  <li><strong>Temporal locality</strong> — something read recently is likely to be read again soon (a new post is read heavily in its first hours).</li>
+  <li><strong>Skewed popularity</strong> — access follows a power law (often modelled with a Zipf distribution): a small fraction of keys gets most of the traffic. A cache holding the hottest ~10–20% of data commonly serves 80–95%+ of reads.</li>
+</ul>
+<p>The quantity you care about is the <strong>hit ratio</strong> <code>h = hits / (hits + misses)</code>. The average latency of a cached read path is:</p>
+<pre><code>avg_latency = t_cache + (1 − h) × t_db
+
+Example: t_cache = 0.5 ms, t_db = 10 ms
+  h = 0.80 →  0.5 + 0.20 × 10 = 2.5 ms     DB sees 20% of reads
+  h = 0.95 →  0.5 + 0.05 × 10 = 1.0 ms     DB sees 5%  (4× less than at 80%)
+  h = 0.99 →  0.5 + 0.01 × 10 = 0.6 ms     DB sees 1%  (5× less than at 95%)</code></pre>
+<p>Notice that the last few percentage points of hit ratio cut database load dramatically. That is why large companies obsess over hit ratio — and also why a sudden drop in hit ratio (a cache node dying, a bad deploy changing key names) can take the database down.</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  You are writing an essay. The books you are using right now are open <strong>on your desk</strong> (CPU cache / in-process cache). A few dozen more are on the <strong>bookshelf behind you</strong> (distributed cache — a short walk). The rest are in the <strong>university library</strong> across campus (the database), and rarely used volumes are in an <strong>off-site warehouse</strong> (archival storage). You keep the books you use most within arm's reach, and when the desk is full you put back the one you haven't touched for the longest time (LRU eviction). The risk: if a new edition of a book is published, your desk copy is now out of date (stale cache) — someone has to tell you to fetch the new one (invalidation).
+</div>
+
+<h2>2. Where caches live: the cache layers</h2>
+<p>"Add a cache" is not one decision — a single feed request passes through up to six caches. Each layer is closer to the user (faster, but harder to keep consistent and smaller) or closer to the data (slower, but easier to invalidate).</p>
+
+<div class="diagram">
+<svg viewBox="0 0 880 250" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-cache-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g font-weight="600">
+    <rect x="10" y="40" width="125" height="58" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="72" y="64" text-anchor="middle">📱 Client cache</text><text x="72" y="84" text-anchor="middle" font-weight="400" font-size="11.5">0 ms (on device)</text>
+    <rect x="157" y="40" width="125" height="58" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="219" y="64" text-anchor="middle">CDN edge</text><text x="219" y="84" text-anchor="middle" font-weight="400" font-size="11.5">~10–30 ms</text>
+    <rect x="304" y="40" width="125" height="58" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="366" y="64" text-anchor="middle">API Gateway</text><text x="366" y="84" text-anchor="middle" font-weight="400" font-size="11.5">~1 ms</text>
+    <rect x="451" y="40" width="125" height="58" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="513" y="64" text-anchor="middle">Service (L1)</text><text x="513" y="84" text-anchor="middle" font-weight="400" font-size="11.5">~100 ns</text>
+    <rect x="598" y="40" width="125" height="58" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="660" y="64" text-anchor="middle">Redis/Memcached</text><text x="660" y="84" text-anchor="middle" font-weight="400" font-size="11.5">~0.2–1 ms</text>
+    <rect x="745" y="40" width="125" height="58" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="807" y="64" text-anchor="middle">DB buffer pool</text><text x="807" y="84" text-anchor="middle" font-weight="400" font-size="11.5">~1–10 ms query</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" marker-end="url(#ar-cache-1)" fill="none">
+    <path d="M135,69 L155,69"/><path d="M282,69 L302,69"/><path d="M429,69 L449,69"/><path d="M576,69 L596,69"/><path d="M723,69 L743,69"/>
+  </g>
+  <g font-size="11.5" fill="#333" text-anchor="middle">
+    <text x="72" y="122">images, feed JSON,</text><text x="72" y="138">drafts, profile</text>
+    <text x="219" y="122">photos, video</text><text x="219" y="138">segments</text>
+    <text x="366" y="122">auth tokens,</text><text x="366" y="138">public responses</text>
+    <text x="513" y="122">config, hot keys,</text><text x="513" y="138">celebrity profiles</text>
+    <text x="660" y="122">timelines, counters,</text><text x="660" y="138">objects, sessions</text>
+    <text x="807" y="122">hot pages of</text><text x="807" y="138">tables &amp; indexes</text>
+  </g>
+  <path d="M20,180 L860,180" stroke="#999" stroke-width="1.2" marker-end="url(#ar-cache-1)"/>
+  <text x="20" y="200" font-size="12" fill="#555">closer to the user: faster, cheaper per read, but harder to invalidate and less consistent</text>
+  <text x="860" y="222" font-size="12" fill="#555" text-anchor="end">closer to the data: easier to keep correct</text>
+</svg>
+<div class="caption">The cache hierarchy for one Instagram request. Each layer absorbs some reads so the next layer sees less traffic.</div>
+</div>
+
+<div class="table-wrap"><table>
+  <tr><th>Layer</th><th>What it caches (Instagram)</th><th>How it's kept fresh</th></tr>
+  <tr><td><b>Client cache</b> (app memory + disk)</td><td>Downloaded images, the last feed page (instant, offline-capable open), your own profile — see <a href="clients.html">Clients</a></td><td>TTL, HTTP <code>Cache-Control</code>/<code>ETag</code>, pull-to-refresh; you can't purge a phone</td></tr>
+  <tr><td><b>CDN</b></td><td>Immutable media renditions and video segments — see <a href="cdn.html">CDN</a></td><td>Versioned URLs, long TTL, purge API</td></tr>
+  <tr><td><b>API gateway / reverse proxy</b></td><td>Public, non-personalised responses; token-validation results — see <a href="api-gateway.html">API Gateway</a></td><td>Short TTL (seconds)</td></tr>
+  <tr><td><b>In-process (L1) cache</b></td><td>Feature flags, config, the hottest few thousand keys (celebrity profile)</td><td>Very short TTL (1–10 s); thousands of copies to invalidate</td></tr>
+  <tr><td><b>Distributed cache</b> (Redis / Memcached)</td><td>Timelines, post and user objects, counters, seen-state, sessions</td><td>Cache-aside with delete-on-write, TTLs, invalidation events</td></tr>
+  <tr><td><b>DB buffer pool / page cache</b></td><td>Hot data and index pages of PostgreSQL / Cassandra</td><td>Managed by the DB — always consistent; cold after restart</td></tr>
+</table></div>
+<p>The deeper (closer to the database) a cache sits, the more correct it is: the DB buffer pool is <em>always</em> consistent because the database itself manages it. The closer to the user, the more you trade freshness for speed. Most design discussions in interviews are about the <strong>distributed cache</strong> tier, so that is where we'll spend most of our time.</p>
+
+<h2>3. Caching patterns: how reads and writes flow</h2>
+<p>A caching <em>pattern</em> answers two questions: <strong>who loads data into the cache on a read</strong>, and <strong>what happens to the cache on a write</strong>. There are five classic patterns. Real systems mix them per data type.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 880 270" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-cache-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <text x="210" y="22" text-anchor="middle" font-weight="700">Cache-aside (lazy loading)</text>
+  <text x="660" y="22" text-anchor="middle" font-weight="700">Read-through / write-through</text>
+  <line x1="440" y1="10" x2="440" y2="260" stroke="#ccc" stroke-dasharray="4 4"/>
+  <g font-weight="600">
+    <rect x="20" y="110" width="120" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="80" y="131" text-anchor="middle">Application</text><text x="80" y="149" text-anchor="middle" font-weight="400" font-size="11.5">owns the logic</text>
+    <rect x="270" y="40" width="140" height="50" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="340" y="61" text-anchor="middle">Cache</text><text x="340" y="79" text-anchor="middle" font-weight="400" font-size="11.5">Redis / Memcached</text>
+    <rect x="270" y="185" width="140" height="50" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="340" y="206" text-anchor="middle">Database</text><text x="340" y="224" text-anchor="middle" font-weight="400" font-size="11.5">source of truth</text>
+    <rect x="455" y="110" width="110" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="510" y="131" text-anchor="middle">Application</text><text x="510" y="149" text-anchor="middle" font-weight="400" font-size="11.5">talks to cache only</text>
+    <rect x="660" y="110" width="200" height="50" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="760" y="131" text-anchor="middle">Cache + loader</text><text x="760" y="149" text-anchor="middle" font-weight="400" font-size="11.5">fetches/writes DB itself</text>
+    <rect x="690" y="205" width="140" height="45" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="760" y="232" text-anchor="middle">Database</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" fill="none">
+    <path d="M140,125 L268,70" marker-end="url(#ar-cache-2)" marker-start="url(#ar-cache-2)"/>
+    <path d="M140,145 L268,205" marker-end="url(#ar-cache-2)" marker-start="url(#ar-cache-2)"/>
+    <path d="M565,135 L658,135" marker-end="url(#ar-cache-2)" marker-start="url(#ar-cache-2)"/>
+    <path d="M760,160 L760,203" marker-end="url(#ar-cache-2)" marker-start="url(#ar-cache-2)"/>
+  </g>
+  <g font-size="11.5" fill="#333">
+    <text x="150" y="80">① GET key</text><text x="150" y="96">② miss → ⑤ SET key</text>
+    <text x="150" y="200">③ SELECT row</text><text x="150" y="216">④ row returned</text>
+    <text x="570" y="125">get / put</text>
+    <text x="752" y="187" text-anchor="end">on miss / on write</text>
+    <text x="210" y="255" text-anchor="middle">App does the miss handling and invalidation</text>
+    <text x="660" y="100" text-anchor="middle">Cache library hides the DB from the app</text>
+  </g>
+</svg>
+<div class="caption">Left: in cache-aside, the application explicitly reads the cache, falls back to the DB and populates the cache. Right: in read/write-through, the cache layer itself loads from and writes to the DB.</div>
+</div>
+
+<h3>3.1 Cache-aside (lazy loading) — the default</h3>
+<p>The application treats the cache as a side store. On a read it checks the cache; on a <strong>miss</strong> it reads the database and writes the result into the cache with a TTL. On a write it updates the database and then <strong>deletes</strong> the cache key so the next reader reloads fresh data.</p>
+<pre><code>def get_user(user_id):
+    key = f"user:{user_id}:v3"            # version suffix lets you change the format safely
+    cached = cache.get(key)
+    if cached is not None:
+        return decode(cached)              # HIT  (~0.3 ms)
+    row = db.query("SELECT * FROM users WHERE id = %s", user_id)   # MISS (~5 ms)
+    if row is None:
+        cache.set(key, NOT_FOUND, ttl=60)  # negative caching (section 7.3)
+        return None
+    cache.set(key, encode(row), ttl=3600 + random.randint(0, 600))  # jittered TTL (7.4)
+    return row
+
+def update_user(user_id, changes):
+    db.update("users", user_id, changes)   # 1. write the source of truth first
+    cache.delete(f"user:{user_id}:v3")     # 2. then invalidate - delete, don't overwrite</code></pre>
+<ul>
+  <li><strong>Pros:</strong> only data that is actually read gets cached (memory-efficient); a cache outage degrades to "slower" rather than "broken" because the app can still reach the DB; works with any database; simple to reason about.</li>
+  <li><strong>Cons:</strong> the first read of every key is a miss (three network hops); stale data is possible between the DB write and the delete; the app code carries the caching logic; subtle races (section 6).</li>
+</ul>
+<p>Facebook's Memcache deployment, described in the public <em>Scaling Memcache at Facebook</em> paper (NSDI 2013), is a giant cache-aside ("look-aside" in the paper's words) system, and it is the default answer in interviews.</p>
+
+<h3>3.2 Read-through</h3>
+<p>Same idea, but the miss handling lives <em>inside</em> the cache layer: the app calls <code>cache.get(key)</code> and the cache (or a client library wrapping it) calls a registered <em>loader</em> function to fetch from the DB on a miss. Examples: Guava/Caffeine <code>LoadingCache</code> in Java, NCache, DynamoDB Accelerator (DAX) in front of DynamoDB.</p>
+<ul>
+  <li><strong>Pros:</strong> app code is cleaner; the library can coalesce concurrent misses for the same key automatically. <strong>Cons:</strong> the cache must understand your data source; less per-call flexibility.</li>
+</ul>
+
+<h3>3.3 Write-through</h3>
+<p>Every write goes <strong>to the cache and the database synchronously</strong> (typically cache layer writes DB, then itself); the write returns only after both succeed.</p>
+<pre class="ascii">
+ App                 Cache                    DB
+  |--- PUT k=v ------->|                        |
+  |                    |---- write k=v -------->|
+  |                    |&lt;------- OK ------------|
+  |                    | store k=v              |
+  |&lt;------ OK ---------|                        |
+</pre>
+<p><strong>Pros:</strong> the cache is warm for recently written data and consistent with the DB when both writes succeed. <strong>Cons:</strong> two writes on every request; caches data that may never be read; a failure between the writes still needs handling.</p>
+
+<h3>3.4 Write-behind (write-back)</h3>
+<p>Writes go <strong>only to the cache</strong>, which acknowledges immediately and flushes to the database <strong>asynchronously</strong> later, often batched or coalesced.</p>
+<pre class="ascii">
+ App                 Cache                         DB
+  |--- INCR likes --->|                             |
+  |&lt;------ OK --------|  (dirty: likes += 1)        |
+  |--- INCR likes --->|                             |
+  |&lt;------ OK --------|  (dirty: likes += 2)        |
+  |        ... every 1 s or 1,000 updates ...       |
+  |                   |--- UPDATE likes = likes+2 -&gt;|   one DB write for many cache writes
+</pre>
+<p><strong>Pros:</strong> lowest write latency; absorbs bursts; coalesces many updates into one DB write. <strong>Cons:</strong> <strong>data-loss risk</strong> if the cache node dies before flushing (unless the cache is replicated/durable); the DB is temporarily behind.</p>
+<p>Many "counter" systems use a variant of this: increments land in Redis (or in a Kafka topic) and a background job periodically persists aggregated totals. See <a href="likes-comments.html">Likes, Comments &amp; Counters</a>.</p>
+
+<h3>3.5 Write-around</h3>
+<p>Writes go <strong>directly to the database</strong>, bypassing the cache (plus a delete of any old copy); the cache fills only on reads. It avoids polluting the cache with write-once, read-rarely data (old comments, analytics events), at the cost of a guaranteed miss on the first read after a write.</p>
+
+<h3>3.6 Comparison</h3>
+<div class="table-wrap"><table>
+  <tr><th>Pattern</th><th>Read path</th><th>Write path</th><th>Consistency</th><th>Write latency</th><th>Best for (Instagram example)</th></tr>
+  <tr><td><b>Cache-aside</b></td><td>App reads cache → DB on miss → app fills</td><td>App writes DB, deletes key</td><td>Eventual; small stale window</td><td>DB only</td><td>User profiles, post metadata — general purpose</td></tr>
+  <tr><td><b>Read-through</b></td><td>Cache loads from DB on miss</td><td>(paired with any write strategy)</td><td>Same as cache-aside</td><td>—</td><td>Libraries/local caches with loaders; config</td></tr>
+  <tr><td><b>Write-through</b></td><td>Cache (usually hit)</td><td>Cache and DB synchronously</td><td>Strong-ish (if both writes succeed)</td><td>Higher (2 writes)</td><td>Data read right after it's written: your own new post in your profile grid</td></tr>
+  <tr><td><b>Write-behind</b></td><td>Cache</td><td>Cache now, DB later in batches</td><td>Weak; risk of loss</td><td>Lowest</td><td>View counts, "last active" timestamps, high-rate counters</td></tr>
+  <tr><td><b>Write-around</b></td><td>Cache-aside</td><td>DB only (+ delete key)</td><td>Eventual</td><td>DB only</td><td>Write-heavy, rarely re-read data: old comments, logs</td></tr>
+</table></div>
+<div class="callout tip"><span class="callout-title">💡 A note on "push" caches</span>
+Instagram's feed timelines are a special case: fan-out workers <em>push</em> new post IDs into followers' timeline lists in Redis as soon as a post is created (see <a href="news-feed.html">News Feed</a>). That's effectively write-through into a <strong>derived</strong> data structure: the cache isn't a copy of one DB row but a precomputed answer to "what should user X see?". If it's lost, it can be rebuilt from the posts store and the social graph.</div>
+
+<h2>4. Eviction: what to throw away when the cache is full</h2>
+<p>RAM is finite and expensive, so a cache is almost always smaller than the dataset. When it's full and a new item arrives, an <strong>eviction policy</strong> picks a victim. Don't confuse eviction with invalidation: <em>eviction</em> removes data because of <strong>space</strong> (the data is still correct); <em>invalidation</em> removes data because it's <strong>wrong</strong> (the source of truth changed).</p>
+
+<h3>4.1 LRU — Least Recently Used</h3>
+<p>Evict the item that hasn't been accessed for the longest time. It's the default almost everywhere because recency is a good predictor of future use (temporal locality). The classic O(1) implementation combines two data structures:</p>
+<ul>
+  <li>a <strong>hash map</strong> from key → node, for O(1) lookup, and</li>
+  <li>a <strong>doubly linked list</strong> ordered by recency: the head is the most recently used item, the tail is the least recently used. "Doubly" linked so a node can unlink itself in O(1) given only a pointer to it.</li>
+</ul>
+<p>On <code>get</code>: find the node via the map, unlink it and move it to the head. On <code>put</code> of a new key when full: remove the node at the tail (and its map entry), then insert the new node at the head. Every operation is a constant number of pointer updates.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 880 240" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-cache-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <rect x="20" y="30" width="170" height="180" rx="8" fill="#e8f5e9" stroke="#2e7d32"/>
+  <text x="105" y="52" text-anchor="middle" font-weight="700">Hash map</text>
+  <g font-size="12">
+    <rect x="35" y="65" width="140" height="30" fill="#fff" stroke="#2e7d32"/><text x="45" y="85">"post:7" → node</text>
+    <rect x="35" y="105" width="140" height="30" fill="#fff" stroke="#2e7d32"/><text x="45" y="125">"user:3" → node</text>
+    <rect x="35" y="145" width="140" height="30" fill="#fff" stroke="#2e7d32"/><text x="45" y="165">"feed:9" → node</text>
+  </g>
+  <g font-weight="600">
+    <rect x="240" y="95" width="100" height="44" rx="6" fill="#eceff1" stroke="#455a64"/><text x="290" y="122" text-anchor="middle">HEAD</text>
+    <rect x="380" y="95" width="100" height="44" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="430" y="122" text-anchor="middle">post:7</text>
+    <rect x="520" y="95" width="100" height="44" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="570" y="122" text-anchor="middle">user:3</text>
+    <rect x="660" y="95" width="100" height="44" rx="6" fill="#fff8e1" stroke="#f9a825"/><text x="710" y="122" text-anchor="middle">feed:9</text>
+    <rect x="790" y="95" width="80" height="44" rx="6" fill="#eceff1" stroke="#455a64"/><text x="830" y="122" text-anchor="middle">TAIL</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-cache-3)" marker-start="url(#ar-cache-3)">
+    <path d="M342,117 L378,117"/><path d="M482,117 L518,117"/><path d="M622,117 L658,117"/><path d="M762,117 L788,117"/>
+  </g>
+  <g stroke="#2e7d32" stroke-width="1.2" fill="none" stroke-dasharray="4 3" marker-end="url(#ar-cache-3)">
+    <path d="M175,80 C260,40 380,50 420,93"/>
+    <path d="M175,120 C300,200 520,190 560,141"/>
+    <path d="M175,160 C320,230 680,225 705,141"/>
+  </g>
+  <text x="430" y="78" text-anchor="middle" font-size="11.5" fill="#333">most recently used</text>
+  <text x="790" y="78" text-anchor="middle" font-size="11.5" fill="#c62828">evict from here (LRU)</text>
+  <text x="530" y="30" text-anchor="middle" font-size="12" fill="#555">GET user:3 → unlink node, move it right after HEAD</text>
+</svg>
+<div class="caption">O(1) LRU: the hash map finds a node instantly; the doubly linked list keeps recency order. Hits move a node to the front; eviction pops the tail.</div>
+</div>
+
+<pre><code>class Node:
+    __slots__ = ("key", "val", "prev", "next")
+    def __init__(self, key=None, val=None):
+        self.key, self.val, self.prev, self.next = key, val, None, None
+
+class LRUCache:
+    def __init__(self, capacity):
+        self.cap = capacity
+        self.map = {}                         # key -&gt; Node
+        self.head, self.tail = Node(), Node()  # sentinels: head = MRU side, tail = LRU side
+        self.head.next, self.tail.prev = self.tail, self.head
+
+    def _unlink(self, n):
+        n.prev.next, n.next.prev = n.next, n.prev
+
+    def _push_front(self, n):
+        n.prev, n.next = self.head, self.head.next
+        self.head.next.prev = n
+        self.head.next = n
+
+    def get(self, key):
+        n = self.map.get(key)
+        if n is None:
+            return None                       # miss
+        self._unlink(n); self._push_front(n)  # now the most recently used
+        return n.val
+
+    def put(self, key, val):
+        n = self.map.get(key)
+        if n is not None:
+            n.val = val
+            self._unlink(n); self._push_front(n)
+            return
+        if len(self.map) &gt;= self.cap:
+            lru = self.tail.prev              # least recently used
+            self._unlink(lru)
+            del self.map[lru.key]
+        n = Node(key, val)
+        self.map[key] = n
+        self._push_front(n)</code></pre>
+<p>(In Python you can get the same behaviour from <code>collections.OrderedDict</code> with <code>move_to_end()</code> and <code>popitem(last=False)</code>, or <code>functools.lru_cache</code> for function results.)</p>
+<p><strong>How real caches do it:</strong> a full linked list costs two pointers (16 bytes) per item and a lock on every read. <strong>Redis</strong> therefore uses <em>approximated LRU</em>: each key stores a 24-bit "last access" clock; when memory is needed, Redis samples a few random keys (<code>maxmemory-samples</code>, default 5) and evicts the oldest among them, keeping a small pool of good candidates between rounds. With 10 samples it is very close to true LRU. <strong>Memcached</strong> uses a per-slab-class LRU that is segmented into hot/warm/cold sub-queues so a single scan of many keys doesn't flush the truly hot ones.</p>
+
+<h3>4.2 LFU — Least Frequently Used</h3>
+<p>Evict the item with the fewest accesses. Better than LRU when popularity is stable and a one-off scan (e.g. a batch job reading every profile once) would otherwise push hot items out. Naïve LFU has two problems: counters grow forever (an item popular last week stays forever) and new items start at 0 and get evicted immediately. Redis's LFU (<code>allkeys-lfu</code>) solves both with an 8-bit <strong>logarithmic (Morris) counter</strong> that increments probabilistically — so 255 can represent millions of hits — and <strong>decays</strong> over time (<code>lfu-decay-time</code>); new keys start at a small non-zero value. Modern designs such as <strong>W-TinyLFU</strong> (used by Java's Caffeine) combine a small LRU "window" with a frequency sketch and achieve near-optimal hit ratios.</p>
+
+<h3>4.3 FIFO, random and TTL-based</h3>
+<ul>
+  <li><strong>FIFO</strong> — evict the oldest <em>inserted</em> item regardless of use. Cheap (a queue) but evicts hot items just because they're old. Interestingly, research systems such as S3-FIFO show that FIFO queues with a small probationary queue can match LRU with less locking.</li>
+  <li><strong>Random</strong> — evict a random key. Surprisingly decent under heavy skew, zero bookkeeping.</li>
+  <li><strong>TTL (time to live)</strong> — every key carries an expiry time; once it passes, the key is treated as absent. TTL is primarily a <em>freshness</em> tool (it bounds staleness) but it also frees memory. Redis expires keys <em>lazily</em> (checked on access) plus an <em>active</em> background sampler that deletes expired keys; <code>volatile-ttl</code> evicts keys closest to expiry first.</li>
+</ul>
+
+<div class="table-wrap"><table>
+  <tr><th>Policy</th><th>Evicts</th><th>Strength</th><th>Weakness</th><th>Redis setting</th></tr>
+  <tr><td>LRU</td><td>Least recently accessed</td><td>Great default, adapts quickly</td><td>Scan pollution; pointer/lock overhead</td><td><code>allkeys-lru</code>, <code>volatile-lru</code></td></tr>
+  <tr><td>LFU</td><td>Least frequently accessed</td><td>Keeps stable hot set; scan-resistant</td><td>Slow to adapt without decay</td><td><code>allkeys-lfu</code>, <code>volatile-lfu</code></td></tr>
+  <tr><td>FIFO</td><td>Oldest inserted</td><td>Very cheap, lock-friendly</td><td>Ignores popularity</td><td>— (Memcached/other caches)</td></tr>
+  <tr><td>Random</td><td>Any key</td><td>Zero overhead</td><td>May evict a hot key</td><td><code>allkeys-random</code></td></tr>
+  <tr><td>TTL</td><td>Keys nearest expiry</td><td>Bounds staleness</td><td>Choosing the TTL is a guess</td><td><code>volatile-ttl</code> (+ per-key <code>EXPIRE</code>)</td></tr>
+  <tr><td>No eviction</td><td>Nothing — writes fail when full</td><td>Never silently loses data</td><td>Errors under memory pressure</td><td><code>noeviction</code> (use when Redis is a primary store)</td></tr>
+</table></div>
+<p>The <code>volatile-*</code> variants only evict keys that have a TTL, which lets you mix "must keep" keys (no TTL) and "cache" keys in one Redis — though it's cleaner to use separate clusters.</p>
+
+<h2>5. Invalidation: keeping the cache truthful</h2>
+<p>When the source of truth changes, cached copies become <strong>stale</strong>. Invalidation strategies, from simplest to most precise:</p>
+<div class="table-wrap"><table>
+  <tr><th>Strategy</th><th>How it works</th><th>Staleness bound</th><th>Cost / risk</th></tr>
+  <tr><td><b>TTL expiry only</b></td><td>Set a TTL; accept staleness until it expires</td><td>≤ TTL</td><td>Simplest; short TTL → low hit ratio, long TTL → stale data. Fine for counts, recommendations.</td></tr>
+  <tr><td><b>Delete on write</b> (explicit invalidation)</td><td>Writer deletes affected keys after committing to the DB</td><td>~milliseconds</td><td>Writer must know every key derived from the row; a crashed writer leaves stale data → keep a TTL as a safety net.</td></tr>
+  <tr><td><b>Update on write</b></td><td>Writer overwrites the cached value</td><td>~milliseconds</td><td>Concurrent writers can leave the <em>older</em> value in the cache (section 6.2). Prefer delete.</td></tr>
+  <tr><td><b>Event / CDC-driven</b></td><td>A daemon tails the DB's commit log (or a Kafka topic of change events) and deletes keys</td><td>Replication lag (ms–s)</td><td>Decoupled and reliable (never misses a committed write); one more pipeline to run. See <a href="message-queues.html">Message Queues</a>.</td></tr>
+  <tr><td><b>Versioned keys</b></td><td>Include a version in the key (<code>user:42:v17</code>); bumping the version makes old entries unreachable, and they age out by LRU/TTL</td><td>Instant (once readers see the new version)</td><td>Readers need the current version number (itself cached); wastes memory until old keys evict.</td></tr>
+  <tr><td><b>Write-through</b></td><td>The cache is updated as part of the write path</td><td>None (if both succeed)</td><td>Higher write latency; partial failures.</td></tr>
+</table></div>
+<p>A good default for a system like Instagram: <strong>cache-aside + delete-on-write + CDC-driven deletes as a backstop + a TTL on every key</strong> so that any bug eventually heals itself. Facebook's paper describes exactly this backstop: daemons called <em>mcsqueal</em> tail the MySQL commit log and broadcast deletes for every committed change, so even if a web server crashes after writing the DB, the cache still gets invalidated.</p>
+<div class="callout warn"><span class="callout-title">⚠️ Know your derived keys</span>
+One row often feeds many cache keys. Changing a username affects <code>user:42</code>, the rendered header of every comment by user 42 if you cached rendered comments, search typeahead entries, and so on. The safest designs cache <strong>normalised objects</strong> (one key per entity) and assemble responses at read time, so a change invalidates one key, not thousands.</div>
+
+<h2>6. Consistency races (and why "delete, don't update")</h2>
+<p>Cache and database are two separate systems with no shared transaction, so concurrent operations can interleave in nasty ways. Two classic races:</p>
+
+<h3>6.1 Race 1: the stale set after delete</h3>
+<p>A reader misses, reads the DB, but is slow to write the value into the cache. Meanwhile a writer updates the DB and deletes the key. Then the slow reader finally sets the <em>old</em> value — which now stays in the cache until its TTL expires.</p>
+<pre class="ascii">
+ Reader R                         Cache                Writer W                 DB
+   |-- GET user:42 --------------&gt;|                       |                      |
+   |&lt;------------- MISS ----------|                       |                      |
+   |-- SELECT user:42 -------------------------------------------------------&gt;  | name = "ana"
+   |&lt;------------------------------------------------------------ "ana" ------- |
+   |    (R pauses: GC, slow network...)                   |-- UPDATE name="ana_k" -&gt;|
+   |                              |&lt;--- DELETE user:42 ----|                      |
+   |-- SET user:42 = "ana" ------&gt;|   ✗ stale value written AFTER the delete     |
+   |                              |   cache says "ana", DB says "ana_k" until TTL|
+</pre>
+<p>This window is small but at billions of requests per day it happens constantly. Fixes:</p>
+<ul>
+  <li><strong>Leases</strong> (Facebook Memcache — below): the cache itself rejects the late <code>SET</code>.</li>
+  <li><strong>Compare-and-set with versions</strong>: store a row version with the value and only overwrite if the new version is higher (Redis Lua script or Memcached <code>cas</code>).</li>
+  <li><strong>Delayed double delete</strong>: delete, then delete again ~1 s later to remove any stale set that slipped in. Crude but common.</li>
+  <li>A <strong>TTL</strong> on every key bounds the damage.</li>
+</ul>
+
+<h3>6.2 Race 2: concurrent updates applied out of order</h3>
+<p>If writers <em>update</em> the cache instead of deleting, two writers W1 (sets bio = A) and W2 (sets bio = B) can commit to the DB in order A then B but reach the cache in order B then A. The DB says B; the cache says A — forever (until TTL). A <strong>delete</strong> doesn't have this problem: deletes are <strong>idempotent</strong> and order-independent ("delete, delete" in any order leaves the same result), and the next reader repopulates from the DB, which is authoritative. That's why the Memcache paper's rule is: on writes, <em>delete</em> cached data rather than updating it. Updating can still make sense for derived structures that you modify with commutative operations (e.g. <code>INCR</code> on a counter, <code>ZADD</code> of a post ID to a timeline).</p>
+
+<h3>6.3 Leases (from <em>Scaling Memcache at Facebook</em>)</h3>
+<p>Facebook's lease mechanism fixes both stale sets and thundering herds with one small idea:</p>
+<ol class="steps">
+  <li>On a cache <strong>miss</strong>, memcached hands the client a <strong>lease token</strong> — a 64-bit number bound to that key.</li>
+  <li>The client reads the DB and calls <code>set(key, value, lease_token)</code>.</li>
+  <li>If a <strong>delete</strong> for that key arrived in the meantime, memcached has <em>invalidated the token</em>, so the late set is <strong>rejected</strong>. Race 1 is gone: a slow reader can no longer overwrite a newer invalidation.</li>
+  <li><strong>Herd control:</strong> memcached hands out at most one token per key every ~10 seconds (the paper's default). Other clients that miss during that window get a special "wait and retry" response instead of a token, so only <em>one</em> client goes to the database; the others retry a few milliseconds later and find the value already filled.</li>
+  <li><strong>Stale reads when acceptable:</strong> after a delete, the old value is kept briefly in a special state; clients that can tolerate slightly stale data may receive it instead of waiting.</li>
+</ol>
+<p>The paper reports that leases cut the peak database query rate for some hot keys from ~17,000/s to ~1,300/s.</p>
+
+<h2>7. Failure modes at scale (and their fixes)</h2>
+<p>Four classic problems show up whenever a cache protects a much weaker database. Interviewers love them because each has a crisp name and a crisp fix.</p>
+
+<h3>7.1 Cache stampede (thundering herd / dog-piling)</h3>
+<p>A very popular key expires (or is deleted). In the next few milliseconds, thousands of requests all miss and <strong>all</strong> query the database for the same row and all try to recompute the same value. The DB shard spikes, latency rises, more requests time out and retry — a feedback loop. Example: a celebrity with 600M followers edits their bio; the delete triggers a herd of profile reads.</p>
+<p>Fixes, often combined:</p>
+<ul>
+  <li><strong>Request coalescing (single-flight / promises).</strong> Within one process, only the first miss for a key does the fetch; concurrent callers wait on the same in-flight future/promise and share the result. Instagram Engineering has publicly written about using promise-based caching for exactly this ("thundering herds and promises"). Across servers, the lease mechanism above does the same at the cache server.</li>
+  <li><strong>Distributed lock / mutex on miss.</strong> The first miss acquires a short lock in Redis; others wait briefly or serve stale data:
+<pre><code>SET lock:user:42 &lt;random-token&gt; NX PX 3000   # only one caller gets "OK"
+# winner: read DB, SET user:42 ..., then release the lock only if the token still matches (Lua)
+# losers: sleep 20-50 ms and retry GET user:42 (or return the stale copy)</code></pre></li>
+  <li><strong>Serve stale while revalidating.</strong> Store the value with a <em>soft</em> expiry inside the payload and a longer <em>hard</em> TTL. After the soft expiry, one request refreshes in the background while everyone else keeps getting the slightly stale value.</li>
+  <li><strong>Probabilistic early expiration (XFetch).</strong> Each reader independently decides to refresh <em>before</em> expiry with a probability that rises as expiry approaches, so typically exactly one request refreshes early and the key never actually expires under load:
+<pre><code>def should_refresh(now, expiry, delta, beta=1.0):
+    # delta = how long a recompute takes (e.g. 0.05 s); beta &gt; 1 refreshes earlier
+    return now - delta * beta * math.log(random.random()) &gt;= expiry
+    # log(random()) is negative, so the subtraction adds a random "head start"</code></pre></li>
+</ul>
+
+<h3>7.2 Hot keys</h3>
+<p>Even without expiry, one key can receive more traffic than one cache node can serve. A Redis node handles ~100K–200K simple ops/s; a viral post's like counter or a celebrity profile can see far more, and with key-based sharding (<a href="consistent-hashing.html">consistent hashing</a>) <em>all</em> of it lands on a single node. Fixes:</p>
+<ul>
+  <li><strong>Replicate the hot key:</strong> store N copies under <code>post:99:counts#0</code> … <code>#7</code>, which hash to different nodes; readers pick a random copy, writers update/delete all copies. Or use read replicas of the shard. The Memcache paper also describes replicating a whole pool for keys with very high read rates.</li>
+  <li><strong>Local L1 cache:</strong> keep the hottest keys in each app server's memory for 1–5 seconds. With 5,000 app servers, each L1 turns millions of reads per second into ~1 request per server per TTL. Staleness is bounded by the tiny TTL.</li>
+  <li><strong>Detect hot keys automatically</strong> (sampling in the client, Redis <code>--hotkeys</code> with LFU, proxy statistics) and promote them to the L1 or replicated tier dynamically.</li>
+  <li><strong>Split writes:</strong> for hot <em>counters</em>, shard the counter itself (<code>likes:99:shard{0..15}</code>) and sum on read. See <a href="likes-comments.html">Likes &amp; Counters</a>.</li>
+</ul>
+
+<h3>7.3 Cache penetration (lookups for things that don't exist)</h3>
+<p>If a key doesn't exist in the DB, cache-aside never caches anything for it, so <strong>every</strong> request for it goes to the database. A bug, a scraper, or an attacker iterating over random usernames or post IDs can bypass the cache entirely. Fixes:</p>
+<ul>
+  <li><strong>Negative caching:</strong> cache "not found" as a sentinel value with a short TTL (30–300 s). Remember to delete it when the item is created (e.g. a username is registered).</li>
+  <li><strong>Bloom filter in front of the DB:</strong> a compact probabilistic set of all existing keys. It answers "definitely not present" or "maybe present". If "definitely not", reject without touching cache or DB.</li>
+  <li><strong>Input validation and rate limiting</strong> — malformed IDs should never reach storage. See <a href="rate-limiting.html">Rate Limiting</a>.</li>
+</ul>
+<p><strong>Bloom filter in one paragraph:</strong> a bit array of <em>m</em> bits and <em>k</em> hash functions. To add a key, set the <em>k</em> bits it hashes to. To query, check those <em>k</em> bits: if any is 0, the key was definitely never added; if all are 1, it was <em>probably</em> added (other keys may have set those bits — a false positive). The false-positive rate is ≈ <code>(1 − e^(−k·n/m))^k</code>. With 10 bits per key and k = 7, it's about <strong>0.8%</strong>. For 2 billion usernames that's 2×10⁹ × 10 bits = 20 Gbit ≈ <strong>2.5 GB</strong> of RAM — far smaller than the usernames themselves. Standard Bloom filters can't delete; counting Bloom filters or cuckoo filters can.</p>
+
+<h3>7.4 Cache avalanche</h3>
+<p>Many keys expire at the <strong>same moment</strong> — or a whole cache cluster restarts — and the database suddenly receives the full read load. Typical cause: a batch job warmed a million keys at 03:00 with <code>TTL = 3600</code>, so they all expire at 04:00. Fixes:</p>
+<ul>
+  <li><strong>Jittered TTLs:</strong> <code>ttl = base + random(0, 0.1 × base)</code> spreads expiries out.</li>
+  <li><strong>High availability for the cache:</strong> replicas and fast failover, so a node loss doesn't empty a large slice of the keyspace. Facebook's <em>gutter pool</em> (~1% of servers) temporarily serves keys of failed hosts with short TTLs.</li>
+  <li><strong>Protect the DB:</strong> request coalescing, circuit breakers and load shedding so the DB survives while the cache refills (see <a href="resilience-patterns.html">Resilience Patterns</a>).</li>
+  <li><strong>Gradual warm-up</strong> before sending full traffic to a new/empty cluster (section 10).</li>
+</ul>
+
+<h2>8. Redis vs Memcached</h2>
+<p>Both are in-memory key-value stores accessed over the network. Memcached is a deliberately simple, multi-threaded cache; Redis is a "data structure server" that can also act as a database.</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Memcached</th><th>Redis (and its open-source fork Valkey)</th></tr>
+  <tr><td><b>Data model</b></td><td>Opaque byte strings (default max item 1 MB)</td><td>Strings, lists, hashes, sets, sorted sets, bitmaps, HyperLogLog, streams, geo, JSON (module)</td></tr>
+  <tr><td><b>Threading</b></td><td>Multi-threaded — scales up on one big box</td><td>Commands run on a single main thread (atomic, no locks); I/O threads help networking since 6.0 → scale out with more shards</td></tr>
+  <tr><td><b>Memory management</b></td><td>Slab allocator by size class; very predictable, small per-item overhead</td><td>jemalloc + compact encodings (listpack/intset) for small collections</td></tr>
+  <tr><td><b>Eviction</b></td><td>Segmented LRU per slab class</td><td>Configurable: LRU/LFU/random/TTL approximations, or <code>noeviction</code></td></tr>
+  <tr><td><b>Persistence</b></td><td>None — pure cache</td><td>RDB snapshots and/or AOF append-only log</td></tr>
+  <tr><td><b>Replication / HA</b></td><td>None built in (clients or proxies like mcrouter replicate)</td><td>Async leader-follower replication, Sentinel failover, Redis Cluster</td></tr>
+  <tr><td><b>Sharding</b></td><td>Client-side, usually consistent hashing</td><td>Redis Cluster: 16,384 hash slots spread over nodes; or client/proxy sharding</td></tr>
+  <tr><td><b>Atomic server-side logic</b></td><td><code>incr/decr</code>, <code>cas</code></td><td>Rich atomic commands, MULTI/EXEC transactions, Lua scripts / functions</td></tr>
+  <tr><td><b>Extras</b></td><td>—</td><td>Pub/Sub, streams, keyspace notifications, TTL per key</td></tr>
+  <tr><td><b>Choose when</b></td><td>You need a huge, simple, multi-threaded look-aside cache for serialized objects</td><td>You need data structures (timelines, counters, sets, leaderboards), persistence or replication</td></tr>
+</table></div>
+<p>Facebook's public papers are built on Memcached; Instagram's early engineering posts describe using both Memcached (for Django object caching) and Redis (for data structures such as feeds and a famous memory-optimised mapping of media IDs to user IDs using Redis hashes). In a design interview, "Redis for the feed cache and counters" is the expected answer, matching our architecture diagram.</p>
+
+<h2>9. Redis data structures for Instagram</h2>
+<p>The real power of Redis is that the cache holds <strong>structures</strong>, so operations like "prepend a post to a timeline" or "add 1 to a counter" happen atomically on the server without read-modify-write races.</p>
+
+<h3>9.1 Timelines: lists or sorted sets</h3>
+<p>Fan-out workers push each new post ID into every follower's timeline. Keep only the newest few hundred IDs per user — older pages can be rebuilt from the database.</p>
+<pre><code># Option A: LIST - newest first, O(1) push, trim to bound memory
+LPUSH  timeline:1001  3049215820194820101     # fan-out worker adds a new post id
+LTRIM  timeline:1001  0 799                   # keep the newest 800 ids
+LRANGE timeline:1001  0 19                    # first page (20 ids)
+
+# Option B: SORTED SET - members are post ids, score = created_at in ms
+ZADD   timeline:1001  1729673400123 "3049215820194820101"
+ZREMRANGEBYRANK timeline:1001 0 -801          # drop everything but the newest 800
+ZREVRANGEBYSCORE timeline:1001 +inf -inf LIMIT 0 20          # first page
+ZREVRANGEBYSCORE timeline:1001 (1729673400123 -inf LIMIT 0 20 # next page: strictly older than cursor</code></pre>
+<p>Sorted sets cost more memory than lists but give idempotent inserts (re-adding the same ID is a no-op — handy when a fan-out job retries), ordered merge of late-arriving posts, and score-based cursors for pagination (see <a href="api-design.html">API Design</a>).</p>
+<div class="callout warn"><span class="callout-title">⚠️ Gotcha: sorted-set scores are doubles</span>
+Redis scores are 64-bit floating-point numbers, which represent integers exactly only up to 2<sup>53</sup>. Instagram-style 64-bit IDs (see <a href="id-generation.html">ID Generation</a>) are larger than that, so using the raw ID as the score silently loses precision and can mis-order or collide posts. Use the <strong>millisecond timestamp</strong> (41 bits — fits exactly) as the score and the full ID as the member string, or use a list.</div>
+
+<h3>9.2 Counters: INCR and hashes</h3>
+<pre><code>HINCRBY post:3049215820194820101:counts likes 1      # atomic, no read-modify-write race
+HINCRBY post:3049215820194820101:counts comments 1
+HGETALL post:3049215820194820101:counts              # -&gt; likes 18342, comments 211
+INCR    ratelimit:user:1001:likes:202610231450       # per-minute counter for rate limiting
+EXPIRE  ratelimit:user:1001:likes:202610231450 120</code></pre>
+<p>A <strong>hash</strong> groups related small fields under one key, which is far more memory-efficient than many tiny top-level keys (small hashes use a compact listpack encoding). Counters in Redis are usually <em>write-behind</em>: periodically persisted to Cassandra, and rebuildable from the like records if lost.</p>
+
+<h3>9.3 Seen-state and membership: sets, bitmaps, HyperLogLog</h3>
+<pre><code># Which stories has viewer 1001 already seen from author 55? (expires with the stories)
+SADD      seen:1001:55  "story:777" "story:778"
+SISMEMBER seen:1001:55  "story:779"           # -&gt; 0, so show the ring as unseen
+EXPIRE    seen:1001:55  86400                 # 24 h, matching story lifetime
+
+# Has viewer already been shown this post in feed? (dedupe across sessions)
+SADD feed_seen:1001 "3049215820194820101"
+
+# Approximate unique viewers of a Reel: 12 KB per key, ~0.81% standard error
+PFADD  reel:9001:viewers "user:1001"
+PFCOUNT reel:9001:viewers</code></pre>
+<p>Sets give O(1) membership checks; <strong>bitmaps</strong> (<code>SETBIT</code>) are even denser when IDs are small integers; <strong>HyperLogLog</strong> counts distinct items approximately in fixed tiny memory. See <a href="stories.html">Stories</a> for the full seen-state design.</p>
+
+<h3>9.4 Other everyday uses</h3>
+<p>Sessions (<a href="authentication.html">Authentication</a>), rate-limit counters (<a href="rate-limiting.html">Rate Limiting</a>), presence keys with short TTLs for <a href="direct-messaging.html">Direct Messaging</a>, and trending hashtags with <code>ZINCRBY</code>. Fan-out workers <strong>pipeline</strong> thousands of <code>ZADD</code>s per round trip; in Redis Cluster, <em>hash tags</em> (<code>timeline:{1001}</code>, <code>seen:{1001}:55</code>) keep one user's keys in the same slot for multi-key operations.</p>
+
+<h2>10. Operating a cache fleet: sizing, multi-region and warm-up</h2>
+
+<h3>10.1 Cache sizing math</h3>
+<p>You size a cache by <strong>working set</strong> (memory) and by <strong>throughput</strong> (ops/s), then take the larger. All inputs below are assumptions for practice, not official figures (see <a href="capacity-estimation.html">Back-of-the-Envelope Estimation</a>).</p>
+<pre><code>Feed timeline cache (Redis)
+  Assume 500M daily active users, keep newest 800 post ids per timeline
+  Memory per entry ≈ 40 B (id + score + encoding overhead; sorted sets cost more than lists)
+  Per user:   800 × 40 B           ≈ 32 KB
+  All users:  500M × 32 KB         ≈ 16 TB
+  × 2 for a replica (HA)           ≈ 32 TB
+  Usable RAM per node ≈ 64 GB (128 GB box; leave headroom for fork/copy-on-write, fragmentation)
+  Nodes ≈ 32 TB / 64 GB            ≈ 500 nodes
+  Lever: trim to 300 ids → ~12 TB with replicas → ~190 nodes
+
+Throughput check
+  Feed opens: 500M × 10/day = 5B/day ≈ 58K reads/s average, ~175K/s at 3× peak
+  Fan-out writes: assume 100M posts/day × 200 followers avg = 20B ZADDs/day ≈ 230K/s, ~700K/s peak
+  Spread over 250 primary shards → ~3.5K ops/s per shard — tiny vs ~100K ops/s capacity
+  ⇒ this cache is MEMORY-bound, not CPU-bound.
+
+Object cache (post &amp; user objects)
+  Posts from the last 7 days: 100M/day × 7 × 1 KB ≈ 700 GB
+  Active user objects:        500M × 0.5 KB       ≈ 250 GB
+  ⇒ ~1 TB of hot objects → a few dozen nodes, typically ≥ 95% hit ratio.</code></pre>
+<p>Rules of thumb: keep Redis memory below ~60–75% of the box (snapshots fork the process, and copy-on-write can double memory for hot pages); measure real per-key overhead with <code>MEMORY USAGE key</code>; and remember the 80/20 rule — you rarely need to cache everything, only the working set.</p>
+
+<h3>10.2 Cross-region invalidation</h3>
+<p>Instagram runs in several regions (see <a href="multi-region.html">Multi-Region</a>). Each region has its own cache cluster. A write in one region must invalidate caches in <em>all</em> regions — and the ordering matters. Facebook's Memcache paper describes the canonical design:</p>
+<div class="diagram">
+<svg viewBox="0 0 880 260" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-cache-4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <rect x="10" y="10" width="420" height="240" rx="10" fill="none" stroke="#999" stroke-dasharray="6 4"/>
+  <rect x="450" y="10" width="420" height="240" rx="10" fill="none" stroke="#999" stroke-dasharray="6 4"/>
+  <text x="220" y="32" text-anchor="middle" font-weight="700">Region A (primary for this shard)</text>
+  <text x="660" y="32" text-anchor="middle" font-weight="700">Region B (replica)</text>
+  <g font-weight="600">
+    <rect x="30" y="55" width="160" height="46" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="110" y="83" text-anchor="middle">Writer service</text>
+    <rect x="250" y="55" width="160" height="46" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="330" y="83" text-anchor="middle">Primary DB</text>
+    <rect x="250" y="160" width="160" height="46" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="330" y="182" text-anchor="middle">Invalidation daemon</text><text x="330" y="198" text-anchor="middle" font-weight="400" font-size="11">tails commit log</text>
+    <rect x="30" y="160" width="160" height="46" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="110" y="188" text-anchor="middle">Cache cluster A</text>
+    <rect x="470" y="55" width="160" height="46" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="550" y="83" text-anchor="middle">Replica DB</text>
+    <rect x="470" y="160" width="160" height="46" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="550" y="182" text-anchor="middle">Invalidation daemon</text><text x="550" y="198" text-anchor="middle" font-weight="400" font-size="11">tails replica log</text>
+    <rect x="690" y="160" width="160" height="46" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="770" y="188" text-anchor="middle">Cache cluster B</text>
+    <rect x="690" y="55" width="160" height="46" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="770" y="83" text-anchor="middle">Readers in B</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-cache-4)">
+    <path d="M190,78 L248,78"/>
+    <path d="M330,101 L330,158"/>
+    <path d="M250,183 L192,183"/>
+    <path d="M410,70 L468,70" stroke-dasharray="5 3"/>
+    <path d="M550,101 L550,158"/>
+    <path d="M630,183 L688,183"/>
+    <path d="M770,101 L770,158"/>
+  </g>
+  <g font-size="11" fill="#333">
+    <text x="219" y="70" text-anchor="middle">write</text>
+    <text x="221" y="176" text-anchor="middle">DELETE</text>
+    <text x="439" y="62" text-anchor="middle">async repl.</text>
+    <text x="659" y="176" text-anchor="middle">DELETE</text>
+    <text x="778" y="134">read</text>
+    <text x="220" y="235" text-anchor="middle">invalidate only after the commit</text>
+    <text x="660" y="235" text-anchor="middle">invalidate only after the replica applied it</text>
+  </g>
+</svg>
+<div class="caption">Each region's cache is invalidated by a daemon tailing <em>that region's</em> database log, so a cache is never refilled from a replica that hasn't seen the write yet.</div>
+</div>
+<ul>
+  <li><strong>Invalidate from the local replication stream.</strong> If region A broadcast deletes directly to region B's cache, a reader in B might miss, read B's <em>replica</em> DB (which hasn't received the write yet due to replication lag) and put the <em>old</em> value back. By having region B's daemon read B's own replica log, the delete in B happens only after B's DB already has the new data.</li>
+  <li><strong>Remote markers</strong> for read-your-writes: when a user in region B updates something, the write goes to the primary in A. The web server sets a marker key in B's cache ("k was recently changed remotely"), then deletes k. A reader in B that misses and finds the marker reads from the primary region instead of the stale local replica, until replication catches up.</li>
+  <li><strong>Alternative:</strong> publish invalidation events to a multi-region Kafka topic (or use CDC tools like Debezium) and have per-region consumers delete keys — simpler, but you must still think about replica lag vs invalidation order.</li>
+</ul>
+
+<h3>10.3 Warm-up (avoiding the cold-cache cliff)</h3>
+<p>An empty cache has a 0% hit ratio; if a new cluster (or a restarted one) takes full traffic immediately, the database receives 20–100× its normal load. Strategies:</p>
+<ul>
+  <li><strong>Read from a warm peer:</strong> Facebook's "cold cluster warm-up" lets clients of a new cluster fetch misses from an existing <em>warm</em> cluster instead of the database, turning days of warm-up into hours. To prevent a stale value from the warm cluster being added right after a delete, the cold cluster refuses adds for that key for a couple of seconds after a delete (a "hold-off").</li>
+  <li><strong>Pre-load the hot set</strong> from access logs or the previous cluster's key dump (top-N keys by frequency).</li>
+  <li><strong>Ramp traffic gradually</strong> (1% → 10% → 50% → 100%) while watching DB load and hit ratio, the same way you'd do a canary deploy.</li>
+  <li><strong>Persistence:</strong> Redis RDB/AOF lets a restarted node come back warm; replicas let a failover start warm.</li>
+  <li><strong>Consistent hashing</strong> when adding/removing nodes so only ~1/N of keys remap instead of nearly all (see <a href="consistent-hashing.html">Consistent Hashing</a>).</li>
+</ul>
+
+<h2>11. How Instagram uses caching</h2>
+<p>Follow a home-feed request through the caches in our architecture diagram:</p>
+<div class="flow">
+  <div class="fnode client">📱 App<small>local cache of last feed</small></div><div class="farrow">→<small>GET /feed</small></div>
+  <div class="fnode edge">API Gateway<small>auth, rate limit</small></div><div class="farrow">→</div>
+  <div class="fnode svc">News Feed Service<small>L1 for hot keys</small></div><div class="farrow">→<small>ZREVRANGE</small></div>
+  <div class="fnode store">Feed Cache (Redis)<small>timeline ids, counts</small></div><div class="farrow">→<small>on miss</small></div>
+  <div class="fnode store">Cassandra / PostgreSQL<small>source of truth</small></div>
+</div>
+<ol>
+  <li>The app renders its <strong>locally cached</strong> feed instantly, then asks for fresh data.</li>
+  <li>The <a href="news-feed.html">News Feed Service</a> reads the user's <strong>precomputed timeline</strong> of post IDs from Redis — written ahead of time by the <strong>Feed Fan-out Workers</strong> consuming "post created" events from Kafka — and merges in celebrities' cached recent-post lists (pull model).</li>
+  <li>It hydrates the IDs with a <strong>multi-get</strong> of post objects, author objects, counter hashes and "did I like this?" flags; misses fall back to Cassandra (posts) and sharded PostgreSQL (users), then fill the cache.</li>
+  <li>The response contains <strong>CDN URLs</strong>; media bytes are cached at the <a href="cdn.html">CDN</a>, never in Redis.</li>
+  <li>Writes (like, edit, follow) update the source of truth, then <strong>delete or atomically update</strong> related keys, with Kafka invalidation events as a backstop.</li>
+</ol>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+Instagram's early public engineering posts describe a Django stack with <strong>Memcached</strong> for object caching and <strong>Redis</strong> for data structures such as the main feed and activity feed — plus a well-known write-up about squeezing hundreds of millions of media-ID→user-ID mappings into Redis by bucketing them into small hashes to exploit Redis's compact encoding. Today Instagram runs on Meta's infrastructure, whose caching is described publicly in the <em>Scaling Memcache at Facebook</em> and <em>TAO</em> papers (TAO is a graph-aware, write-through cache in front of MySQL for the social graph — see <a href="social-graph.html">Social Graph</a>). For our design: assume a <strong>~95–99% hit ratio</strong> on hot objects, timelines capped at a few hundred IDs per user, TTLs on everything, and fan-out for celebrities replaced by pull + caching of their recent posts.</div>
+<p><strong>Per-data-type choices:</strong></p>
+<div class="table-wrap"><table>
+  <tr><th>Data</th><th>Cache structure</th><th>Pattern</th><th>Freshness</th></tr>
+  <tr><td>Home timeline</td><td>Redis list / sorted set of post IDs</td><td>Push (write-through into derived data) + rebuild on miss</td><td>Seconds; small delays acceptable</td></tr>
+  <tr><td>Post &amp; user objects</td><td>Serialized blobs (Memcached or Redis strings)</td><td>Cache-aside + delete-on-write + CDC backstop</td><td>Milliseconds after write</td></tr>
+  <tr><td>Like/comment counts</td><td>Redis hash with HINCRBY</td><td>Write-behind to Cassandra, rebuildable</td><td>Approximate is fine</td></tr>
+  <tr><td>"Did I like this?"</td><td>Set / bitmap per post or per user, or cached per (user, post)</td><td>Cache-aside, updated on like</td><td>Must reflect <em>your own</em> action immediately (read-your-writes)</td></tr>
+  <tr><td>Story seen-state</td><td>Redis sets with 24h TTL</td><td>Write-through on view</td><td>Seconds</td></tr>
+  <tr><td>Sessions / auth tokens</td><td>Redis strings with TTL</td><td>Write-through</td><td>Revocation must be fast</td></tr>
+  <tr><td>Photos / videos</td><td>CDN + device cache</td><td>Pull CDN, immutable URLs</td><td>Immutable</td></tr>
+</table></div>
+
+<h2>12. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Benefits</h4><ul>
+    <li>Order-of-magnitude lower read latency</li>
+    <li>Huge reduction in database load and cost</li>
+    <li>Absorbs read spikes and protects hot DB shards</li>
+    <li>Rich structures (Redis) make features like timelines and counters simple and fast</li>
+    <li>Can keep serving (stale) data during DB incidents</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs</h4><ul>
+    <li>Staleness and consistency races</li>
+    <li>Another distributed system to run, monitor and size</li>
+    <li>RAM is expensive per GB</li>
+    <li>Hidden dependency: the DB is now sized for the <em>hit</em> rate, so a cache failure can cascade into a DB outage</li>
+    <li>Invalidation logic spread across code paths</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Updating instead of deleting</strong> on writes → out-of-order overwrites leave old data.</li>
+  <li><strong>No TTL</strong> on keys → any missed invalidation is stale forever.</li>
+  <li><strong>Same TTL for millions of keys</strong> → avalanche. Add jitter.</li>
+  <li><strong>Caching before the DB commit</strong> (or deleting before commit) → readers repopulate with uncommitted/rolled-back or old data. Invalidate <em>after</em> commit.</li>
+  <li><strong>Huge values or unbounded collections</strong> block Redis's single thread and blow up memory — cache IDs and small objects, always trim lists, and use <code>SCAN</code> instead of <code>KEYS *</code>. Media belongs in <a href="object-storage.html">object storage</a> + CDN.</li>
+  <li><strong>Treating the cache as the source of truth</strong> by accident — then eviction or a node loss is data loss.</li>
+  <li><strong>Ignoring cold start</strong> → a deploy that changes key formats drops hit ratio to zero; version keys and roll out gradually.</li>
+</ul>
+
+<h2>13. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>What it is</th><th>Use it when</th></tr>
+  <tr><td>Redis / Valkey</td><td>In-memory data-structure server with replication, persistence, Cluster</td><td>Timelines, counters, leaderboards, sessions, rate limits, queues — the default distributed cache</td></tr>
+  <tr><td>Memcached</td><td>Multi-threaded, simple LRU key-value cache</td><td>Massive look-aside caches of serialized objects; maximum simplicity and multi-core efficiency</td></tr>
+  <tr><td>mcrouter (Meta), twemproxy, Envoy Redis proxy</td><td>Proxies that route, shard, replicate and fail over cache traffic</td><td>Hundreds of cache nodes, many clients; consistent hashing and replication without client changes</td></tr>
+  <tr><td>Amazon ElastiCache / MemoryDB, Azure Cache for Redis, GCP Memorystore</td><td>Managed Redis/Memcached (MemoryDB adds durable multi-AZ log)</td><td>Don't want to run the fleet yourself</td></tr>
+  <tr><td>Caffeine (Java), Guava cache, <code>functools.lru_cache</code>, Ristretto (Go)</td><td>In-process (L1) caches</td><td>Hot keys, config, per-server memoization with sub-µs latency</td></tr>
+  <tr><td>Varnish, NGINX proxy cache</td><td>HTTP reverse-proxy caches</td><td>Caching whole HTTP responses at the gateway</td></tr>
+  <tr><td>CDNs (CloudFront, Akamai, Fastly, Cloudflare)</td><td>Edge HTTP caches</td><td>Static and media content close to users — see <a href="cdn.html">CDN</a></td></tr>
+</table></div>
+
+<h2>14. Interview corner</h2>
+<details class="qa"><summary>Walk me through how you'd cache user profiles for Instagram.</summary>
+<p>Cache-aside in a distributed cache keyed <code>user:{id}:v{schema}</code>, storing a compact serialized object (~500 B) with a jittered TTL of about an hour. Reads: GET → on miss read the sharded PostgreSQL replica, then SET. Writes (profile edit): commit to the primary, then DELETE the key; a CDC daemon tailing the DB log also deletes as a backstop. Use leases or versioned compare-and-set to prevent the stale-set race. For celebrity profiles, an in-process L1 with a 2–5 s TTL absorbs hot-key traffic. For the editor's own view, read-your-writes: either bypass the cache right after editing or update the client optimistically. Expected hit ratio 95%+, so the DB sees a few percent of profile reads.</p></details>
+<details class="qa"><summary>Why delete the cache entry on write instead of updating it?</summary>
+<p>Because writes to the DB and to the cache are not atomic together. Two concurrent updaters can commit to the DB in one order and reach the cache in the opposite order, leaving the older value cached indefinitely. Deletes are idempotent and order-independent; the next read repopulates from the authoritative DB. Delete also avoids computing values that may never be read. The remaining race (a slow reader setting an old value after the delete) is handled by leases/CAS and TTLs.</p></details>
+<details class="qa"><summary>A celebrity posts; millions open the post within a minute. What happens to your caches and how do you protect the DB?</summary>
+<p>The post object and its counters become hot keys. (1) Request coalescing/leases ensure only one DB fetch per key per cache node when it's first missed. (2) Replicate the hot keys across several cache nodes (key suffixes) or serve them from an in-process L1 with a few-second TTL. (3) Counters are incremented atomically in Redis with HINCRBY (sharded counter if a single key can't keep up) and persisted write-behind. (4) Media is served by the CDN with request collapsing at the edge. (5) Feed fan-out for this author uses pull-on-read, so followers' feed services fetch the celebrity's cached recent-posts list rather than 600M timeline writes.</p></details>
+<details class="qa"><summary>What's a cache stampede and how do you prevent it?</summary>
+<p>Many concurrent requests miss the same key (usually right after expiry or invalidation) and all hit the DB to recompute it. Prevent it with single-flight request coalescing inside each server, a distributed lock or lease so only one client recomputes, stale-while-revalidate (serve the old value while one request refreshes), probabilistic early expiration (XFetch) so a single request refreshes slightly before the TTL, and jittered TTLs so related keys don't expire together.</p></details>
+<details class="qa"><summary>Redis or Memcached for Instagram's feed cache? Justify.</summary>
+<p>Redis. The feed cache needs data structures with atomic server-side operations: lists/sorted sets for timelines (push, trim, range-by-score pagination), hashes with HINCRBY for counters, sets with TTL for seen-state, plus replication for HA and optional persistence for fast warm restart. Memcached only stores opaque blobs, so every timeline update would be a read-modify-write of a big blob with races. Memcached remains a great choice for a large look-aside cache of serialized post/user objects where its multi-threading and memory efficiency shine.</p></details>
+<details class="qa"><summary>How do you keep caches in multiple regions consistent?</summary>
+<p>Accept eventual consistency but order invalidations correctly: each region's caches are invalidated by a daemon tailing that region's own DB replication log (or a regional consumer of change events), so the delete happens only after the local replica has the new value — otherwise a miss could repopulate from a lagging replica. For read-your-writes after a user's own update in a non-primary region, set a remote marker so subsequent misses read from the primary region until replication catches up. Keep TTLs as a final safety net.</p></details>
+
+<h2>15. Check your understanding</h2>
+<details class="quiz"><summary>Your cache hit ratio drops from 98% to 94%. By what factor does database read load change?</summary>
+<p>DB load goes from 2% to 6% of reads — it <strong>triples</strong>. Small hit-ratio changes have outsized effects on the backend; that's why hit ratio is a key alert.</p></details>
+<details class="quiz"><summary>Why does an O(1) LRU need a <em>doubly</em> linked list and a hash map?</summary>
+<p>The hash map gives O(1) lookup of a key's node. Moving that node to the front requires unlinking it from the middle, which needs its predecessor — available in O(1) only with a <code>prev</code> pointer (doubly linked). The tail gives the eviction victim in O(1).</p></details>
+<details class="quiz"><summary>A scraper requests random non-existent usernames at 50K requests/s, and your DB CPU spikes even though the cache hit ratio for real users is 99%. What's happening and what do you do?</summary>
+<p><strong>Cache penetration</strong>: misses for keys that don't exist are never cached, so every request reaches the DB. Fix with negative caching (store "not found" for ~60 s), a Bloom filter of existing usernames in front of the DB, input validation and rate limiting the client.</p></details>
+<details class="quiz"><summary>You warm 10M keys at midnight with TTL = 24 h. What problem will you see and how do you fix it?</summary>
+<p>A <strong>cache avalanche</strong> at midnight the next day when all 10M expire together. Add random jitter to TTLs (e.g. 24 h ± 2 h), and protect the DB with coalescing and load shedding.</p></details>
+<details class="quiz"><summary>Why is it dangerous to use a 64-bit post ID as a Redis sorted-set score?</summary>
+<p>Scores are IEEE-754 doubles with a 53-bit mantissa; integers above 2<sup>53</sup> can't be represented exactly, so distinct IDs may get the same score and ordering becomes wrong. Use a timestamp (fits in 53 bits) as the score and the ID as the member, or use a list.</p></details>
+<details class="quiz"><summary>With 10 bits per key and 7 hash functions, a Bloom filter's false-positive rate is about 0.8%. How much memory does it need for 1 billion post IDs, and what happens on a false positive?</summary>
+<p>10 bits × 10⁹ = 10¹⁰ bits ≈ <strong>1.25 GB</strong>. On a false positive the filter says "maybe present", so the request proceeds to the cache/DB and finds nothing — a wasted lookup, never a wrong answer. Bloom filters never give false negatives.</p></details>
+<details class="quiz"><summary>Which write pattern would you choose for (a) Reel view counts, (b) a user's password hash, (c) old comments rarely re-read?</summary>
+<p>(a) <strong>Write-behind</strong> — very high write rate, approximate counts are fine, batching saves DB writes. (b) Write to the DB (source of truth) and <strong>delete</strong> any cached copy — correctness matters more than speed; arguably don't cache it at all. (c) <strong>Write-around</strong> — don't pollute the cache with data unlikely to be read.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Caching exploits the huge latency gap between RAM and disk/network plus skewed popularity; <strong>hit ratio</strong> is the number that matters.</li>
+    <li>Default to <strong>cache-aside</strong> with <strong>delete-after-commit</strong>, a <strong>TTL on every key</strong>, and CDC-driven invalidation as a backstop.</li>
+    <li>LRU (hash map + doubly linked list) is the default eviction policy; LFU resists scans; Redis approximates both by sampling.</li>
+    <li>Guard against <strong>stampedes</strong> (coalescing, leases, early refresh), <strong>hot keys</strong> (replicas, L1), <strong>penetration</strong> (negative caching, Bloom filters) and <strong>avalanches</strong> (jitter, HA, warm-up).</li>
+    <li>Use <strong>Redis data structures</strong> for Instagram's timelines, counters and seen-state; size the cluster by working-set memory first, then check ops/s.</li>
+    <li>Across regions, invalidate from the <strong>local replication stream</strong> and warm new clusters gradually.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="news-feed.html">News Feed: Fan-out &amp; Ranking</a> — the main consumer of the Redis timeline cache</li>
+  <li><a href="cdn.html">CDN</a> — the same caching ideas applied at the network edge for media</li>
+  <li><a href="consistent-hashing.html">Consistent Hashing</a> — how keys are spread over cache nodes with minimal remapping</li>
+  <li><a href="likes-comments.html">Likes, Comments &amp; Counters</a> — hot keys and write-behind counters in depth</li>
+  <li><a href="stories.html">Stories &amp; Ephemeral Data</a> — TTLs and seen-state sets</li>
+  <li><a href="replication.html">Replication</a> — replica lag, which drives cache consistency problems</li>
+  <li><a href="cap-consistency.html">CAP &amp; Consistency Models</a> — why caches are eventually consistent and what read-your-writes means</li>
+  <li><a href="message-queues.html">Message Queues &amp; Kafka</a> — event-driven invalidation and fan-out workers</li>
+  <li><a href="capacity-estimation.html">Back-of-the-Envelope Estimation</a> — practise cache sizing math</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

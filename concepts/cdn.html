@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Content Delivery Network (CDN) — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="cdn">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>A <strong>CDN</strong> is a worldwide network of cache servers (<em>edge servers</em>, grouped into <em>PoPs</em>) that store copies of your static content close to users.</li>
+    <li>Instead of every photo request travelling to Instagram's data center, it's served from a server maybe <strong>20&nbsp;km</strong> away instead of <strong>8,000&nbsp;km</strong> — cutting latency from hundreds of ms to tens of ms.</li>
+    <li>It also <strong>offloads 90–99%</strong> of media traffic from the origin (object storage), which saves enormous bandwidth cost and protects the backend.</li>
+    <li>Key ideas: <strong>pull vs push</strong>, <strong>cache keys</strong>, <strong>TTL</strong>, <strong>cache hit ratio</strong>, <strong>invalidation via versioned URLs</strong>, <strong>origin shield</strong>, and <strong>signed URLs</strong> for private content.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why do we need a CDN?</h2>
+<p>Instagram is a <strong>media-first, read-heavy</strong> product. Every time someone scrolls their feed, the app downloads dozens of images and video segments. Suppose all of that media lived only in one data center in Virginia, USA:</p>
+<ul>
+  <li><strong>Latency is physics.</strong> Light in fibre travels ~200,000 km/s. A round trip Mumbai ⇄ Virginia (~13,000 km each way) takes <em>at least</em> ~130 ms — and a single HTTPS image fetch needs several round trips (TCP handshake, TLS handshake, request). Realistically a user in India would wait 400–800 ms per image. Scrolling would feel broken.</li>
+  <li><strong>Bandwidth is enormous.</strong> With ~2 billion monthly users each viewing hundreds of images a day, media egress is measured in <em>terabits per second</em>. No single data center uplink can handle that, and transit bandwidth across oceans is expensive.</li>
+  <li><strong>The origin would melt.</strong> Object storage (S3-like) is built for durability, not for serving the same viral photo 50 million times in an hour.</li>
+</ul>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  Think of a popular bakery with one central kitchen. If every customer in the country had to travel to the central kitchen, queues would be endless. Instead the bakery opens <strong>small shops in every neighbourhood</strong> that stock the most popular items. If a shop runs out of something rare, it orders it from the central kitchen once and then keeps it on the shelf. The neighbourhood shops are the CDN edge servers; the central kitchen is the origin.
+</div>
+
+<h2>2. How a CDN works</h2>
+
+<h3>2.1 The building blocks</h3>
+<div class="cards">
+  <div class="card"><h4>🌍 PoP (Point of Presence)</h4><p>A CDN location in a city (e.g. Mumbai, Frankfurt, São Paulo), containing many edge servers. Large CDNs have 200–3,000+ PoPs, often inside ISP networks.</p></div>
+  <div class="card"><h4>🖥️ Edge server</h4><p>A cache server with lots of RAM and SSD that terminates the user's TLS connection and serves cached files.</p></div>
+  <div class="card"><h4>🛡️ Origin shield / mid-tier</h4><p>A regional cache layer between edges and origin. Many edges miss → only one shield request reaches the origin.</p></div>
+  <div class="card"><h4>🏛️ Origin</h4><p>The source of truth — for Instagram, the object storage cluster holding every photo/video rendition.</p></div>
+</div>
+
+<div class="diagram">
+<svg viewBox="0 0 820 330" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <!-- users -->
+  <g font-weight="600">
+    <rect x="20" y="30" width="120" height="40" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="80" y="55" text-anchor="middle">📱 User, Mumbai</text>
+    <rect x="20" y="145" width="120" height="40" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="80" y="170" text-anchor="middle">📱 User, Berlin</text>
+    <rect x="20" y="260" width="120" height="40" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="80" y="285" text-anchor="middle">📱 User, Paris</text>
+  </g>
+  <!-- edges -->
+  <g font-weight="600">
+    <rect x="220" y="25" width="150" height="50" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="295" y="46" text-anchor="middle">Edge PoP</text><text x="295" y="63" text-anchor="middle" font-weight="400" font-size="11.5">Mumbai</text>
+    <rect x="220" y="140" width="150" height="50" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="295" y="161" text-anchor="middle">Edge PoP</text><text x="295" y="178" text-anchor="middle" font-weight="400" font-size="11.5">Frankfurt</text>
+    <rect x="220" y="255" width="150" height="50" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="295" y="276" text-anchor="middle">Edge PoP</text><text x="295" y="293" text-anchor="middle" font-weight="400" font-size="11.5">Paris</text>
+  </g>
+  <!-- shields -->
+  <g font-weight="600">
+    <rect x="450" y="55" width="140" height="50" rx="8" fill="#fff3e0" stroke="#ef6c00" stroke-dasharray="5 3"/><text x="520" y="76" text-anchor="middle">Origin shield</text><text x="520" y="93" text-anchor="middle" font-weight="400" font-size="11.5">Asia</text>
+    <rect x="450" y="200" width="140" height="50" rx="8" fill="#fff3e0" stroke="#ef6c00" stroke-dasharray="5 3"/><text x="520" y="221" text-anchor="middle">Origin shield</text><text x="520" y="238" text-anchor="middle" font-weight="400" font-size="11.5">Europe</text>
+  </g>
+  <path d="M640,110 a50,10 0 0,0 150,0 a50,10 0 0,0 -150,0 v100 a50,10 0 0,0 150,0 v-100" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="715" y="160" text-anchor="middle" font-weight="600">Origin</text><text x="715" y="177" text-anchor="middle" font-size="11.5">Object storage (S3)</text>
+  <g stroke="#555" stroke-width="1.5" marker-end="url(#ar)" fill="none">
+    <path d="M140,50 L218,50"/><path d="M140,165 L218,165"/><path d="M140,280 L218,280"/>
+    <path d="M370,50 L448,75"/><path d="M370,165 L448,220"/><path d="M370,280 L448,235"/>
+    <path d="M590,80 L640,130" stroke-dasharray="5 3"/><path d="M590,225 L640,190" stroke-dasharray="5 3"/>
+  </g>
+  <text x="180" y="42" text-anchor="middle" font-size="11" fill="#555">~5 ms</text>
+  <text x="410" y="45" text-anchor="middle" font-size="11" fill="#555">on miss</text>
+  <text x="640" y="100" text-anchor="end" font-size="11" fill="#555">rare miss</text>
+</svg>
+<div class="caption">Users hit the nearest edge. Edge misses go to a regional shield; only shield misses reach the origin.</div>
+</div>
+
+<h3>2.2 How does the user reach the <em>nearest</em> edge?</h3>
+<p>Two main techniques route the user to a nearby PoP:</p>
+<ol>
+  <li><strong>DNS-based routing (GeoDNS).</strong> When the app resolves <code>scontent.cdninstagram.com</code>, the CDN's authoritative <a href="dns.html">DNS</a> server looks at where the request came from and returns the IP of a nearby, healthy PoP. Different users get different IPs for the same name.</li>
+  <li><strong>Anycast.</strong> Many PoPs announce the <em>same</em> IP address via BGP. Internet routers naturally deliver packets to the topologically closest one. Cloudflare relies heavily on this; it also absorbs DDoS traffic by spreading it across all PoPs.</li>
+</ol>
+
+<h3>2.3 Cache hit vs cache miss</h3>
+<ol class="steps">
+  <li>The app requests <code>https://cdn.example.com/p/9f3a…/1080.jpg</code>. The edge computes the <strong>cache key</strong> (usually host + path, plus selected query params/headers).</li>
+  <li><strong>Cache HIT:</strong> the edge has the file and it's still fresh (within its TTL) → it returns it immediately. ⚡ ~10–30 ms total.</li>
+  <li><strong>Cache MISS:</strong> the edge asks the origin shield; if the shield also misses, the shield fetches from the origin (object storage).</li>
+  <li>The response flows back, and <strong>each layer stores a copy</strong> according to the <code>Cache-Control</code> header, so the next user nearby gets a hit.</li>
+</ol>
+
+<pre class="ascii">
+ User            Edge (Mumbai)           Shield (Asia)            Origin (S3)
+  |  GET img.jpg      |                        |                        |
+  |-----------------> |  lookup cache key      |                        |
+  |                   |--- MISS -------------> |                        |
+  |                   |                        |--- MISS ------------> |
+  |                   |                        | <------ 200 + bytes -- |
+  |                   | <------ 200 + bytes -- |  (store copy)          |
+  | <-- 200 + bytes - |  (store copy)          |                        |
+  |                                                                     |
+  |  GET img.jpg  (another user in Mumbai, 2 s later)                   |
+  |-----------------> |  HIT ✔ → served from RAM/SSD in ~10 ms          |
+</pre>
+
+<p>The single most important CDN metric is the <strong>cache hit ratio (CHR)</strong>:</p>
+<pre><code>cache hit ratio = cache hits / (cache hits + cache misses)</code></pre>
+<p>Going from 90% to 99% CHR sounds small, but it means origin traffic drops from 10% to 1% of requests — a <strong>10× reduction</strong> in origin load.</p>
+
+<h2>3. Pull CDN vs Push CDN</h2>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Pull CDN (origin pull)</th><th>Push CDN</th></tr>
+  <tr><td><b>How content gets there</b></td><td>Edge fetches from origin lazily on the first miss.</td><td>You upload content to the CDN ahead of time.</td></tr>
+  <tr><td><b>Setup effort</b></td><td>Minimal — just point the CDN at your origin.</td><td>You manage uploads, updates and deletions.</td></tr>
+  <tr><td><b>First request</b></td><td>Slower (miss goes to origin).</td><td>Fast — already present.</td></tr>
+  <tr><td><b>Storage use</b></td><td>Only popular content is cached; unpopular content gets evicted.</td><td>Everything you push occupies CDN storage.</td></tr>
+  <tr><td><b>Best for</b></td><td>Huge, long-tail catalogs with unpredictable popularity (user-generated content).</td><td>Small, predictable catalogs, large launches (game patches, a new movie release).</td></tr>
+</table></div>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+Instagram uses <strong>pull</strong> — there are hundreds of billions of photos and most are rarely viewed, so pre-pushing everything everywhere would be absurdly wasteful. The diagram's <em>"origin pull"</em> arrow from Object Storage to the CDN is exactly this. For predictable spikes (e.g. a celebrity with 600M followers posts), some systems <strong>pre-warm</strong> the cache by requesting the new object from key PoPs right after upload.</div>
+
+<h2>4. Controlling what gets cached (and for how long)</h2>
+
+<h3>4.1 Cache-Control headers & TTL</h3>
+<p>The origin tells caches how to behave through HTTP headers:</p>
+<pre><code>Cache-Control: public, max-age=31536000, immutable   # cache for 1 year, never revalidate
+Cache-Control: private, max-age=0, no-store           # never cache (e.g. personalised API responses)
+Cache-Control: public, max-age=60, s-maxage=300       # browser: 60 s, shared caches (CDN): 300 s
+ETag: "9f3a1c"                                        # version fingerprint for revalidation</code></pre>
+<ul>
+  <li><strong>TTL (time to live)</strong> — how long a cached copy is considered fresh.</li>
+  <li><strong>Revalidation</strong> — after the TTL expires, the cache can ask the origin <code>If-None-Match: "9f3a1c"</code>; the origin replies <code>304 Not Modified</code> (no body) if unchanged — cheap.</li>
+  <li><code>stale-while-revalidate</code> lets the edge serve a slightly stale copy while it refreshes in the background, hiding origin latency.</li>
+</ul>
+
+<h3>4.2 Cache keys</h3>
+<p>The cache key decides whether two requests are "the same file". If you accidentally include a random query param (e.g. a tracking id) in the key, every request becomes a miss and your hit ratio collapses. Good practice: <strong>normalise</strong> the key — include only what changes the response (path, size, format), and strip everything else.</p>
+
+<h3>4.3 Invalidation: the hard part</h3>
+<p>"There are only two hard things in computer science: cache invalidation and naming things." What if a user edits or deletes a photo that's cached in 300 PoPs?</p>
+<div class="table-wrap"><table>
+  <tr><th>Strategy</th><th>How</th><th>Trade-off</th></tr>
+  <tr><td><b>Versioned / content-addressed URLs</b> ⭐</td><td>Put a hash or version in the URL: <code>/p/9f3a1c/1080.jpg</code>. A changed file gets a <em>new URL</em>; the old one is simply never requested again.</td><td>Best practice. Allows <code>max-age=1 year, immutable</code>. Requires the API to hand out the new URL.</td></tr>
+  <tr><td><b>Purge API</b></td><td>Call the CDN API: "purge this URL / this tag" across all PoPs.</td><td>Takes seconds to minutes to propagate; rate-limited; costly at scale.</td></tr>
+  <tr><td><b>Short TTL</b></td><td>Cache for only a few minutes.</td><td>Stale for at most TTL, but hit ratio and origin load suffer.</td></tr>
+</table></div>
+<div class="callout warn"><span class="callout-title">⚠️ Deletion & privacy</span>
+When a user deletes a photo or makes their account private, the content must stop being reachable. Because URLs are versioned and <strong>signed with an expiry</strong> (see below), deleting the metadata means the app never hands out the URL again, and any leaked URL expires on its own. A purge is issued as a belt-and-braces step.</div>
+
+<h2>5. Securing content on a CDN</h2>
+<ul>
+  <li><strong>Signed URLs / tokens:</strong> the API server generates a URL containing an expiry time and an HMAC signature, e.g. <code>…/1080.jpg?exp=1730000000&amp;sig=ab12…</code>. The edge verifies the signature without contacting the origin. Leaked links stop working after expiry. Instagram media URLs carry exactly this kind of signature (<code>oe=</code>, <code>oh=</code> params).</li>
+  <li><strong>TLS at the edge:</strong> the edge terminates HTTPS close to the user (faster handshakes) and re-encrypts to the origin.</li>
+  <li><strong>DDoS absorption & WAF:</strong> CDNs have enormous aggregate capacity and filter malicious traffic before it reaches you. See <a href="security.html">Security</a>.</li>
+  <li><strong>Origin protection:</strong> only CDN IPs (or authenticated requests) may reach the origin bucket.</li>
+</ul>
+
+<h2>6. CDNs for video: adaptive streaming</h2>
+<p>Reels and Stories videos aren't served as one giant file. The <a href="media-processing.html">media pipeline</a> cuts each video into small 2–6 second <strong>segments</strong> at several bitrates (240p…1080p), plus a <strong>manifest</strong> (HLS <code>.m3u8</code> / DASH <code>.mpd</code>). The player downloads segments one by one from the CDN and switches quality based on bandwidth. Segments are just small static files — perfect for CDN caching — and the first few segments of popular videos are almost always hot in the edge cache, giving near-instant playback.</p>
+<p>Two HTTP features make this efficient:</p>
+<ul>
+  <li><strong>Range requests</strong> (<code>Range: bytes=0-1048575</code>) let a player fetch just part of a file, which the CDN can serve from a partially cached object. The edge often fetches large files from the origin in fixed-size <em>chunks</em> (e.g. 1–2 MB), so a user seeking to minute 3 doesn't force the whole file to be downloaded first.</li>
+  <li><strong>Byte hit ratio vs request hit ratio.</strong> Video segments are big, thumbnails are tiny. A CDN can have a 95% <em>request</em> hit ratio but only a 80% <em>byte</em> hit ratio if big videos miss more often. Bandwidth cost follows the byte hit ratio, so watch both.</li>
+</ul>
+
+<h2>7. Inside an edge server</h2>
+<p>An edge server is essentially a very fast HTTP reverse proxy with a huge cache. Understanding its internals explains most CDN behaviour.</p>
+
+<h3>7.1 The cache hierarchy inside one PoP</h3>
+<div class="diagram">
+<svg viewBox="0 0 760 250" width="760" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-cdn-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <rect x="20" y="95" width="120" height="50" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="80" y="125" text-anchor="middle" font-weight="600">Request</text>
+  <rect x="190" y="20" width="160" height="60" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="270" y="45" text-anchor="middle" font-weight="600">RAM cache</text><text x="270" y="63" text-anchor="middle" font-size="11.5">hottest objects · ~µs</text>
+  <rect x="190" y="95" width="160" height="60" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="270" y="120" text-anchor="middle" font-weight="600">SSD cache</text><text x="270" y="138" text-anchor="middle" font-size="11.5">warm objects · ~0.1 ms</text>
+  <rect x="190" y="170" width="160" height="60" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="270" y="195" text-anchor="middle" font-weight="600">Peer edge (same PoP)</text><text x="270" y="213" text-anchor="middle" font-size="11.5">consistent-hash owner</text>
+  <rect x="420" y="95" width="140" height="60" rx="8" fill="#fff3e0" stroke="#ef6c00" stroke-dasharray="5 3"/><text x="490" y="120" text-anchor="middle" font-weight="600">Origin shield</text><text x="490" y="138" text-anchor="middle" font-size="11.5">regional tier</text>
+  <rect x="610" y="95" width="130" height="60" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="675" y="120" text-anchor="middle" font-weight="600">Origin</text><text x="675" y="138" text-anchor="middle" font-size="11.5">object storage</text>
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#ar-cdn-2)">
+    <path d="M140,115 L188,55"/><path d="M140,120 L188,125"/><path d="M140,128 L188,195"/>
+    <path d="M350,125 L418,125"/><path d="M560,125 L608,125"/>
+  </g>
+  <text x="385" y="115" text-anchor="middle" font-size="11" fill="#555">all miss</text>
+</svg>
+<div class="caption">A lookup checks RAM, then SSD, then the peer that "owns" the key, and only then leaves the PoP.</div>
+</div>
+<ul>
+  <li><strong>Key ownership within a PoP.</strong> A PoP may have hundreds of servers. If each cached every object independently, the PoP would store 100 copies of the same photo and the effective cache size would shrink 100×. Instead, servers use <a href="consistent-hashing.html">consistent hashing</a> on the cache key so each object has one "owner" server. Very hot objects are deliberately replicated to many servers to spread load.</li>
+  <li><strong>Eviction.</strong> When the disk is full, something must go. Plain LRU (least recently used) is easily polluted by "one-hit wonders" — objects requested once and never again, which are extremely common for user-generated content. CDNs therefore use smarter policies: <em>segmented LRU</em>, <em>LFU</em>-style admission, or "only cache on the second request" (admission filters, often implemented with a Bloom filter — see <a href="caching.html">Caching</a>). Meta has published research showing that smarter admission and eviction noticeably raise the hit ratio of its photo caches.</li>
+  <li><strong>Request collapsing (coalescing).</strong> If 1,000 requests for the same uncached object arrive within 50 ms, the edge sends <em>one</em> request upstream and makes the other 999 wait for that response. This is the main defence against the thundering herd described in <a href="caching.html">Caching</a>.</li>
+</ul>
+
+<h3>7.2 Serving stale content when things break</h3>
+<p>Two headers let edges keep serving when the origin is slow or down:</p>
+<pre><code>Cache-Control: max-age=600, stale-while-revalidate=60, stale-if-error=86400</code></pre>
+<ul>
+  <li><code>stale-while-revalidate=60</code>: for 60 s after expiry, serve the stale copy immediately and refresh it in the background.</li>
+  <li><code>stale-if-error=86400</code>: if the origin returns 5xx or times out, keep serving the stale copy for up to a day.</li>
+</ul>
+<p>This makes the CDN a <strong>resilience layer</strong> as well as a performance layer — a pattern covered in <a href="resilience-patterns.html">Resilience Patterns</a> as <em>graceful degradation</em>.</p>
+
+<h2>8. Beyond static files: dynamic acceleration & edge compute</h2>
+<p>CDNs started as static-file caches but now do much more:</p>
+<div class="table-wrap"><table>
+  <tr><th>Capability</th><th>What it does</th><th>Instagram-style use</th></tr>
+  <tr><td><b>Dynamic site acceleration</b></td><td>Personalised API calls still pass through the edge. The edge terminates TCP+TLS close to the user and forwards over a pre-warmed, long-lived connection to the origin data center.</td><td>A user in Chennai pays the expensive handshakes to a nearby PoP (~10 ms RTT) instead of a faraway data center (~200 ms RTT); see <a href="networking-basics.html">Networking Basics</a>.</td></tr>
+  <tr><td><b>Edge compute</b></td><td>Run small functions at the edge (Cloudflare Workers, Lambda@Edge, Fastly Compute).</td><td>Validate signed URLs, pick the image format from the <code>Accept</code> header, A/B test, block bots.</td></tr>
+  <tr><td><b>On-the-fly image transforms</b></td><td>The edge resizes or re-encodes images per request and caches each variant.</td><td>An alternative to pre-generating every rendition in the <a href="media-processing.html">media pipeline</a>, useful for rare sizes.</td></tr>
+  <tr><td><b>WAF & bot management</b></td><td>Filter malicious requests before they reach your servers.</td><td>Block credential-stuffing on the login API; see <a href="security.html">Security</a>.</td></tr>
+</table></div>
+
+<h2>9. Operating a CDN: metrics, cost and multi-CDN</h2>
+<h3>9.1 What to monitor</h3>
+<div class="table-wrap"><table>
+  <tr><th>Metric</th><th>Why it matters</th><th>Healthy target (typical)</th></tr>
+  <tr><td>Request hit ratio</td><td>Share of requests served without leaving the edge</td><td>&gt; 90–95% for media</td></tr>
+  <tr><td>Byte hit ratio / origin offload</td><td>Share of <em>bytes</em> not fetched from origin — drives cost</td><td>&gt; 90%</td></tr>
+  <tr><td>Time to first byte (TTFB), p50/p95/p99</td><td>User-perceived latency, per region and per ISP</td><td>p95 &lt; 100 ms on hits</td></tr>
+  <tr><td>Origin request rate & error rate</td><td>Early warning of misses storms or origin trouble</td><td>Stable; alerts on spikes</td></tr>
+  <tr><td>4xx/5xx at the edge</td><td>Expired signatures, bad links, origin failures</td><td>Low and flat</td></tr>
+</table></div>
+<p>These feed the dashboards and SLOs described in <a href="observability.html">Observability</a>. Real-user monitoring from the app (how long images actually took to appear) is the ultimate truth.</p>
+
+<h3>9.2 The cost model</h3>
+<p>Commercial CDNs mostly charge per GB delivered (cheaper at higher volume and in North America/Europe, pricier in some regions), plus per-request fees and extras such as edge compute. Two levers dominate the bill: <strong>bytes delivered</strong> (shrink them with better formats like WebP/AVIF and the right rendition per screen) and <strong>origin egress</strong> (cut it with a higher byte hit ratio and an origin shield). A 30% smaller image format saves 30% of the CDN bill <em>and</em> makes the app faster — one of the rare wins on every axis.</p>
+
+<h3>9.3 Multi-CDN</h3>
+<p>Large companies that don't run their own CDN often use two or more providers at once:</p>
+<ul>
+  <li><strong>Availability:</strong> if one CDN has a global outage (it happens, e.g. the June 2021 Fastly incident that briefly took down many large websites), DNS steers traffic to the other.</li>
+  <li><strong>Performance:</strong> real-user measurements decide, per country or ISP, which CDN is fastest.</li>
+  <li><strong>Cost leverage:</strong> traffic can be shifted toward the cheaper provider.</li>
+</ul>
+<p>The price is complexity: consistent configuration, signed-URL schemes and purges across providers, and a lower hit ratio per CDN since traffic is split.</p>
+
+<h2>10. How Instagram uses the CDN</h2>
+<div class="flow">
+  <div class="fnode client">📱 App<small>gets feed JSON</small></div><div class="farrow">→<small>image URLs</small></div>
+  <div class="fnode edge">CDN edge<small>nearest PoP</small></div><div class="farrow">→<small>on miss</small></div>
+  <div class="fnode edge">Origin shield</div><div class="farrow">→<small>on miss</small></div>
+  <div class="fnode store">Object storage<small>all renditions</small></div>
+</div>
+<ol>
+  <li>The <a href="news-feed.html">Feed service</a> returns JSON containing post metadata and <strong>signed CDN URLs</strong> — never the bytes themselves. The API path and the media path are separate.</li>
+  <li>The app picks the right rendition for the device (e.g. 640px for a small phone, 1080px for a large one, WebP/AVIF if supported) — these renditions were generated by the <a href="media-processing.html">media processing workers</a>.</li>
+  <li>The app fetches media directly from the CDN. Popular content is served from edge RAM/SSD; long-tail content triggers an origin pull from <a href="object-storage.html">object storage</a>.</li>
+  <li>The app <strong>prefetches</strong> the next few posts' images while you scroll, so they're already on the device when you get there (see <a href="clients.html">Clients</a>).</li>
+</ol>
+<div class="callout instagram"><span class="callout-title">📸 Real-world note</span>
+Meta runs its own global edge network (PoPs plus caches embedded inside ISPs, called <em>FNA — Facebook Network Appliances</em>). Instagram media hostnames such as <code>scontent-*.cdninstagram.com</code> resolve to those edge caches. At this scale, building your own CDN becomes cheaper than renting one; for almost every other company, a commercial CDN is the right answer.</div>
+
+<h3>Rough numbers</h3>
+<p>Assume 500M daily active users view ~100 images/day at ~200 KB average:</p>
+<pre><code>500M × 100 × 200 KB = 10 PB/day of media egress
+10 PB / 86,400 s ≈ 116 GB/s ≈ 0.93 Tbps average (peak ~2–3×)
+With a 95% hit ratio → origin serves only ~5.8 GB/s; the CDN absorbs the rest.</code></pre>
+<p>See <a href="capacity-estimation.html">Back-of-the-Envelope Estimation</a> for how to do this math yourself.</p>
+
+<h2>11. Trade-offs & common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ Benefits</h4><ul>
+    <li>Much lower latency worldwide</li>
+    <li>Massive origin offload &amp; bandwidth savings</li>
+    <li>Absorbs traffic spikes and DDoS</li>
+    <li>Higher availability — edges can serve stale content if origin is down</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs</h4><ul>
+    <li>Staleness — cached content can be out of date</li>
+    <li>Invalidation complexity</li>
+    <li>Vendor cost (priced per GB) and lock-in</li>
+    <li>Harder debugging (which PoP served what?)</li>
+    <li>Not useful for personalised / private dynamic data</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Caching personalised responses</strong> (e.g. a user's feed JSON) under a shared key → users see each other's data. Always mark them <code>private</code> / <code>no-store</code>.</li>
+  <li><strong>Cache-busting by accident</strong> — random query params in cache keys destroy the hit ratio.</li>
+  <li><strong>Thundering herd on the origin</strong> — a viral new post misses in 300 PoPs simultaneously. Fix with an origin shield and <em>request collapsing</em> (the edge sends one origin request and makes the others wait for it).</li>
+  <li><strong>Overwriting files in place</strong> instead of using new versioned URLs.</li>
+</ul>
+
+<h2>12. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Provider</th><th>Notes</th></tr>
+  <tr><td>Akamai</td><td>The oldest and one of the largest; thousands of PoPs inside ISPs.</td></tr>
+  <tr><td>Cloudflare</td><td>Anycast-based, strong DDoS/WAF, edge compute (Workers).</td></tr>
+  <tr><td>Amazon CloudFront</td><td>Tight integration with S3 as origin, origin shield option, signed URLs/cookies.</td></tr>
+  <tr><td>Fastly</td><td>Very fast purges (~150 ms), programmable edge (VCL/Compute).</td></tr>
+  <tr><td>Google Cloud CDN, Azure Front Door</td><td>Cloud-native options integrated with their load balancers.</td></tr>
+  <tr><td>Netflix Open Connect, Meta FNA</td><td>In-house CDNs built by companies whose traffic is large enough to justify it.</td></tr>
+</table></div>
+
+<h2>13. Interview corner</h2>
+<details class="qa"><summary>Why put a CDN in front of Instagram's media?</summary>
+<p>Instagram is read-heavy (~100:1 reads to writes) and media is large and immutable once processed. A CDN serves media from locations close to users, reducing latency from hundreds of ms to tens of ms, offloads 90%+ of bandwidth from the origin, and absorbs spikes when content goes viral. The API (feed JSON) still goes to our servers; only media bytes go via the CDN.</p></details>
+<details class="qa"><summary>Pull or push CDN for Instagram — and why?</summary>
+<p>Pull. The catalog is enormous and long-tailed; most photos are viewed a few times, a few are viewed billions of times. Pull caches only what's actually requested and evicts cold objects automatically. Pre-warming can be added for known hot content (celebrity posts).</p></details>
+<details class="qa"><summary>A user deletes a photo. How do you make sure it's no longer served?</summary>
+<p>1) Delete/mark the metadata so the API never returns the URL again. 2) URLs are signed with short expiry, so leaked links die quickly. 3) Issue a CDN purge for that object's URLs. 4) Asynchronously delete the blobs from object storage. Because URLs are content-versioned, there's no risk of serving an "old version" after an edit — an edit produces a new URL.</p></details>
+<details class="qa"><summary>A celebrity posts and 50M people open it in a minute. What happens at the CDN?</summary>
+<p>Every PoP initially misses. Without protection, thousands of simultaneous misses hit the origin (thundering herd). Mitigations: <em>request collapsing</em> at each edge (one in-flight origin fetch per object), a tiered <em>origin shield</em> so only a handful of requests reach object storage, and optionally <em>pre-warming</em> the object in major PoPs right after processing completes.</p></details>
+<details class="qa"><summary>Would you cache the feed API response on the CDN?</summary>
+<p>Generally no — it's personalised per user and changes constantly; caching it in a shared cache risks leaking data and gives a low hit ratio. Use an application cache (e.g. the Redis <a href="caching.html">feed cache</a>) instead. The CDN can still accelerate dynamic API calls by terminating TLS near the user and keeping warm connections to the origin ("dynamic site acceleration").</p></details>
+<details class="qa"><summary>Your CDN bill doubled this quarter while traffic grew only 20%. How do you investigate and fix it?</summary>
+<p>Break the bill down: bytes delivered vs origin egress vs requests, per region and per content type. Typical culprits: (1) a <strong>falling byte hit ratio</strong> — e.g. a new query parameter leaked into the cache key, or longer-tail video content — fix the cache key and add an origin shield; (2) <strong>bigger payloads</strong> — a client release requesting 1080px images on small screens, or a regression to JPEG — enforce correct rendition selection and modern formats (WebP/AVIF); (3) <strong>expensive regions</strong> — consider regional pricing, ISP-embedded caches or a multi-CDN mix. Then add dashboards and alerts on byte hit ratio and bytes per view so it can't silently regress again.</p></details>
+
+<h2>14. Check your understanding</h2>
+<details class="quiz"><summary>What does a cache hit ratio of 98% mean for the origin, compared with 90%?</summary>
+<p>At 90%, 10% of requests reach the origin; at 98%, only 2% do — a <strong>5× reduction</strong> in origin load, even though the hit ratio only went up by 8 percentage points.</p></details>
+<details class="quiz"><summary>Why is <code>/p/9f3a1c/1080.jpg</code> a better URL design than <code>/p/1080.jpg?v=2</code> or overwriting <code>/p/photo.jpg</code>?</summary>
+<p>A content hash in the path makes the URL immutable: if the file changes, the URL changes. It can be cached forever (<code>immutable</code>), needs no purge on update, and some CDNs ignore query strings in the cache key — so <code>?v=2</code> could still serve the old file.</p></details>
+<details class="quiz"><summary>What's the difference between GeoDNS and Anycast routing?</summary>
+<p>GeoDNS returns <em>different IP addresses</em> depending on the resolver's location. Anycast advertises the <em>same IP</em> from many locations and lets BGP routing deliver packets to the nearest one. Anycast reacts faster to failures (no DNS TTL to wait out) and spreads DDoS traffic naturally.</p></details>
+<details class="quiz"><summary>What is an origin shield and what problem does it solve?</summary>
+<p>A middle cache tier between edges and origin. When many edges miss for the same object, they all ask the shield, which makes a single request to the origin. It raises the overall hit ratio and prevents origin overload (thundering herd).</p></details>
+<details class="quiz"><summary>Which of these should be served via the CDN: (a) a post's 1080px JPEG, (b) the user's personalised feed JSON, (c) the first 4-second segment of a Reel, (d) a pre-signed upload URL?</summary>
+<p><strong>(a) and (c)</strong> — both are static, immutable and shared by many users. (b) is personalised and changes constantly, so it belongs in an application cache, not a shared CDN cache. (d) is a one-time, per-user secret used to <em>write</em> to object storage; it must never be cached.</p></details>
+<details class="quiz"><summary>A PoP has 200 servers, each with 10 TB of cache. Roughly how much unique content can the PoP hold if (a) every server caches independently, (b) servers shard keys with consistent hashing?</summary>
+<p>(a) Popular objects end up duplicated on nearly every server, so in the worst case the PoP effectively holds only about <strong>10 TB</strong> of unique content. (b) Each object lives on one owner server, so the PoP holds up to <strong>200 × 10 TB = 2 PB</strong> of unique content — a far higher hit ratio for long-tail photos. Very hot objects are then selectively replicated so a single owner doesn't become a hotspot.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>A CDN caches <strong>static, cacheable</strong> content close to users — for Instagram, that's all photos, video segments and thumbnails.</li>
+    <li>Instagram-style systems use a <strong>pull CDN</strong> with <strong>object storage as origin</strong> and an <strong>origin shield</strong>.</li>
+    <li>Use <strong>versioned (content-hashed) URLs</strong> with long TTLs; use <strong>signed URLs</strong> for access control.</li>
+    <li>Track <strong>cache hit ratio</strong> — small improvements make huge differences to origin load.</li>
+    <li>Keep the <strong>API path</strong> (personalised JSON) and the <strong>media path</strong> (CDN) separate.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="dns.html">DNS</a> — how users get routed to the nearest PoP</li>
+  <li><a href="object-storage.html">Object Storage</a> — the CDN's origin</li>
+  <li><a href="media-processing.html">Media Processing</a> — where the cached renditions come from</li>
+  <li><a href="caching.html">Caching</a> — the same ideas (TTL, hit ratio, invalidation) applied inside the data center</li>
+  <li><a href="security.html">Security</a> — signed URLs, DDoS protection, WAF</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

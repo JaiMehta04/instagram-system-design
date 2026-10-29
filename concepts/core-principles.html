@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scalability, Availability, Reliability &amp; Performance — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="core-principles">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li><strong>Scalability</strong> = handling more load by adding resources. Prefer <strong>horizontal</strong> scaling of <strong>stateless</strong> services; the <strong>scale cube</strong> gives three ways to scale: clone (X), split by function (Y), split by data (Z).</li>
+    <li><strong>Availability</strong> = fraction of time/requests the system works. Components in <strong>series multiply</strong> availabilities (worse); redundant components in <strong>parallel</strong> give <code>1 − Π(1 − A<sub>i</sub>)</code> (better). Remove every <strong>single point of failure</strong>; fail over automatically (active-passive or active-active).</li>
+    <li><strong>Reliability</strong> (correct behaviour), <strong>availability</strong> (up), <strong>durability</strong> (data never lost) and <strong>fault tolerance</strong> (keeps working despite failures) are related but different.</li>
+    <li><strong>Performance</strong>: latency vs throughput; measure <strong>p50/p95/p99</strong>, not averages. Fan-out amplifies tail latency: with 100 backends each 1% slow, <strong>63%</strong> of requests are slow. <strong>Little's law</strong> L = λW links concurrency, throughput and latency.</li>
+    <li>Also design for <strong>maintainability/operability</strong> and <strong>cost</strong>. Every box in the Instagram diagram exists to buy one or more of these properties.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why do we need these principles?</h2>
+<p>Instagram's requirements (see <a href="requirements.html">Requirements</a>) say: serve 500M people a day, at ~350K feed requests per second at peak, with p99 latency under 300 ms, 99.99% availability, and never lose a photo. Now imagine the simplest possible implementation: one server running the app and a database, with photos on its disk. Every one of those requirements fails:</p>
+<ul>
+  <li><strong>Scale:</strong> one server handles maybe a few thousand requests per second — two orders of magnitude short.</li>
+  <li><strong>Availability:</strong> when that server reboots for a kernel patch, Instagram is down for everyone.</li>
+  <li><strong>Durability:</strong> when its disk dies, every photo ever posted is gone.</li>
+  <li><strong>Performance:</strong> users in Mumbai wait 300 ms just for packets to reach Virginia and back, before any work is done.</li>
+</ul>
+<p>The principles in this lesson are the vocabulary for describing <em>how</em> a design fixes each of these — and what it costs. They come up in every system design interview, usually in step 6 ("what are the bottlenecks and failure modes?" — see <a href="how-to-approach.html">How to Approach</a>).</p>
+
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  A restaurant. <strong>Scalability</strong>: when more customers come, you hire more cooks (horizontal) or buy a bigger oven (vertical), or open more branches. <strong>Availability</strong>: the restaurant is open even when one cook is sick — because no dish depends on a single person. <strong>Reliability</strong>: the food that comes out is what was ordered, every time. <strong>Durability</strong>: the secret recipes are written down in a safe and a copy is kept at the bank — a kitchen fire doesn't destroy them. <strong>Performance</strong>: how long you wait for your meal (latency) and how many meals the kitchen serves per hour (throughput). <strong>Maintainability</strong>: a new cook can learn the kitchen in a week. <strong>Cost</strong>: the restaurant still makes a profit.
+</div>
+
+<h2>2. Scalability</h2>
+<p><strong>Scalability</strong> is a system's ability to handle increased load — more users, more data, more requests — by adding resources, while keeping performance acceptable. A scalable system's capacity grows roughly in proportion to the resources you add. "Load" must be described with <strong>load parameters</strong>: for Instagram, requests per second per endpoint, read:write ratio, follower-count distribution, data volume.</p>
+
+<h3>2.1 Vertical vs horizontal scaling</h3>
+<div class="diagram">
+<svg viewBox="0 0 820 250" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-cp-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <text x="200" y="24" text-anchor="middle" font-weight="700">Vertical (scale up)</text>
+  <rect x="60" y="150" width="70" height="50" rx="6" fill="#e8f5e9" stroke="#2e7d32"/><text x="95" y="180" text-anchor="middle" font-size="12">8 cores</text>
+  <path d="M140,175 L178,175" stroke="#555" stroke-width="1.5" marker-end="url(#ar-cp-1)"/>
+  <rect x="190" y="50" width="150" height="150" rx="8" fill="#e8f5e9" stroke="#2e7d32"/>
+  <text x="265" y="115" text-anchor="middle" font-weight="600">128 cores</text><text x="265" y="135" text-anchor="middle" font-size="12">2 TB RAM</text>
+  <text x="200" y="230" text-anchor="middle" font-size="12" fill="#555">simple, but has a ceiling and is one box</text>
+  <path d="M410,20 L410,230" stroke="#ccc" stroke-dasharray="4 4"/>
+  <text x="620" y="24" text-anchor="middle" font-weight="700">Horizontal (scale out)</text>
+  <rect x="545" y="40" width="150" height="34" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="620" y="62" text-anchor="middle">Load balancer</text>
+  <g fill="#e8f5e9" stroke="#2e7d32">
+    <rect x="450" y="130" width="60" height="50" rx="6"/><rect x="520" y="130" width="60" height="50" rx="6"/><rect x="590" y="130" width="60" height="50" rx="6"/><rect x="660" y="130" width="60" height="50" rx="6"/><rect x="730" y="130" width="60" height="50" rx="6" stroke-dasharray="4 3"/>
+  </g>
+  <g font-size="12" text-anchor="middle"><text x="480" y="160">8 cores</text><text x="550" y="160">8 cores</text><text x="620" y="160">8 cores</text><text x="690" y="160">8 cores</text><text x="760" y="160">+ more</text></g>
+  <g stroke="#555" stroke-width="1.3" fill="none" marker-end="url(#ar-cp-1)">
+    <path d="M590,74 L482,128"/><path d="M605,74 L552,128"/><path d="M620,74 L620,128"/><path d="M635,74 L688,128"/><path d="M650,74 L758,128" stroke-dasharray="4 3"/>
+  </g>
+  <text x="620" y="230" text-anchor="middle" font-size="12" fill="#555">near-unlimited and redundant, but needs statelessness</text>
+</svg>
+<div class="caption">Scaling up buys a bigger machine; scaling out adds more machines behind a load balancer.</div>
+</div>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Vertical scaling (scale up)</th><th>Horizontal scaling (scale out)</th></tr>
+  <tr><td><b>How</b></td><td>Bigger machine: more CPU, RAM, faster disks</td><td>More machines sharing the load</td></tr>
+  <tr><td><b>Code changes</b></td><td>None</td><td>Services must be stateless or data must be partitioned</td></tr>
+  <tr><td><b>Limit</b></td><td>Hard ceiling (largest available machine); cost grows super-linearly near the top</td><td>Practically unlimited; cost grows ~linearly</td></tr>
+  <tr><td><b>Availability</b></td><td>Still a single point of failure</td><td>Redundant: losing one of N machines loses 1/N capacity</td></tr>
+  <tr><td><b>Operational complexity</b></td><td>Low</td><td>Higher: load balancing, distributed data, partial failures</td></tr>
+  <tr><td><b>Upgrades</b></td><td>Usually downtime to resize</td><td>Rolling: add/replace machines one at a time</td></tr>
+  <tr><td><b>Best for</b></td><td>Early stage; databases that are hard to distribute; quick relief</td><td>Stateless tiers; anything at Instagram scale</td></tr>
+</table></div>
+<p>Real systems do both: scale up a database primary to the largest sensible machine (it buys time and simplicity), and scale out everything else. Instagram's early story, as told in public talks, followed this path: a few bigger servers first, then many servers and sharded databases as growth demanded.</p>
+
+<h3>2.2 Stateless services: the key to scaling out</h3>
+<p>A service is <strong>stateless</strong> when it keeps no client-specific data in its own memory or disk between requests: any instance can handle any request. All state lives in shared external stores — databases, caches, object storage. Then:</p>
+<ul>
+  <li>The <a href="load-balancer.html">load balancer</a> can send each request to <em>any</em> healthy instance (no "sticky sessions").</li>
+  <li>Adding capacity = starting more instances; autoscaling becomes trivial.</li>
+  <li>An instance crashing loses nothing except in-flight requests, which clients retry.</li>
+  <li>Deploys are rolling restarts with zero downtime.</li>
+</ul>
+<pre><code># ❌ Stateful: session kept in the server's memory — breaks when the LB picks another server
+sessions = {}                                   # lives in this process only
+def login(user):  sessions[token] = user
+def feed(token):  user = sessions[token]        # KeyError on any other instance
+
+# ✅ Stateless: identity carried in a signed token, data in shared stores
+def feed(request):
+    user_id = verify_jwt(request.headers["Authorization"])   # no server memory needed
+    post_ids = redis.zrevrange(f"timeline:{user_id}", 0, 19)
+    return hydrate(post_ids)                                  # from cache / Cassandra</code></pre>
+<p>In the Instagram diagram every application service (Upload, Feed, Like &amp; Comment, Follow, Search, User/Auth) is stateless. The one notable exception is the <strong>Direct Messaging</strong> WebSocket tier, which must hold long-lived connections; it keeps only the connection itself in memory and stores everything else (messages, presence) externally, with a routing table saying which gateway holds which user's connection. See <a href="microservices.html">Microservices &amp; Stateless Services</a>.</p>
+
+<h3>2.3 The scale cube: three ways to scale</h3>
+<p>The <strong>scale cube</strong> (from the book <em>The Art of Scalability</em>) names three independent dimensions of scaling:</p>
+<div class="diagram">
+<svg viewBox="0 0 820 330" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-cp-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#333"/></marker></defs>
+  <path d="M150,270 L150,90 L330,90 L330,270 Z" fill="#f5f5f5" stroke="#bbb"/>
+  <path d="M150,90 L240,30 L420,30 L330,90" fill="#eeeeee" stroke="#bbb"/>
+  <path d="M330,90 L420,30 L420,210 L330,270" fill="#e0e0e0" stroke="#bbb"/>
+  <text x="240" y="185" text-anchor="middle" font-size="12" fill="#555">one monolith,</text><text x="240" y="201" text-anchor="middle" font-size="12" fill="#555">one database</text>
+  <circle cx="150" cy="270" r="5" fill="#333"/>
+  <path d="M150,270 L470,270" stroke="#2e7d32" stroke-width="3" marker-end="url(#ar-cp-2)"/>
+  <path d="M150,270 L150,40" stroke="#ef6c00" stroke-width="3" marker-end="url(#ar-cp-2)"/>
+  <path d="M150,270 L60,330" stroke="#6a1b9a" stroke-width="3" marker-end="url(#ar-cp-2)" transform="translate(0,-10)"/>
+  <text x="480" y="266" font-weight="700" fill="#2e7d32">X-axis: clone</text>
+  <text x="480" y="284" font-size="12">N identical copies behind a load balancer</text>
+  <text x="135" y="50" text-anchor="end" font-weight="700" fill="#ef6c00">Y</text>
+  <text x="480" y="60" font-weight="700" fill="#ef6c00">Y-axis: split by function</text>
+  <text x="480" y="78" font-size="12">Upload, Feed, Like, Follow, Search, DM …</text>
+  <text x="480" y="160" font-weight="700" fill="#6a1b9a">Z-axis: split by data</text>
+  <text x="480" y="178" font-size="12">each server/shard owns a subset of users</text>
+  <text x="480" y="196" font-size="12">e.g. shard = hash(user_id) mod N</text>
+  <text x="40" y="312" fill="#6a1b9a" font-weight="700">Z</text>
+</svg>
+<div class="caption">The scale cube. Real systems combine all three axes: Instagram's Feed Service is split out by function (Y), runs as many clones (X), and reads data sharded by user (Z).</div>
+</div>
+<div class="table-wrap"><table>
+  <tr><th>Axis</th><th>What it means</th><th>Solves</th><th>Costs</th><th>Instagram example</th></tr>
+  <tr><td><b>X — horizontal duplication</b></td><td>Run N identical copies of a component; load balancer spreads requests</td><td>Throughput and availability of stateless compute; read scaling via DB replicas</td><td>Doesn't help with data size or write volume; every copy needs all the code</td><td>Hundreds of Feed Service instances; PostgreSQL read replicas</td></tr>
+  <tr><td><b>Y — functional decomposition</b></td><td>Split by verb/noun into separate services, each with its own data</td><td>Team autonomy, independent scaling and deploys, fault isolation</td><td>Network calls, distributed transactions, operational overhead</td><td>Upload, Feed, Like &amp; Comment, Follow, Search, DM as separate services (<a href="microservices.html">Microservices</a>)</td></tr>
+  <tr><td><b>Z — data partitioning</b></td><td>Each instance handles a subset of the data, chosen by a key</td><td>Data volume and write throughput beyond one machine</td><td>Cross-shard queries, hot shards, resharding complexity</td><td>Posts in Cassandra partitioned by user_id; users in PostgreSQL shards (<a href="sharding.html">Sharding</a>)</td></tr>
+</table></div>
+
+<h3>2.4 Scaling the data tier</h3>
+<p>Stateless compute is the easy part; <strong>data</strong> is where scaling gets hard, because it has state by definition.</p>
+<ul>
+  <li><strong>Read-heavy?</strong> Add <a href="caching.html">caches</a> (absorb most reads) and <a href="replication.html">read replicas</a> (X-axis for reads). Instagram's ~100:1 content read ratio makes this the first lever.</li>
+  <li><strong>Too much data or too many writes for one machine?</strong> <a href="sharding.html">Shard</a> (Z-axis), ideally with <a href="consistent-hashing.html">consistent hashing</a> or many logical shards so you can rebalance.</li>
+  <li><strong>Different access patterns?</strong> Use different stores for different data (polyglot persistence): PostgreSQL for users, Cassandra for posts, Redis for timelines, Elasticsearch for search, S3 for media (<a href="databases.html">Databases</a>).</li>
+  <li><strong>Expensive work on the request path?</strong> Move it off via a queue (<a href="message-queues.html">Kafka</a>) and process asynchronously — this scales the work independently of user-facing latency.</li>
+</ul>
+<div class="callout tip"><span class="callout-title">💡 Elasticity vs scalability</span>
+<strong>Scalability</strong> is the ability to grow capacity; <strong>elasticity</strong> is doing it automatically and quickly in response to load (autoscaling), and shrinking again to save money. Stateless tiers can be elastic in minutes; stateful tiers (databases, caches) usually scale in planned steps because data must be moved.</div>
+
+<h2>3. Availability</h2>
+<p><strong>Availability</strong> is the proportion of time — or, better at scale, the proportion of requests — for which the system is working correctly:</p>
+<pre><code>availability (time-based)    = uptime / (uptime + downtime)
+availability (request-based) = successful requests / total valid requests
+availability (from failures) = MTBF / (MTBF + MTTR)
+   MTBF = mean time between failures   MTTR = mean time to recovery (detect + fix)</code></pre>
+<p>The last formula reveals the two levers: fail <strong>less often</strong> (raise MTBF) or <strong>recover faster</strong> (cut MTTR). At scale, recovering faster is usually far cheaper. Example: a component fails once a month (MTBF = 720 h). If a human must notice and fix it (MTTR = 1 h), availability = 720/721 = <strong>99.86%</strong>. If automatic failover recovers in 1 minute, availability = 720/(720 + 0.0167) = <strong>99.998%</strong> — the same unreliable hardware, 60× less downtime.</p>
+
+<h3>3.1 The nines</h3>
+<div class="table-wrap"><table>
+  <tr><th>Availability</th><th>Downtime / year</th><th>Downtime / month</th><th>Downtime / day</th><th>Typical for</th></tr>
+  <tr><td>90% ("one nine")</td><td>36.5 days</td><td>~73 hours</td><td>2.4 hours</td><td>Batch jobs, experiments</td></tr>
+  <tr><td>99% ("two nines")</td><td>3.65 days</td><td>~7.3 hours</td><td>14.4 minutes</td><td>Internal tools</td></tr>
+  <tr><td>99.9% ("three nines")</td><td>8.77 hours</td><td>~43.8 minutes</td><td>1.44 minutes</td><td>Many SaaS products; Instagram search/Explore</td></tr>
+  <tr><td>99.95%</td><td>4.38 hours</td><td>~21.9 minutes</td><td>43.2 seconds</td><td>Typical single-region cloud service SLAs</td></tr>
+  <tr><td>99.99% ("four nines")</td><td>52.6 minutes</td><td>~4.38 minutes</td><td>8.64 seconds</td><td>Instagram feed, upload, media</td></tr>
+  <tr><td>99.999% ("five nines")</td><td>5.26 minutes</td><td>~26.3 seconds</td><td>0.86 seconds</td><td>Telecom, payment networks, core infra</td></tr>
+</table></div>
+<p>Each extra nine is 10× less downtime, and typically costs far more than 10× the engineering effort: three nines can be reached with good practices in one region; five nines generally requires multiple regions, automated everything and extremely careful change management.</p>
+
+<h3>3.2 Availability in series vs in parallel</h3>
+<p>A request usually passes through several components. How do their availabilities combine? Assume failures are <strong>independent</strong> (an important caveat — see 3.3).</p>
+<p><strong>In series</strong> (the request needs <em>all</em> of them): multiply.</p>
+<pre><code>A_series = A1 × A2 × … × An</code></pre>
+<p><strong>In parallel</strong> (redundant copies; the request needs <em>at least one</em>): the system fails only if <em>all</em> copies fail.</p>
+<pre><code>A_parallel = 1 − (1 − A1) × (1 − A2) × … × (1 − An)
+two copies of 99%:   1 − 0.01 × 0.01   = 1 − 0.0001  = 99.99%
+three copies of 99%: 1 − 0.01^3        = 99.9999%</code></pre>
+
+<div class="diagram">
+<svg viewBox="0 0 820 300" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-cp-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <text x="20" y="24" font-weight="700">Series: one instance of each — the chain is weaker than its weakest link</text>
+  <g text-anchor="middle">
+    <rect x="20" y="40" width="120" height="46" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="80" y="60">DNS</text><text x="80" y="77" font-size="12">99.99%</text>
+    <rect x="170" y="40" width="120" height="46" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="230" y="60">Load balancer</text><text x="230" y="77" font-size="12">99.99%</text>
+    <rect x="320" y="40" width="120" height="46" rx="8" fill="#fff3e0" stroke="#ef6c00"/><text x="380" y="60">API gateway</text><text x="380" y="77" font-size="12">99.99%</text>
+    <rect x="470" y="40" width="120" height="46" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="530" y="60">Feed service</text><text x="530" y="77" font-size="12">99.5%</text>
+    <rect x="620" y="40" width="120" height="46" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="680" y="60">Redis</text><text x="680" y="77" font-size="12">99.9%</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" marker-end="url(#ar-cp-3)"><path d="M140,63 L168,63"/><path d="M290,63 L318,63"/><path d="M440,63 L468,63"/><path d="M590,63 L618,63"/></g>
+  <text x="20" y="112" font-size="12">0.9999 × 0.9999 × 0.9999 × 0.995 × 0.999 = <tspan font-weight="700">99.37%</tspan>  ≈ 55 hours of downtime per year</text>
+  <text x="20" y="150" font-weight="700">Parallel: replicate the weak components</text>
+  <g text-anchor="middle">
+    <rect x="470" y="165" width="120" height="34" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="530" y="187" font-size="12">Feed #1 99.5%</text>
+    <rect x="470" y="205" width="120" height="34" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="530" y="227" font-size="12">Feed #2 99.5%</text>
+    <rect x="470" y="245" width="120" height="34" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="530" y="267" font-size="12">Feed #3 99.5%</text>
+    <rect x="620" y="180" width="120" height="34" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="680" y="202" font-size="12">Redis primary</text>
+    <rect x="620" y="230" width="120" height="34" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="680" y="252" font-size="12">Redis replica</text>
+  </g>
+  <text x="20" y="190" font-size="12">Feed × 3: 1 − 0.005³ ≈ 99.99999%</text>
+  <text x="20" y="212" font-size="12">Redis × 2: 1 − 0.001² = 99.9999%</text>
+  <text x="20" y="234" font-size="12">Whole chain: 0.9999³ × 0.9999999 × 0.999999</text>
+  <text x="20" y="256" font-size="12" font-weight="700">≈ 99.97%  ≈ 2.6 hours of downtime per year</text>
+  <text x="20" y="280" font-size="12" fill="#555">Now the single DNS / LB / gateway dominate → replicate them too.</text>
+</svg>
+<div class="caption">Series multiplies availabilities (down); redundancy in parallel multiplies <em>unavailabilities</em> (up). Always find the weakest serial link.</div>
+</div>
+<p>Let's verify the numbers. Series: 0.9999³ = 0.99970; × 0.995 = 0.99470; × 0.999 = 0.99370 → <strong>99.37%</strong>, i.e. 0.63% × 8,766 h ≈ <strong>55 hours/year</strong>. With three feed instances and a Redis replica: 0.99970 × 0.9999999 × 0.999999 ≈ <strong>99.97%</strong> (~2.6 h/year). The remaining downtime now comes from the three single-instance edge components — so we make those redundant too (multiple DNS providers/anycast, LB pairs, many gateway instances). That is precisely why <em>every</em> layer in the Instagram diagram is drawn as a single box but deployed as many.</p>
+<div class="callout tip"><span class="callout-title">💡 Two quick rules</span>
+(1) Adding a dependency in series can only <em>lower</em> availability — every synchronous call is a liability, which is one reason to move work to async queues. (2) A system can't be more available than its least available serial dependency — so a 99.99% target means every critical-path dependency must be (effectively) better than 99.99%.</div>
+
+<h3>3.3 The independence trap: correlated failures</h3>
+<p>The parallel formula assumes copies fail independently. In reality, failures are often <strong>correlated</strong>: all three replicas run the same buggy release; all sit in one data centre that loses power; all read the same bad config push; all depend on the same DNS or auth service. Three "independent" 99% replicas that share a deploy pipeline are not 99.9999% available. Defences: spread replicas across <strong>failure domains</strong> (racks, availability zones, regions), deploy gradually (canary one zone first), keep dependencies diverse where it matters, and design so that a bad change can be rolled back automatically.</p>
+
+<h2>4. Redundancy and single points of failure</h2>
+<p>A <strong>single point of failure (SPOF)</strong> is any component whose failure takes down the whole system (or a whole feature). <strong>Redundancy</strong> — having spare capacity or duplicate components — removes SPOFs.</p>
+<h3>4.1 Hunting SPOFs in a naive Instagram</h3>
+<div class="table-wrap"><table>
+  <tr><th>SPOF</th><th>What happens when it fails</th><th>Fix</th></tr>
+  <tr><td>Single load balancer</td><td>Nobody can reach anything</td><td>Active-active LB pair / anycast, DNS with multiple IPs (<a href="load-balancer.html">Load Balancing</a>)</td></tr>
+  <tr><td>One database primary</td><td>No writes (or nothing at all)</td><td>Replicas + automatic failover (<a href="replication.html">Replication</a>)</td></tr>
+  <tr><td>One cache node holding all timelines</td><td>Feed latency explodes; DB overloaded by misses</td><td>Sharded Redis cluster with replicas</td></tr>
+  <tr><td>One availability zone</td><td>Power/network outage takes all copies at once</td><td>Spread every tier across ≥3 zones</td></tr>
+  <tr><td>One region</td><td>Regional disaster = global outage</td><td>Multi-region with failover (<a href="multi-region.html">Multi-Region</a>)</td></tr>
+  <tr><td>One Kafka broker</td><td>Event pipeline stops</td><td>Replication factor 3, partitions spread across brokers</td></tr>
+  <tr><td>Hidden SPOFs: DNS provider, certificate expiry, a config service, a single on-call engineer</td><td>Total outage from something "boring"</td><td>Redundant providers, automation, alerts on expiry, runbooks</td></tr>
+</table></div>
+<h3>4.2 How much redundancy?</h3>
+<ul>
+  <li><strong>N+1</strong>: enough capacity to lose any one unit (server, zone) and still serve peak load. With 3 zones, each zone must handle 50% of peak → you provision 150% of peak.</li>
+  <li><strong>N+2</strong>: survive one planned outage (maintenance) <em>plus</em> one unplanned failure at the same time.</li>
+  <li><strong>Data redundancy</strong>: replication factor 3 is the common default for databases and logs; object stores use replication or erasure coding (e.g. 10 data + 4 parity fragments) for durability at lower overhead (<a href="object-storage.html">Object Storage</a>).</li>
+</ul>
+
+<h2>5. Failover: active-passive vs active-active</h2>
+<p><strong>Failover</strong> is switching traffic from a failed component to a healthy one. It needs three things: <strong>detection</strong> (health checks, heartbeats), a <strong>decision</strong> (who's the new primary — ideally via consensus to avoid two primaries) and <strong>redirection</strong> (update the LB, DNS or client routing).</p>
+<pre class="ascii">
+ ACTIVE-PASSIVE                                ACTIVE-ACTIVE
+ ──────────────                                ─────────────
+   clients                                       clients
+      │                                         ┌───┴───┐
+      ▼                                         ▼       ▼
+ ┌─────────┐  replicate  ┌─────────┐       ┌───────┐ ┌───────┐
+ │ ACTIVE  │ ──────────&gt; │ PASSIVE │       │ node A│ │ node B│   both serve traffic;
+ │ serves  │             │ standby │       │ 50%   │ │ 50%   │   replicate to each other
+ └─────────┘             └─────────┘       └───────┘ └───────┘
+   ✗ fails → standby promoted (seconds–minutes)   ✗ A fails → B takes 100% immediately
+</pre>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Active-passive (primary/standby)</th><th>Active-active</th></tr>
+  <tr><td><b>Normal operation</b></td><td>One node serves; standby only replicates</td><td>All nodes serve traffic</td></tr>
+  <tr><td><b>Failover time</b></td><td>Seconds to minutes (detect + promote + redirect)</td><td>Near-instant (LB stops sending to the dead node)</td></tr>
+  <tr><td><b>Resource efficiency</b></td><td>Standby capacity sits idle (can serve reads as a replica)</td><td>All capacity used — but each node must have headroom to absorb the others' load</td></tr>
+  <tr><td><b>Data consistency</b></td><td>Simple: one writer. Risk: losing un-replicated writes on failover (async replication)</td><td>Hard for writes: concurrent updates on different nodes → conflicts (<a href="cap-consistency.html">conflict resolution</a>)</td></tr>
+  <tr><td><b>Main risk</b></td><td>Split brain: old primary comes back thinking it's still primary → needs fencing</td><td>Write conflicts; cascading overload if remaining nodes lack headroom</td></tr>
+  <tr><td><b>Typical use</b></td><td>Relational DB primaries (PostgreSQL with a standby), many stateful systems</td><td>Stateless services, load balancers, leaderless stores (Cassandra), multi-region reads</td></tr>
+</table></div>
+<p>Standby flavours: <strong>hot</strong> (running and in sync, takes over in seconds), <strong>warm</strong> (running but behind or under-provisioned, minutes), <strong>cold</strong> (restored from backups when needed, hours). The choice trades cost against <strong>RTO</strong> (recovery time objective: how long you may be down) and <strong>RPO</strong> (recovery point objective: how much recent data you may lose).</p>
+<div class="callout warn"><span class="callout-title">⚠️ Split brain and fencing</span>
+If the network between a primary and its standby breaks, the standby may conclude the primary is dead and promote itself — while the primary is actually alive and still accepting writes. Now two primaries diverge. Systems prevent this with a consensus-based leader election (ZooKeeper/etcd, Raft) and <strong>fencing</strong>: each new leader gets a higher "epoch" number, and storage rejects writes carrying an old epoch. This is CAP in practice — see <a href="cap-consistency.html">CAP &amp; Consistency</a>.</div>
+
+<h2>6. Reliability vs availability vs durability vs fault tolerance</h2>
+<p>These words are often used interchangeably, but interviewers notice when you distinguish them precisely.</p>
+<div class="table-wrap"><table>
+  <tr><th>Property</th><th>Question it answers</th><th>Measured as</th><th>Instagram example of a failure</th><th>Main techniques</th></tr>
+  <tr><td><b>Reliability</b></td><td>Does the system do the <em>right thing</em>, consistently, over time?</td><td>Error rate, MTBF, correctness</td><td>A like is recorded twice; a post appears for the wrong audience</td><td>Testing, idempotency, validation, careful rollouts</td></tr>
+  <tr><td><b>Availability</b></td><td>Can users use it <em>right now</em>?</td><td>% uptime or % successful requests</td><td>Feed returns 503 for 10 minutes</td><td>Redundancy, failover, load balancing, degradation</td></tr>
+  <tr><td><b>Durability</b></td><td>Once stored, will the data <em>still exist</em> later?</td><td>Probability of data loss per object per year (e.g. 11 nines)</td><td>A photo is permanently lost after a disk failure</td><td>Replication, erasure coding, backups, checksums</td></tr>
+  <tr><td><b>Fault tolerance</b></td><td>Does it keep working <em>when parts fail</em>?</td><td>Which failures it survives (node, zone, region)</td><td>Losing one Cassandra node causes errors</td><td>Redundancy, quorums, retries, isolation (bulkheads)</td></tr>
+  <tr><td><b>Resilience</b></td><td>How well does it <em>absorb and recover</em> from stress?</td><td>Recovery time, degradation behaviour</td><td>A traffic spike causes a cascading failure</td><td>Timeouts, circuit breakers, load shedding (<a href="resilience-patterns.html">Resilience</a>)</td></tr>
+</table></div>
+<p>Some illuminating contrasts:</p>
+<ul>
+  <li><strong>Available but unreliable:</strong> the feed always loads, but sometimes shows posts from blocked users. Up, but wrong.</li>
+  <li><strong>Durable but unavailable:</strong> during a regional outage your photos are safe on disk but can't be viewed for an hour.</li>
+  <li><strong>Available but not durable:</strong> a cache that always answers but loses everything on restart — fine for a cache, unacceptable for a database of record.</li>
+  <li><strong>Fault tolerance is a means, availability is an end:</strong> you build fault tolerance (redundancy, failover) <em>in order to</em> achieve availability and durability targets.</li>
+</ul>
+<p>A key design idea is <strong>graceful degradation</strong>: when part of the system fails, reduce functionality instead of failing entirely. If the ranking service is down, serve the timeline in chronological order; if like counts can't be fetched, hide them; if the CDN can't reach the origin, serve a slightly stale cached copy. Users experience "a bit worse" instead of "broken".</p>
+
+<h2>7. Performance</h2>
+<h3>7.1 Latency vs throughput</h3>
+<ul>
+  <li><strong>Latency</strong>: time to complete <em>one</em> operation (ms). "How long did my feed take to load?"</li>
+  <li><strong>Throughput</strong>: operations completed <em>per unit time</em> (requests/s, MB/s). "How many feeds can we serve per second?"</li>
+  <li><strong>Bandwidth</strong>: the <em>maximum</em> possible throughput of a channel (e.g. a 10 Gbps link).</li>
+</ul>
+<p>Analogy: a motorway. Latency is how long one car takes to drive from A to B; throughput is how many cars pass per hour. Adding lanes raises throughput without making any car faster; raising the speed limit lowers latency. They interact through queueing: as throughput approaches capacity, queues form and latency rises sharply (section 7.5). Some techniques trade one for the other — <strong>batching</strong> (e.g. Kafka producers batching messages, or fan-out workers writing timelines in bulk) raises throughput but adds a little latency to each item.</p>
+
+<h3>7.2 Percentiles: p50, p95, p99</h3>
+<p>Latency is a distribution, not a number. The <strong>p<em>N</em></strong> (N-th percentile) is the value below which N% of measurements fall.</p>
+<pre><code>20 feed requests, sorted latencies (ms):
+ 42 45 47 48 50 51 53 55 56 58 60 62 65 70 75 80 95 120 250 1,900
+
+mean = 3,282 / 20 ≈ 164 ms     ← dragged up by one 1.9 s outlier; describes nobody
+p50  (median) ≈ 59 ms          ← the typical experience
+p95           ≈ 250 ms         ← 1 in 20 requests is at least this slow
+p99           ≈ 1,900 ms       ← the tail (with only 20 samples, p99 ≈ the max)</code></pre>
+<ul>
+  <li><strong>p50</strong> shows typical performance; <strong>p95/p99</strong> show the <strong>tail</strong>, which is what frequent users actually feel — someone loading 20 feed pages a day hits the p95 roughly once a day.</li>
+  <li><strong>Never average percentiles</strong> across servers or time windows (the average of p99s is not the p99). Aggregate the underlying histograms instead (<a href="observability.html">Observability</a>).</li>
+  <li>Tail causes include garbage-collection pauses, cache misses, a slow disk, a noisy neighbour, retries, lock contention, and queueing at high utilisation.</li>
+</ul>
+
+<h3>7.3 Tail latency amplification under fan-out</h3>
+<p>Here is a subtle but crucial effect. When one user request fans out to many backend calls <strong>in parallel</strong> and must wait for <strong>all</strong> of them, the request is as slow as the slowest call. If each backend is "slow" (above its p99) 1% of the time, independently:</p>
+<pre><code>P(user request is slow) = 1 − P(all N calls are fast) = 1 − 0.99^N</code></pre>
+<div class="diagram">
+<svg viewBox="0 0 820 270" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <text x="20" y="24" font-weight="700">Probability a request hits at least one slow (p99) backend call, vs fan-out N</text>
+  <path d="M80,230 L780,230" stroke="#555"/><path d="M80,230 L80,40" stroke="#555"/>
+  <g font-size="11" fill="#555" text-anchor="end"><text x="74" y="234">0%</text><text x="74" y="139">50%</text><text x="74" y="44">100%</text></g>
+  <path d="M80,135 L780,135" stroke="#eee"/>
+  <g fill="#f3e5f5" stroke="#6a1b9a">
+    <rect x="100" y="228" width="70" height="2"/>
+    <rect x="200" y="221" width="70" height="9"/>
+    <rect x="300" y="212" width="70" height="18"/>
+    <rect x="400" y="195" width="70" height="35"/>
+    <rect x="500" y="155" width="70" height="75"/>
+    <rect x="600" y="110" width="70" height="120"/>
+    <rect x="700" y="65" width="70" height="165"/>
+  </g>
+  <g font-size="12" text-anchor="middle" font-weight="600">
+    <text x="135" y="220">1%</text><text x="235" y="214">4.9%</text><text x="335" y="205">9.6%</text><text x="435" y="188">18.2%</text><text x="535" y="148">39.5%</text><text x="635" y="103">63.4%</text><text x="735" y="58">86.6%</text>
+  </g>
+  <g font-size="12" text-anchor="middle">
+    <text x="135" y="248">N = 1</text><text x="235" y="248">5</text><text x="335" y="248">10</text><text x="435" y="248">20</text><text x="535" y="248">50</text><text x="635" y="248">100</text><text x="735" y="248">200</text>
+  </g>
+  <text x="430" y="266" text-anchor="middle" font-size="12" fill="#555">Each backend is slow only 1% of the time — but at N = 100, most user requests are slow.</text>
+</svg>
+<div class="caption">Tail latency amplification: 1 − 0.99<sup>N</sup>. The rare becomes the common as fan-out grows.</div>
+</div>
+<p><strong>Instagram example:</strong> rendering one feed page hydrates ~20 posts, each requiring metadata, counters, author info and "did I like it?" lookups spread over many cache shards — easily 20–100 parallel calls. With N = 20, <strong>18%</strong> of feed requests experience some backend's p99. Flip it around: to keep the <em>page</em> p99 at a target, each backend must meet that target at the <strong>p99.95</strong> level, because 0.99<sup>1/20</sup> ≈ 0.9995.</p>
+<p>Mitigations (from Google's well-known paper <em>The Tail at Scale</em> and common practice):</p>
+<ul>
+  <li><strong>Reduce fan-out</strong>: batch lookups (one multi-get per shard instead of one call per item), denormalise data so fewer services are touched.</li>
+  <li><strong>Hedged requests</strong>: if a call hasn't returned by its p95, send a duplicate to another replica and take whichever answers first (costs a few % extra load).</li>
+  <li><strong>Tight timeouts + partial results</strong>: render the feed without one post's like count rather than wait (graceful degradation).</li>
+  <li><strong>Reduce variance at the source</strong>: avoid GC pauses, isolate noisy neighbours, keep utilisation moderate, use load-aware balancing.</li>
+  <li><strong>Pre-compute</strong>: serve a pre-built timeline instead of assembling it from many sources per request — exactly what the Feed Cache does.</li>
+</ul>
+
+<h3>7.4 Little's law</h3>
+<p>Little's law is a simple, universally applicable relationship for any stable system (a server, a queue, a whole service):</p>
+<pre><code>L = λ × W
+L = average number of requests in the system (concurrency / in-flight)
+λ = average arrival rate (throughput, requests/s)
+W = average time each request spends in the system (latency, s)</code></pre>
+<p>Uses:</p>
+<ul>
+  <li><strong>Sizing concurrency:</strong> the feed tier at 350K req/s peak with 100 ms average latency has 350,000 × 0.1 = <strong>35,000 requests in flight</strong>. If each server can work on 64 requests concurrently, you need at least 35,000 / 64 ≈ <strong>550 servers</strong> — just for concurrency.</li>
+  <li><strong>Connection pools:</strong> a service doing 20,000 DB queries/s at 5 ms each needs ~20,000 × 0.005 = <strong>100 connections</strong> on average (plus headroom). Too small a pool → requests queue; too large → the DB drowns in connections.</li>
+  <li><strong>Latency spikes eat capacity:</strong> if a dependency slows from 100 ms to 1 s, concurrency at the same throughput rises 10× — threads and connections run out and the slowdown cascades. This is why <a href="resilience-patterns.html">timeouts and circuit breakers</a> are essential.</li>
+  <li><strong>Queues:</strong> a Kafka consumer group with 2M messages of lag processing 50K messages/s means new events wait ~40 s (W = L / λ) — directly the "post visible to followers" delay.</li>
+</ul>
+
+<h3>7.5 Utilisation and queueing: why you need headroom</h3>
+<p>Queueing theory gives a sobering rule: as a server's <strong>utilisation</strong> ρ (busy fraction) approaches 100%, waiting time explodes. For the simplest model (M/M/1 — random arrivals, one server), average time in system is:</p>
+<pre><code>W = S / (1 − ρ)        S = service time when idle
+ρ = 50%  → W = 2 S
+ρ = 70%  → W ≈ 3.3 S
+ρ = 80%  → W = 5 S
+ρ = 90%  → W = 10 S
+ρ = 95%  → W = 20 S
+ρ = 99%  → W = 100 S</code></pre>
+<p>Real systems differ in detail, but the shape — a "hockey stick" — is universal. That's why capacity plans target <strong>~60–70% peak utilisation</strong>, not 100%: the last 30% of "unused" capacity is what keeps the p99 sane and absorbs spikes and failovers (<a href="capacity-estimation.html">Estimation</a>).</p>
+
+<h3>7.6 Bottleneck analysis</h3>
+<p>A system's throughput is limited by its <strong>bottleneck</strong> — the most constrained resource on the path. Speeding up anything else doesn't help. A systematic approach:</p>
+<ol class="steps">
+  <li><strong>Draw the request path</strong> (e.g. feed: LB → gateway → feed service → Redis → post cache → Cassandra on miss → ranking).</li>
+  <li><strong>For each stage, compare demand to capacity</strong>: requests/s vs per-node limit × nodes; bytes/s vs NIC/disk bandwidth; memory vs working set.</li>
+  <li><strong>Check resources with the USE method</strong>: for each resource (CPU, memory, disk, network, connection pools, locks) look at <em>Utilisation</em>, <em>Saturation</em> (queue length) and <em>Errors</em>.</li>
+  <li><strong>Find the latency budget hogs</strong> with distributed tracing: which span dominates the p99? (<a href="observability.html">Observability</a>)</li>
+  <li><strong>Fix the top bottleneck, then re-measure</strong> — the bottleneck moves. After caching the feed, ranking may become the slowest stage; after optimising ranking, the network to Redis may be.</li>
+</ol>
+<p>Common bottlenecks in Instagram-like systems: a hot shard (a celebrity's posts or counters), the primary database for writes, cache-miss storms after a cache restart, fan-out workers lagging behind during a spike, and cross-region round trips. <strong>Amdahl's law</strong> is the reminder for parallelism: if 10% of the work is inherently serial, no amount of parallel workers can make it more than 10× faster.</p>
+
+<h2>8. Maintainability and operability</h2>
+<p>Most of a system's cost over its lifetime is not building it but <strong>running and changing it</strong>. Three facets (as framed in Martin Kleppmann's <em>Designing Data-Intensive Applications</em>):</p>
+<div class="cards">
+  <div class="card"><h4>🛠️ Operability</h4><p>Easy for operators to keep healthy: good monitoring and alerts, automation, runbooks, safe deploys and rollbacks, predictable behaviour, no manual steps in failover.</p></div>
+  <div class="card"><h4>🧩 Simplicity</h4><p>Easy for new engineers to understand: clear service boundaries, good abstractions, no accidental complexity. Choose boring, proven technology unless there's a strong reason not to.</p></div>
+  <div class="card"><h4>🔄 Evolvability</h4><p>Easy to change: loosely coupled services, versioned APIs, schema evolution, feature flags, events that let new consumers be added without touching producers.</p></div>
+</div>
+<p>In the Instagram diagram, <strong>Kafka</strong> is a big maintainability win: when the company wants a new feature that reacts to posts (say, a "creator insights" dashboard), a team adds a new consumer — the Upload Service doesn't change. Splitting services by function (Y-axis) lets hundreds of engineers deploy independently. Public Instagram talks have long emphasised operational simplicity — "do the simple thing first" and use proven technology — which let a tiny early team run a fast-growing service.</p>
+
+<h2>9. Cost</h2>
+<p>Every property above costs money: redundancy doubles or triples hardware, extra nines need extra regions, low latency needs RAM and edge locations. Good designers think in <strong>unit economics</strong> — cost per DAU, per upload, per GB served — and know the main levers:</p>
+<div class="table-wrap"><table>
+  <tr><th>Cost driver (Instagram)</th><th>Lever</th><th>Trade-off</th></tr>
+  <tr><td>Media storage (hundreds of PB/yr)</td><td>Erasure coding instead of 3× replication; cold tiers for old media; efficient formats</td><td>Slower access to cold data; CPU for encoding</td></tr>
+  <tr><td>Egress bandwidth</td><td>CDN with high hit ratio; right-sized renditions; modern codecs</td><td>Encoding compute; device compatibility</td></tr>
+  <tr><td>Cache RAM</td><td>Cap timeline length; skip inactive users; compact encodings</td><td>Older items fetched slower</td></tr>
+  <tr><td>Compute</td><td>Efficient runtimes; autoscaling down off-peak; fewer calls per request</td><td>Engineering effort</td></tr>
+  <tr><td>Redundancy</td><td>Match redundancy to each component's SLO (search needs less than feed)</td><td>Lower availability for less critical features</td></tr>
+</table></div>
+
+<h2>10. How Instagram uses these principles: why each box exists</h2>
+<p>Read the Instagram diagram as a set of answers to the questions in this lesson. Every box buys at least one property:</p>
+<div class="table-wrap"><table>
+  <tr><th>Box in the diagram</th><th>Primary property it provides</th><th>How</th></tr>
+  <tr><td>Mobile/Web clients</td><td>Performance (perceived), availability (perceived)</td><td>Prefetching, local caches, optimistic UI, retries with backoff (<a href="clients.html">Clients</a>)</td></tr>
+  <tr><td>DNS</td><td>Availability, performance</td><td>Routes users to a nearby healthy region/PoP; removes failed ones (<a href="dns.html">DNS</a>)</td></tr>
+  <tr><td>CDN</td><td>Performance, scalability, cost, availability</td><td>Serves media near users; offloads ~95%+ of egress; can serve stale on origin failure (<a href="cdn.html">CDN</a>)</td></tr>
+  <tr><td>Load Balancer</td><td>Scalability (X-axis), availability</td><td>Spreads load; health checks eject dead instances; deployed as a redundant pair/fleet (<a href="load-balancer.html">Load Balancing</a>)</td></tr>
+  <tr><td>API Gateway</td><td>Security, operability, availability</td><td>Central auth, TLS, rate limiting protects backends from overload (<a href="api-gateway.html">API Gateway</a>)</td></tr>
+  <tr><td>Stateless application services</td><td>Scalability (X + Y axes), availability, maintainability</td><td>Any instance serves any request; split by function for independent scaling/deploys (<a href="microservices.html">Microservices</a>)</td></tr>
+  <tr><td>Kafka event bus</td><td>Reliability, scalability, performance, evolvability</td><td>Durable, replicated buffer; async work off the request path; absorbs spikes; new consumers without changing producers (<a href="message-queues.html">Message Queues</a>)</td></tr>
+  <tr><td>Feed Fan-out Workers</td><td>Performance</td><td>Pre-compute timelines so reads are a single cache lookup (<a href="news-feed.html">News Feed</a>)</td></tr>
+  <tr><td>Media Processing Workers</td><td>Performance, cost</td><td>Right-sized renditions and adaptive video reduce bytes and latency (<a href="media-processing.html">Media Processing</a>)</td></tr>
+  <tr><td>Feed Cache (Redis)</td><td>Performance, scalability</td><td>Sub-ms reads; absorbs the bulk of read QPS so databases don't have to; replicated for availability (<a href="caching.html">Caching</a>)</td></tr>
+  <tr><td>Cassandra (posts, comments, stories, messages)</td><td>Scalability (Z-axis), availability, durability</td><td>Sharded by key, leaderless replication (RF 3) survives node and zone loss (<a href="sharding.html">Sharding</a>, <a href="replication.html">Replication</a>)</td></tr>
+  <tr><td>PostgreSQL (users), sharded + replicas</td><td>Reliability/consistency, availability, read scaling</td><td>Unique constraints and transactions; replicas for reads and failover (<a href="databases.html">Databases</a>)</td></tr>
+  <tr><td>Object Storage (S3)</td><td>Durability, scalability, cost</td><td>11-nines design via replication/erasure coding across zones; tiers (<a href="object-storage.html">Object Storage</a>)</td></tr>
+  <tr><td>Elasticsearch</td><td>Performance</td><td>Inverted index makes search fast; updated async so writes aren't slowed (<a href="search.html">Search</a>)</td></tr>
+  <tr><td>Notification Service → APNs/FCM</td><td>Reliability, availability isolation</td><td>Retries, dedupe; push-provider outages don't affect posting (<a href="notifications.html">Notifications</a>)</td></tr>
+  <tr><td>Analytics &amp; ML</td><td>Operability, product performance</td><td>Metrics for capacity planning; models for relevance (<a href="analytics-ml.html">Analytics &amp; ML</a>)</td></tr>
+  <tr><td>Multiple zones/regions (implicit)</td><td>Availability, durability</td><td>Survive data-centre loss; serve users nearby (<a href="multi-region.html">Multi-Region</a>)</td></tr>
+</table></div>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+Instagram's public engineering history illustrates these principles in sequence. Early talks ("Scaling Instagram") describe stateless Django app servers behind load balancers (X-axis), PostgreSQL scaled first with replicas and then by <strong>sharding into thousands of logical shards</strong> (Z-axis), and Redis/Memcached absorbing reads (performance). Later, Instagram moved into Facebook's data centres and described running in <strong>multiple data centres</strong> so that losing one would not take the service down (availability), and adopting <strong>Cassandra</strong> for workloads needing high write throughput and fault tolerance. Their engineers have also written publicly about performance work on the Python/Django stack — e.g. tuning garbage collection to improve memory efficiency — a reminder that per-server efficiency directly translates into fewer machines (cost).</div>
+<div class="flow">
+  <div class="fnode client">More users<small>load ↑</small></div><div class="farrow">→<small>X-axis</small></div>
+  <div class="fnode svc">Clone stateless services</div><div class="farrow">→<small>reads ↑</small></div>
+  <div class="fnode store">Cache + replicas</div><div class="farrow">→<small>data/writes ↑</small></div>
+  <div class="fnode store">Shard (Z-axis)</div><div class="farrow">→<small>teams ↑</small></div>
+  <div class="fnode async">Split services (Y) + events</div><div class="farrow">→<small>regions</small></div>
+  <div class="fnode ext">Multi-region</div>
+</div>
+
+<h2>11. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ What these techniques buy</h4><ul>
+    <li>Horizontal scaling → near-unlimited capacity and redundancy</li>
+    <li>Redundancy + automatic failover → four nines and beyond</li>
+    <li>Replication/erasure coding → durability measured in many nines</li>
+    <li>Caches and pre-computation → low, predictable latency</li>
+    <li>Async queues → spike absorption, failure isolation</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ What they cost</h4><ul>
+    <li>Distributed systems complexity: partial failures, consistency trade-offs</li>
+    <li>2–3× hardware for redundancy and headroom</li>
+    <li>Replication lag → stale reads; failover → possible data loss (RPO)</li>
+    <li>Caches → invalidation bugs and miss storms</li>
+    <li>More moving parts to monitor and operate</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>"We'll scale vertically forever."</strong> Works until it suddenly doesn't — and the migration happens under pressure.</li>
+  <li><strong>Hidden state</strong> in "stateless" services: local file uploads, in-memory sessions, local caches assumed to be authoritative.</li>
+  <li><strong>Redundancy in the same failure domain</strong>: two replicas on the same rack, or a "backup" in the same region.</li>
+  <li><strong>Assuming independent failures</strong>: correlated failures (bad deploys, config pushes) are the most common cause of big outages.</li>
+  <li><strong>Untested failover</strong>: a standby that has never been promoted probably won't work when needed. Practise it (game days, chaos testing).</li>
+  <li><strong>Reporting averages</strong>: the mean hides the tail; use p99 and p99.9.</li>
+  <li><strong>Running hot</strong>: 90% utilisation looks efficient but makes latency explode and leaves no room for failover.</li>
+  <li><strong>Ignoring fan-out</strong>: a page touching 100 services will be slow at the tail unless you mitigate.</li>
+  <li><strong>Every extra nine everywhere</strong>: over-engineering low-value features wastes money; match SLOs to user impact.</li>
+</ul>
+
+<h2>12. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>Principle it serves</th><th>When to use it</th></tr>
+  <tr><td>Kubernetes, cloud autoscaling groups</td><td>Horizontal scaling, elasticity, self-healing</td><td>Running many stateless instances; replacing failed ones automatically</td></tr>
+  <tr><td>HAProxy, NGINX, Envoy, cloud load balancers</td><td>Distribution, health checks, failover</td><td>In front of every replicated tier</td></tr>
+  <tr><td>ZooKeeper, etcd, Consul</td><td>Leader election, fencing, service discovery</td><td>Safe active-passive failover; avoiding split brain</td></tr>
+  <tr><td>Patroni (PostgreSQL), MySQL Group Replication / Orchestrator</td><td>Automated database failover</td><td>Relational primaries that must fail over in seconds</td></tr>
+  <tr><td>Cassandra, DynamoDB, ScyllaDB</td><td>Partitioned, replicated, highly available storage</td><td>Write-heavy data needing to survive node/zone loss</td></tr>
+  <tr><td>Redis Cluster / Sentinel, Memcached</td><td>Performance via in-memory caching; replicas for availability</td><td>Hot reads and low-latency structures</td></tr>
+  <tr><td>Prometheus, Grafana, OpenTelemetry, Jaeger</td><td>Measuring percentiles, saturation, traces for bottleneck analysis</td><td>Always — you can't improve what you don't measure</td></tr>
+  <tr><td>Chaos Monkey, Gremlin, LitmusChaos</td><td>Verifying fault tolerance</td><td>Systems with ambitious availability targets</td></tr>
+  <tr><td>k6, Locust, Gatling</td><td>Finding throughput limits and latency curves</td><td>Capacity planning, before launches</td></tr>
+</table></div>
+
+<h2>13. Interview corner</h2>
+<details class="qa"><summary>What's the difference between vertical and horizontal scaling, and which would you use for Instagram?</summary>
+<p>Vertical scaling buys a bigger machine — simple, no code changes, but it has a hard ceiling, gets expensive near the top, and remains a single point of failure. Horizontal scaling adds more machines behind a load balancer — near-unlimited and redundant, but requires stateless services or partitioned data. For Instagram: horizontal everywhere — stateless services cloned behind LBs, Redis and Cassandra clusters, sharded PostgreSQL. Vertical scaling is still useful tactically, e.g. giving database primaries large machines to delay resharding.</p></details>
+<details class="qa"><summary>Explain the scale cube with Instagram examples.</summary>
+<p>X-axis: clone — hundreds of identical Feed Service instances behind a load balancer; DB read replicas. Y-axis: split by function — separate Upload, Feed, Like &amp; Comment, Follow, Search and DM services, each scaled and deployed independently. Z-axis: split by data — posts partitioned by user_id across Cassandra nodes; users across PostgreSQL shards. Each solves a different limit: X for stateless throughput, Y for organisational and functional scaling, Z for data size and write throughput.</p></details>
+<details class="qa"><summary>A request goes through 5 components each with 99.9% availability. What's the end-to-end availability, and how do you improve it?</summary>
+<p>In series: 0.999<sup>5</sup> ≈ 99.5% — about 44 hours of downtime a year, worse than any single component. Improve by (1) making each component redundant: two independent 99.9% copies in parallel give 1 − 0.001² = 99.9999%, so the chain becomes ≈ 99.9995%; (2) removing components from the synchronous path (move work to async queues); (3) graceful degradation so a failing non-critical dependency doesn't fail the request; (4) spreading replicas across failure domains so failures really are independent.</p></details>
+<details class="qa"><summary>Active-passive or active-active for Instagram's user database?</summary>
+<p>Active-passive per shard: each PostgreSQL shard has one primary that accepts writes (so unique constraints like usernames remain simple and strongly consistent) and replicas that serve reads and act as hot standbys. Failover is automated with consensus-based leader election and fencing to avoid split brain; with synchronous or semi-synchronous replication to at least one standby, RPO can be ~0. Active-active writes would require conflict resolution for usernames — unacceptable. Stateless services, LBs and Cassandra, by contrast, run active-active.</p></details>
+<details class="qa"><summary>Define reliability, availability, durability and fault tolerance, and give an Instagram failure example for each.</summary>
+<p>Reliability: doing the right thing consistently — failure: a like counted twice. Availability: being usable now — failure: the feed returns errors for 10 minutes. Durability: stored data survives — failure: a photo lost forever after disk failures. Fault tolerance: continuing to work despite component failures — failure: losing one Cassandra node causes write errors. Fault tolerance is the means; availability and durability are the goals.</p></details>
+<details class="qa"><summary>Why do you care about p99 more than average latency, and what is tail latency amplification?</summary>
+<p>The average is skewed by outliers and hides what the slowest users experience; heavy users hit the tail daily. Amplification: when a request fans out to N backends in parallel and waits for all, it's as slow as the slowest. If each is slow 1% of the time, the request is slow with probability 1 − 0.99<sup>N</sup>: 18% at N = 20, 63% at N = 100. A feed page hydrating many posts is exactly this case. Mitigate with batching (fewer calls), hedged requests, timeouts with partial results, and pre-computed timelines.</p></details>
+<details class="qa"><summary>Use Little's law to size something in Instagram.</summary>
+<p>Feed tier: λ = 350K req/s at peak, W = 100 ms → L = 35,000 concurrent requests. If a server handles 64 concurrent requests, we need ≥ ~550 servers for concurrency alone, before headroom. Or a DB pool: 20K queries/s × 5 ms = 100 connections. It also explains cascading failures: if a dependency's latency rises 10×, in-flight requests rise 10× at the same throughput, exhausting threads and pools — hence timeouts and circuit breakers.</p></details>
+<details class="qa"><summary>How do you find the bottleneck in a slow feed endpoint?</summary>
+<p>Trace the path (LB → gateway → feed service → Redis timeline → post hydration → ranking) with distributed tracing and look at which spans dominate the p99. For each resource apply USE (utilisation, saturation, errors): CPU on feed hosts, Redis ops/s per shard (a hot shard?), cache hit ratio (miss storm?), connection-pool waits, GC pauses. Fix the top one, re-measure — the bottleneck moves. Typical culprits: N+1 calls during hydration (fix with multi-get), a hot Redis shard (replicate/split hot keys), or ranking-model latency (cache scores, cap candidates).</p></details>
+
+<h2>14. Check your understanding</h2>
+<details class="quiz"><summary>Numeric: two independent load balancers, each 99.9% available, in active-active. Combined availability?</summary>
+<p>1 − (0.001 × 0.001) = 1 − 0.000001 = <strong>99.9999%</strong> — assuming truly independent failures (different racks/zones, staggered deploys).</p></details>
+<details class="quiz"><summary>Numeric: how much downtime per month does 99.95% allow?</summary>
+<p>0.05% of ~43,830 minutes (average month) ≈ <strong>21.9 minutes</strong>.</p></details>
+<details class="quiz"><summary>Numeric: MTBF = 500 hours, MTTR = 30 minutes. Availability? What if MTTR drops to 30 seconds?</summary>
+<p>500 / 500.5 ≈ <strong>99.90%</strong>. With MTTR = 30 s (0.00833 h): 500 / 500.00833 ≈ <strong>99.998%</strong>. Faster recovery is often the cheapest path to more nines.</p></details>
+<details class="quiz"><summary>Numeric: a page calls 50 backends in parallel; each has a 1% chance of being slow. What fraction of pages is slow?</summary>
+<p>1 − 0.99<sup>50</sup> ≈ 1 − 0.605 = <strong>~39.5%</strong>.</p></details>
+<details class="quiz"><summary>Scenario: your three Redis replicas are in the same availability zone. Is the cache highly available?</summary>
+<p>Only against single-node failures. A zone outage (power, network) takes out all three at once — a correlated failure. Spread replicas across zones (and ideally have the feed degrade gracefully if the cache tier is lost).</p></details>
+<details class="quiz"><summary>Scenario: a service runs at 92% CPU at peak and its p99 is erratic. Why, and what do you do?</summary>
+<p>Queueing: near full utilisation, waiting time grows like 1/(1 − ρ) — at 92% it's ~12× the service time and very sensitive to bursts. Add capacity (or cut per-request work) to bring peak utilisation to ~60–70%, and add load shedding/rate limiting to protect it from spikes.</p></details>
+<details class="quiz"><summary>Which property is violated: "Users' photos were all still on disk after the outage, but nobody could view them for 2 hours"?</summary>
+<p><strong>Availability</strong> was violated; <strong>durability</strong> was preserved. The fix lies in redundancy and failover (e.g. serving from another region), not in more data copies.</p></details>
+<details class="quiz"><summary>Why must Instagram's app servers be stateless, and what's the one tier in the diagram that can't be fully stateless?</summary>
+<p>Statelessness lets the load balancer send any request anywhere, enables autoscaling, zero-downtime rolling deploys, and loss of an instance without data loss. The Direct Messaging WebSocket tier holds long-lived connections, so it's connection-stateful; it keeps all durable state (messages, presence) in external stores and uses a routing registry so any instance failure only drops connections, which clients re-establish.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li><strong>Scale out stateless services</strong>; scale data with replicas (reads), sharding (size/writes) and caches. The scale cube's X, Y, Z axes combine.</li>
+    <li>Availability: <strong>series multiplies</strong> (A<sub>1</sub>×A<sub>2</sub>…), <strong>parallel</strong> = 1 − Π(1 − A<sub>i</sub>). Kill SPOFs, spread across failure domains, beware correlated failures; recover fast (MTTR).</li>
+    <li>Active-passive = simple writes, slower failover, split-brain risk; active-active = instant failover, harder writes.</li>
+    <li>Reliability ≠ availability ≠ durability; fault tolerance is how you get them. Degrade gracefully.</li>
+    <li>Measure <strong>p99</strong>; fan-out amplifies tails (1 − 0.99<sup>N</sup>); <strong>L = λW</strong>; keep utilisation ~60–70%; fix the real bottleneck, then re-measure.</li>
+    <li>Maintainability and cost are requirements too — every Instagram box exists to buy one of these properties.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="cap-consistency.html">CAP, PACELC &amp; Consistency</a> — what availability costs in consistency during partitions</li>
+  <li><a href="replication.html">Replication</a> — leader/follower, failover, replication lag</li>
+  <li><a href="sharding.html">Sharding</a> — Z-axis scaling in depth</li>
+  <li><a href="load-balancer.html">Load Balancing</a> — X-axis scaling and health checks</li>
+  <li><a href="resilience-patterns.html">Resilience Patterns</a> — timeouts, retries, circuit breakers, load shedding</li>
+  <li><a href="multi-region.html">Multi-Region &amp; Disaster Recovery</a> — RTO/RPO and regional failover</li>
+  <li><a href="observability.html">Observability</a> — measuring percentiles and finding bottlenecks</li>
+  <li><a href="capacity-estimation.html">Back-of-the-Envelope Estimation</a> — the numbers behind headroom and server counts</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

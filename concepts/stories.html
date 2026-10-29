@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stories &amp; Ephemeral (TTL) Data — Instagram System Design</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="concept" data-slug="stories">
+<article class="lesson">
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR</div>
+  <ul>
+    <li>Stories are photos/videos visible for <strong>24 hours</strong>, shown in a ranked <strong>tray</strong> at the top of the app, with <strong>seen/unseen</strong> rings, <strong>viewer lists</strong>, replies/reactions, <strong>highlights</strong> and <strong>close friends</strong> audiences.</li>
+    <li>Expiry is enforced in <strong>layers</strong>: an exact <strong>query-time filter</strong> on <code>created_at</code> for correctness, plus <strong>Cassandra TTL / Redis EXPIRE</strong>, a <strong>background sweeper</strong> and <strong>object-storage lifecycle rules</strong> to reclaim space.</li>
+    <li>The tray is built like a mini <a href="news-feed.html">feed</a>: <strong>fan-out on write</strong> of "author X has a new story" into followers' tray sets (pull for celebrities), then <strong>ranked by affinity</strong>, unseen first.</li>
+    <li>Views are the dominant write load (tens of billions/day). Track seen-state compactly (<strong>per-author watermarks</strong>, bitmaps, Bloom filters) and protect celebrity stories from <strong>hot partitions</strong> by bucketing and batching viewer-list writes.</li>
+    <li>"Instant" tap-through comes from <strong>prefetching</strong> the next stories' media; privacy (close friends, hidden-from, blocks) is checked at fan-out <em>and</em> at read time.</li>
+  </ul>
+</div>
+
+<h2>1. The problem: why is ephemeral content its own design problem?</h2>
+<p>Instagram launched Stories in 2016, and within a few years publicly reported around <strong>500 million daily Stories users</strong>. Stories look like "posts that disappear", but their access pattern is very different from feed posts:</p>
+<ul>
+  <li><strong>Everything is hot, then nothing is.</strong> A story gets almost all of its views in its first few hours and none after 24 hours. Feed posts have a long tail; stories have a cliff.</li>
+  <li><strong>Reads create writes.</strong> Every view is recorded (seen-state for the viewer, viewer list for the author). Stories are therefore <strong>write-heavy</strong> in a way feed browsing isn't.</li>
+  <li><strong>Expiry must be correct.</strong> If a story is still visible at hour 25, that's a privacy bug, not a performance issue.</li>
+  <li><strong>The UI demands instant tap-through.</strong> Users flick through dozens of stories in a minute; any spinner kills the experience.</li>
+  <li><strong>Audiences vary per story</strong>: all followers, close friends only, minus people the author hid it from.</li>
+</ul>
+<div class="callout analogy">
+  <span class="callout-title">🧠 Analogy</span>
+  Stories are like a <strong>bakery's daily specials board</strong>. Each morning items are chalked up; at closing time they're wiped off — but the baker keeps a <strong>notebook</strong> (the archive) and frames a few favourites on the wall (highlights). Regulars glance at the board and the bakery remembers which specials each regular already tried (seen-state), and the baker gets a list of who looked at each item (viewer list). Wiping the board is easy; the hard part is that ten thousand customers look at the board every second, and some specials (a celebrity's) draw a crowd so large the queue blocks the door (hot partition).
+</div>
+
+<h2>2. Requirements and numbers</h2>
+<h3>2.1 Functional requirements</h3>
+<div class="cards">
+  <div class="card"><h4>⏳ 24-hour expiry</h4><p>A story disappears from everyone's view exactly 24 h after posting.</p></div>
+  <div class="card"><h4>🎞️ Stories tray</h4><p>A ranked row of accounts with active stories; unseen first; tap to play an author's stories in order.</p></div>
+  <div class="card"><h4>🔵 Seen / unseen</h4><p>Coloured ring if the viewer has unseen stories from that author; playback resumes at the first unseen one.</p></div>
+  <div class="card"><h4>👀 Viewer list</h4><p>The author sees who viewed each story and how many (for a limited period).</p></div>
+  <div class="card"><h4>💬 Replies &amp; reactions</h4><p>Reply or send a quick emoji; it arrives as a direct message referencing the story.</p></div>
+  <div class="card"><h4>⭐ Highlights</h4><p>Pin stories to the profile permanently, grouped into named collections.</p></div>
+  <div class="card"><h4>💚 Close friends</h4><p>Post to a hand-picked audience; also "hide story from" specific people.</p></div>
+</div>
+<h3>2.2 Non-functional requirements</h3>
+<ul>
+  <li><strong>Low latency</strong>: tray loads in &lt;200 ms server time; next story starts in &lt;100 ms (needs prefetch).</li>
+  <li><strong>High availability</strong> for viewing; brief staleness in viewer counts is fine (<a href="cap-consistency.html">eventual consistency</a>).</li>
+  <li><strong>Strict expiry and audience enforcement</strong> — correctness, not best effort.</li>
+  <li><strong>Handle extreme skew</strong>: a celebrity's story may get tens of millions of views in an hour.</li>
+</ul>
+<h3>2.3 Back-of-the-envelope (assumptions)</h3>
+<p>Assume 500M daily story viewers; 100M of them post, averaging 4 story items each; each viewer watches ~40 story items per day and opens the app ~10 times.</p>
+<pre><code>New stories/day   = 100M × 4                 = 400M   → ~4,600/s avg  (~14k/s peak)
+Story views/day   = 500M × 40                = 20B    → ~230,000/s avg (~700k/s peak)
+Tray loads/day    = 500M × 10                = 5B     → ~58,000/s avg
+View records      = 20B × ~24 bytes (story_id, viewer_id, ts)  ≈ 480 GB/day before replication
+Media ingest      = 400M × ~3 MB (photo/video mix)              ≈ 1.2 PB/day</code></pre>
+<p>Two striking facts: views outnumber new stories <strong>50 : 1</strong>, and every view is a <strong>write</strong>. The design must make view-recording cheap and spread out. See <a href="capacity-estimation.html">capacity estimation</a>.</p>
+
+<h2>3. Data model</h2>
+<pre class="ascii">
+stories              PARTITION KEY author_id   CLUSTERING story_id DESC   (TTL 24h on the "active" copy)
+  author_id | story_id (time-sortable 64-bit) | media_id | media_type | audience | created_at | expires_at
+            |                                  |          |            | ALL / CLOSE_FRIENDS
+
+story_archive        PARTITION KEY author_id   CLUSTERING story_id DESC   (no TTL — private archive)
+highlights           PARTITION KEY owner_id    CLUSTERING highlight_id  → title, cover_media, [story_ids...]
+
+story_views          PARTITION KEY (story_id, bucket)  CLUSTERING viewer_id     (TTL ~48h)
+story_view_counts    story_id → approximate count (counter / aggregated in a stream)
+
+seen_watermark       (viewer_id, author_id) → last_seen_story_id   (Redis hash, TTL 24h)
+tray_inbox           viewer_id → sorted set { author_id : latest_story_ts }   (Redis, entries &gt;24h trimmed)
+
+close_friends        PARTITION KEY owner_id  CLUSTERING friend_id
+story_hidden_from    PARTITION KEY owner_id  CLUSTERING viewer_id
+</pre>
+<ul>
+  <li><strong>Partition by author</strong>: "all active stories by author X" — the main read when you tap a tray item — is one partition scan, newest-first. This mirrors the post metadata store (Cassandra, sharded by user_id) in the diagram.</li>
+  <li><strong>Story IDs are time-sortable</strong> (<a href="id-generation.html">Snowflake-style</a>), so ordering and "newer than my watermark" comparisons need no extra timestamp index.</li>
+  <li><strong>Views are keyed by story</strong>, not by author, so the author can page through viewers of one story; the <code>bucket</code> spreads a hot story across partitions (section 7).</li>
+  <li><strong>Media</strong> lives in <a href="object-storage.html">object storage</a>, uploaded through the same pre-signed flow as posts (<a href="media-upload.html">Media upload</a>), and is served via the <a href="cdn.html">CDN</a>.</li>
+</ul>
+
+<h2>4. Making stories expire: TTL implementations</h2>
+<p><strong>TTL (time to live)</strong> means "this data stops existing (or stops being visible) after a set duration". There are several places to enforce it, each with different guarantees.</p>
+<div class="table-wrap"><table>
+  <tr><th>Mechanism</th><th>How it works</th><th>Strengths</th><th>Weaknesses</th></tr>
+  <tr><td><b>Cassandra TTL</b></td><td><code>INSERT … USING TTL 86400</code>; each cell carries an expiry. Expired cells are ignored on read and later turned into tombstones and purged during compaction.</td><td>Automatic, per-row; with <em>TimeWindowCompactionStrategy</em> whole SSTables of expired data are dropped cheaply.</td><td>Tombstones linger until <code>gc_grace_seconds</code> passes and compaction runs; mixing TTL and non-TTL data in one table hurts compaction; TTL is fixed at write time.</td></tr>
+  <tr><td><b>Redis EXPIRE</b></td><td><code>SET key … EX 86400</code> or <code>EXPIRE key 86400</code>. Keys are removed lazily when accessed after expiry and actively by a background sampler.</td><td>Precise from the reader's point of view (an expired key is never returned); perfect for caches, tray sets and seen-state.</td><td>Only key-level, not per member of a set/sorted set; memory only; not a source of truth.</td></tr>
+  <tr><td><b>Query-time filtering</b></td><td>Every read adds <code>WHERE story_id &gt; id_at(now − 24h)</code> (or <code>created_at &gt; now − 24h</code>).</td><td><strong>Exact</strong> to the millisecond regardless of cleanup lag; works in every store; trivial to reason about.</td><td>Reclaims no storage; every read path must remember to apply it.</td></tr>
+  <tr><td><b>Background sweeper</b></td><td>A scheduled job (or delayed queue) finds expired stories and deletes/archives them, purges caches, removes tray entries, emits <code>StoryExpired</code>.</td><td>Handles derived data in many systems; can do side effects (archive, notify, analytics).</td><td>Runs late if behind; must be idempotent; another moving part.</td></tr>
+  <tr><td><b>Object storage lifecycle rules</b></td><td>Bucket rules like "expire objects under <code>stories/ephemeral/</code> after 2 days".</td><td>Zero-effort, cheap reclamation of petabytes of media.</td><td>Day-level granularity and asynchronous processing (can lag hours) — useless for exact 24 h visibility; dangerous if the object is also needed by a highlight.</td></tr>
+</table></div>
+
+<h3>4.1 Why combine them</h3>
+<p>No single mechanism is both <strong>exact</strong> and <strong>complete</strong>. The robust design layers them, each doing what it's good at:</p>
+<div class="diagram">
+<svg viewBox="0 0 820 260" width="820" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-st-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <line x1="40" y1="40" x2="790" y2="40" stroke="#555" stroke-width="1.5" marker-end="url(#ar-st-1)"/>
+  <g font-size="11.5" fill="#333" text-anchor="middle">
+    <text x="60" y="30">t = 0 posted</text><text x="400" y="30">t = 24 h</text><text x="600" y="30">t = 48 h</text><text x="740" y="30">~72 h</text>
+  </g>
+  <line x1="400" y1="35" x2="400" y2="245" stroke="#c62828" stroke-dasharray="5 3"/>
+  <g text-anchor="start">
+    <rect x="60" y="55" width="340" height="30" rx="5" fill="#e8f5e9" stroke="#2e7d32"/><text x="70" y="75">Visible: query filter id &gt; id_at(now−24h)</text>
+    <rect x="60" y="95" width="340" height="30" rx="5" fill="#fff8e1" stroke="#f9a825"/><text x="70" y="115">Cassandra active row (TTL 24 h)</text>
+    <rect x="400" y="95" width="200" height="30" rx="5" fill="#eceff1" stroke="#455a64" stroke-dasharray="4 3"/><text x="410" y="115">tombstone → compaction</text>
+    <rect x="60" y="135" width="340" height="30" rx="5" fill="#fff8e1" stroke="#f9a825"/><text x="70" y="155">Redis tray entry / seen-state (EXPIRE)</text>
+    <rect x="400" y="175" width="230" height="30" rx="5" fill="#f3e5f5" stroke="#6a1b9a"/><text x="410" y="195">sweeper: caches, StoryExpired</text>
+    <rect x="60" y="215" width="680" height="30" rx="5" fill="#fff8e1" stroke="#f9a825"/><text x="70" y="235">Media blob → lifecycle rule (if not archived/highlighted); viewer list TTL 48 h</text>
+  </g>
+</svg>
+<div class="caption">Layered expiry: the query filter makes visibility exact at 24 h; TTLs, sweepers and lifecycle rules reclaim storage afterwards, at their own pace.</div>
+</div>
+<ol>
+  <li><strong>Correctness</strong> comes from the <strong>query-time filter</strong> on every read path (tray, author's story list, story-by-ID), plus <strong>short-lived signed media URLs</strong> so a cached URL can't be replayed for days.</li>
+  <li><strong>Storage reclamation</strong> comes from <strong>Cassandra TTL</strong> (in a table dedicated to TTL'd data, with time-window compaction) and <strong>Redis EXPIRE</strong>.</li>
+  <li><strong>Side effects and derived data</strong> (cache purges, tray cleanup, analytics events) come from the <strong>sweeper</strong>, driven by a delayed queue or a time-bucketed index (<code>expiring_at_hour → [story_ids]</code>).</li>
+  <li><strong>Media</strong> is reclaimed by <strong>lifecycle rules</strong> on an ephemeral prefix — only for stories not kept in the archive or a highlight (section 9).</li>
+</ol>
+<div class="callout warn"><span class="callout-title">⚠️ Clock skew</span>
+"Now − 24 h" must be computed from a trustworthy clock. Servers use NTP-synchronised clocks and the story ID's embedded timestamp (assigned server-side), never the client's device time. A few hundred milliseconds of skew is acceptable; minutes are not.</div>
+
+<h2>5. Generating the stories tray</h2>
+<p>The <strong>tray</strong> is the row of circular avatars at the top of the home screen. Building it means answering, fast: <em>"Of the hundreds of accounts I follow, which have active stories I'm allowed to see, in what order?"</em> This is a small version of the <a href="news-feed.html">news feed</a> problem, and the same three options apply.</p>
+
+<h3>5.1 Pull, push or hybrid</h3>
+<div class="table-wrap"><table>
+  <tr><th>Approach</th><th>How</th><th>Cost</th></tr>
+  <tr><td><b>Pull (fan-out on read)</b></td><td>On tray open, fetch the viewer's following list (say 500 accounts) and look up "latest active story" for each.</td><td>500 lookups × ~58k tray loads/s ≈ <strong>29M lookups/s</strong>. Cheap writes, very expensive reads.</td></tr>
+  <tr><td><b>Push (fan-out on write)</b></td><td>On <code>StoryCreated</code>, workers add <code>author_id → timestamp</code> into each follower's <em>tray inbox</em> (Redis sorted set).</td><td>Tray read = one small sorted-set read. But a celebrity with 300M followers creates 300M writes per story.</td></tr>
+  <tr><td><b>Hybrid</b> ⭐</td><td>Push for normal authors; for authors above a follower threshold, keep a global "active stories of celebrity X" entry and merge it in at read time for the few celebrities each viewer follows.</td><td>Bounded write amplification and cheap reads.</td></tr>
+</table></div>
+<div class="diagram">
+<svg viewBox="0 0 840 300" width="840" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar-st-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <g text-anchor="middle">
+    <rect x="20" y="40" width="130" height="46" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="85" y="60" font-weight="600">Stories service</text><text x="85" y="77" font-size="11">story saved</text>
+    <rect x="190" y="40" width="130" height="46" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="255" y="60" font-weight="600">Kafka</text><text x="255" y="77" font-size="11">StoryCreated</text>
+    <rect x="360" y="40" width="150" height="46" rx="8" fill="#f3e5f5" stroke="#6a1b9a"/><text x="435" y="60" font-weight="600">Tray fan-out</text><text x="435" y="77" font-size="11">workers</text>
+    <rect x="360" y="130" width="150" height="46" rx="8" fill="#eceff1" stroke="#455a64"/><text x="435" y="150" font-weight="600">Graph service</text><text x="435" y="167" font-size="11">followers (paged)</text>
+    <rect x="560" y="30" width="260" height="66" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="690" y="52" font-weight="600">Tray inbox per viewer (Redis)</text><text x="690" y="70" font-size="11">ZSET author_id → latest story ts</text><text x="690" y="86" font-size="11">trim entries older than 24 h</text>
+    <rect x="560" y="130" width="260" height="46" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="690" y="150" font-weight="600">Celebrity active-stories cache</text><text x="690" y="167" font-size="11">read-time merge (no fan-out)</text>
+    <rect x="20" y="225" width="130" height="46" rx="8" fill="#e1f5fe" stroke="#0277bd"/><text x="85" y="245" font-weight="600">📱 Viewer</text><text x="85" y="262" font-size="11">opens app</text>
+    <rect x="250" y="225" width="200" height="46" rx="8" fill="#e8f5e9" stroke="#2e7d32"/><text x="350" y="245" font-weight="600">Tray builder</text><text x="350" y="262" font-size="11">merge, filter, rank</text>
+    <rect x="560" y="225" width="260" height="46" rx="8" fill="#fff8e1" stroke="#f9a825"/><text x="690" y="245" font-weight="600">Seen watermarks + affinity</text><text x="690" y="262" font-size="11">unseen first, ML score</text>
+  </g>
+  <g stroke="#555" stroke-width="1.4" fill="none" marker-end="url(#ar-st-2)">
+    <path d="M150,63 L188,63"/><path d="M320,63 L358,63"/><path d="M510,63 L558,63"/>
+    <path d="M435,86 L435,128"/>
+    <path d="M150,248 L248,248"/>
+    <path d="M450,235 C530,220 535,110 558,90"/>
+    <path d="M450,248 C500,230 520,170 558,160"/>
+    <path d="M450,256 L558,250"/>
+  </g>
+</svg>
+<div class="caption">Write path (top): StoryCreated is fanned out into followers' tray inboxes. Read path (bottom): the tray builder merges the inbox with celebrity stories, filters and ranks.</div>
+</div>
+
+<h3>5.2 The read path</h3>
+<pre><code>def build_tray(viewer):
+    cutoff = now() - 24h
+    candidates  = redis.zrangebyscore(f"tray:{viewer}", cutoff, "+inf")          # pushed authors
+    candidates += [c for c in followed_celebrities(viewer)                        # pulled authors
+                   if celeb_latest_story_ts(c) &gt; cutoff]
+    candidates  = [a for a in candidates if can_view_any_story(viewer, a)]        # privacy re-check
+    watermarks  = redis.hmget(f"seen:{viewer}", candidates)
+    for a in candidates:
+        a.unseen = latest_story_id(a) &gt; watermarks[a]
+    ranked = rank_by_affinity(viewer, candidates)                                 # ML model
+    return [viewer.own_story] + sorted(ranked, key=lambda a: (not a.unseen, -a.score))</code></pre>
+<p>Typical sizes: a viewer follows a few hundred accounts, of which maybe 30–100 have active stories — a small candidate set, so ranking it per request is affordable.</p>
+
+<h3>5.3 Ranking by affinity</h3>
+<p>The tray order is personalised. A ranking model (see <a href="analytics-ml.html">Analytics &amp; ML</a>) predicts how likely the viewer is to watch and engage with each author's stories, using features such as:</p>
+<ul>
+  <li><strong>Relationship strength</strong>: DMs exchanged, likes/comments between the two, profile visits, being on each other's close friends list, mutual follows.</li>
+  <li><strong>Story history</strong>: how often the viewer watched this author's past stories to the end vs skipped.</li>
+  <li><strong>Freshness</strong>: how recently the author posted; number of unseen items.</li>
+  <li><strong>Content type</strong>: live videos are usually pinned near the front.</li>
+</ul>
+<p>The ordering rule is roughly <strong>unseen before seen, then by predicted interest</strong>. Affinity features are precomputed offline/in streams and cached per (viewer, author) pair so scoring is cheap at request time.</p>
+
+<h2>6. Tracking seen-state at scale</h2>
+<p>Every view must flip a ring from coloured to grey and make playback start at the right story. At ~230k views/s, storage and write cost matter. Four designs:</p>
+<div class="table-wrap"><table>
+  <tr><th>Design</th><th>Stores</th><th>Size per viewer/day</th><th>Exact?</th><th>Notes</th></tr>
+  <tr><td><b>Per-viewer set of story IDs</b></td><td><code>seen:{viewer} = {story_id, …}</code></td><td>~40 × 8 B ≈ 320 B (+ overhead)</td><td>Yes</td><td>Simple; one write per view; Redis set with 24 h EXPIRE</td></tr>
+  <tr><td><b>Per-author watermark</b> ⭐</td><td><code>seen:{viewer}[author] = last_seen_story_id</code></td><td>~1 entry per author watched ≈ 16 B each</td><td>Yes, for in-order viewing</td><td>Works because an author's stories are played oldest→newest and new ones only append</td></tr>
+  <tr><td><b>Bitmaps</b></td><td>Per (viewer, author): bit <em>i</em> = story <em>i</em> of today's sequence seen</td><td>A few bytes per author</td><td>Yes</td><td>Handles out-of-order viewing; needs a stable per-author story index</td></tr>
+  <tr><td><b>Bloom filter</b></td><td>Per viewer, a bit array with k hash functions over seen story IDs</td><td>~10 bits per item for 1% false positives (≈ 50 B for 40 items)</td><td>No — false positives</td><td>Can claim "seen" for an unseen story; never the reverse</td></tr>
+</table></div>
+
+<h3>6.1 Why the watermark works so well</h3>
+<p>When you tap an author, stories play <strong>chronologically</strong>, and authors only ever <em>append</em> new stories. So "seen" for an author collapses to one number: the highest story ID you've reached. Unseen check: <code>author.latest_story_id &gt; watermark</code>. Resume point: first story with <code>id &gt; watermark</code>. One small hash field per (viewer, author), updated with a "max" operation that's naturally idempotent and order-insensitive:</p>
+<pre><code>-- Lua in Redis: only move the watermark forward
+local cur = redis.call('HGET', KEYS[1], ARGV[1])
+if (not cur) or tonumber(ARGV[2]) &gt; tonumber(cur) then
+  redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+end
+redis.call('EXPIRE', KEYS[1], 86400)</code></pre>
+<p>Trade-off: if a viewer skips ahead, skipped stories count as seen — usually acceptable product behaviour. Story IDs must be time-sortable for this to work.</p>
+<p>Memory check: 500M viewers × ~50 authors watched × ~20 B (field + value + overhead) ≈ <strong>500 GB</strong> — a modest sharded Redis cluster, discarded daily.</p>
+
+<h3>6.2 When a Bloom filter makes sense</h3>
+<p>A <strong>Bloom filter</strong> answers "definitely not seen" or "probably seen" in a tiny fixed space. With <code>n</code> items and <code>m</code> bits, the optimal false-positive rate is about <code>(1 − e<sup>−kn/m</sup>)<sup>k</sup></code>; ~9.6 bits per item with 7 hash functions gives ~1%. A 1% error that marks an <em>unseen</em> story as seen means an author silently loses some views — bad for the main tray ring. Bloom filters fit better for "don't show me things I've probably seen" in ranking surfaces (e.g. suggested stories/Reels), where an occasional miss is harmless.</p>
+
+<h3>6.3 Reducing write load</h3>
+<ul>
+  <li><strong>Client batching</strong>: the app marks stories seen locally (instant UI) and sends batched <code>mark_seen</code> calls every few seconds or when leaving the viewer — one request for 10 stories instead of 10.</li>
+  <li><strong>Async pipeline</strong>: the API appends view events to <a href="message-queues.html">Kafka</a>; consumers update watermarks, viewer lists and counts in bulk.</li>
+  <li><strong>Multi-device</strong>: watermarks are server-side, so seen-state syncs across phone and web.</li>
+</ul>
+
+<h2>7. Viewer lists and celebrity hot partitions</h2>
+<p>Authors can see who viewed each story. For most users that's a few dozen to a few thousand rows. For a celebrity with hundreds of millions of followers, one story may collect <strong>tens of millions of views within hours</strong>.</p>
+<h3>7.1 The hot-partition problem</h3>
+<p>If <code>story_views</code> is partitioned by <code>story_id</code> alone, all 50M view writes for one story hit <strong>one partition</strong> — owned by one small replica set in Cassandra — while the rest of the cluster idles. That node's write path, compaction and disk all saturate (a <strong>hot partition</strong>), and the partition grows to gigabytes, making reads and repairs painful. See <a href="sharding.html">Sharding</a>.</p>
+<pre class="ascii">
+ story_id only:                       (story_id, bucket = hash(viewer_id) % 64):
+  node A  ████████████████████ 50M     node A ███  node B ███  node C ███  node D ███ ...
+  node B  ▏                            (~780k rows per bucket, spread across the ring)
+  node C  ▏
+</pre>
+<h3>7.2 Mitigations</h3>
+<ul>
+  <li><strong>Bucketed partition key</strong>: <code>(story_id, bucket)</code> with <code>bucket = hash(viewer_id) % N</code>. N can be 1 for ordinary users and larger (64–1024) for big accounts, chosen at story creation from the author's follower count. Reading the full list means querying N partitions in parallel — fine, because only the author reads it.</li>
+  <li><strong>Buffer and batch</strong>: view events flow through Kafka (keyed by story_id+bucket); consumers write in batches of hundreds of rows, smoothing spikes.</li>
+  <li><strong>Counts separately</strong>: never <code>COUNT(*)</code> the view list. Maintain a counter aggregated in the stream (increment by batch size), or a <strong>HyperLogLog</strong> for approximate unique viewers (~12 KB per story, ~0.8% error) — see <a href="likes-comments.html">counters at scale</a>.</li>
+  <li><strong>Show a slice</strong>: the UI pages through viewers (e.g. 50 at a time) and for huge audiences shows a ranked subset (people you interact with first) plus the total.</li>
+  <li><strong>Short retention</strong>: viewer lists are kept only for a limited window after posting (Instagram shows viewers for up to about 48 hours), so a TTL bounds total storage.</li>
+</ul>
+
+<h2>8. Replies and reactions</h2>
+<p>Replying to a story or tapping a quick-reaction emoji doesn't create a comment; it sends a <strong>direct message</strong> to the author that <em>references</em> the story:</p>
+<pre><code>Message { thread_id, sender_id, type: "story_reply", text: "😂 so good",
+          story_ref: { author_id: 7, story_id: 31415..., media_id: 991 } }</code></pre>
+<ul>
+  <li>The reply goes through the <a href="direct-messaging.html">Direct Messaging</a> service (WebSocket delivery, Messages store) and triggers a <a href="notifications.html">notification</a>.</li>
+  <li>The DM stores a <strong>reference</strong>, not a copy. When the story expires (or the viewer loses access), the thread shows "story unavailable" — permission is re-checked when rendering.</li>
+  <li>Interactive stickers (polls, quizzes, question boxes, emoji sliders) write responses to a per-story table and maintain aggregated tallies, using the same counter techniques as likes.</li>
+  <li>Rate limits and spam filters apply as for DMs: replies are a common spam vector.</li>
+</ul>
+
+<h2>9. Highlights and the archive</h2>
+<p>Highlights are named collections of past stories pinned to the profile, <strong>exempt from the 24-hour TTL</strong>. Instagram also keeps a private <strong>Stories Archive</strong> (on by default) so authors can revisit and re-share their old stories. So "expiry" really means <strong>public visibility expiry</strong>, not necessarily data deletion.</p>
+<ul>
+  <li><strong>Data</strong>: on creation the story is written to both the TTL'd <code>stories</code> table and the non-TTL <code>story_archive</code> (if archiving is on). A highlight stores an ordered list of archived story IDs plus a cover image.</li>
+  <li><strong>Media lifecycle</strong>: blobs must not be deleted by a blanket lifecycle rule if they're archived or highlighted. Options: (a) write story media to a permanent prefix when archiving is on, and to an ephemeral prefix (with a lifecycle rule) only when it's off; (b) on "add to highlight", copy the object into a permanent prefix; (c) <strong>reference-count</strong> blobs and let a sweeper delete only when the count reaches zero.</li>
+  <li><strong>Visibility</strong>: highlights follow the account's privacy (private account → approved followers only), and the read path still applies blocks.</li>
+  <li><strong>Viewer lists</strong> for highlight views are typically not retained like live story views — another reason the views table has its own TTL.</li>
+</ul>
+
+<h2>10. Prefetching for instant tap-through</h2>
+<p>Users tap through stories every 1–5 seconds. If each tap waited for a CDN fetch (50–300 ms on mobile, worse on 3G), the experience would stutter. The app therefore <strong>prefetches</strong>:</p>
+<ol class="steps">
+  <li>When the tray loads, the response already contains signed CDN URLs for each tray author's <strong>first unseen story</strong>; the app downloads the first 3–5 authors' first item in the background.</li>
+  <li>While you watch story <em>k</em>, the app fetches <em>k+1</em> and <em>k+2</em>, plus the <strong>next author's</strong> first unseen story (because swiping to the next author is common).</li>
+  <li>For video, it prefetches only the <strong>first segment(s)</strong> (a second or two) of an adaptive stream, not the whole file.</li>
+  <li>Prefetching adapts to conditions: more on Wi-Fi, less on cellular or in data-saver mode, none on low battery; prefetches are cancelled when the user leaves.</li>
+</ol>
+<p>Cost estimate: prefetching 5 photos at ~150 KB = 750 KB per tray open; at 5B tray opens/day that's ~3.75 PB/day of potentially wasted CDN egress if nobody tapped — so prefetch depth is tuned using measured tap-through probabilities. See <a href="clients.html">Clients</a> and <a href="cdn.html">CDN</a>.</p>
+
+<h2>11. Privacy filtering</h2>
+<p>Each story has an <strong>audience rule</strong>; enforcement must be correct even as relationships change after posting.</p>
+<div class="table-wrap"><table>
+  <tr><th>Rule</th><th>Stored as</th><th>Check</th></tr>
+  <tr><td>Private account</td><td>User setting + approved followers in the graph</td><td>Viewer must be an approved follower</td></tr>
+  <tr><td>Close friends story</td><td><code>audience = CLOSE_FRIENDS</code> on the story; <code>close_friends(owner, friend)</code></td><td>Viewer ∈ author's close friends list <em>now</em></td></tr>
+  <tr><td>Hide story from</td><td><code>story_hidden_from(owner, viewer)</code></td><td>Viewer not in the hidden set</td></tr>
+  <tr><td>Blocking</td><td>Block edges in the <a href="social-graph.html">social graph</a></td><td>Neither has blocked the other</td></tr>
+  <tr><td>Muting</td><td>Mute edge</td><td>Hide from viewer's tray (but still viewable on profile)</td></tr>
+</table></div>
+<ul>
+  <li><strong>At fan-out time</strong>: don't push a close-friends story's author into the trays of non-close-friends; skip blocked/hidden users. This keeps trays clean and saves writes.</li>
+  <li><strong>At read time</strong>: re-check, because lists change after fan-out (you remove someone from close friends, block them, or they unfollow). The authoritative check runs when the tray is built <em>and</em> when the story list/media URLs are requested.</li>
+  <li><strong>Media URLs</strong> are signed and short-lived, so a URL captured before you were blocked stops working quickly.</li>
+  <li>The close-friends list is private to its owner — the Graph service never exposes "who has me on close friends".</li>
+</ul>
+
+<h2>12. How Instagram uses all this</h2>
+<div class="flow">
+  <div class="fnode client">📱 Post story<small>pre-signed upload</small></div><div class="farrow">→</div>
+  <div class="fnode svc">Stories service<small>row + archive + outbox</small></div><div class="farrow">→<small>StoryCreated</small></div>
+  <div class="fnode async">Kafka</div><div class="farrow">→</div>
+  <div class="fnode async">Fan-out + media workers<small>tray inboxes, renditions</small></div><div class="farrow">→</div>
+  <div class="fnode store">Redis / Cassandra / S3</div>
+</div>
+<div class="flow">
+  <div class="fnode client">📱 Open app</div><div class="farrow">→</div>
+  <div class="fnode svc">Tray builder<small>merge, filter, rank</small></div><div class="farrow">→<small>signed URLs</small></div>
+  <div class="fnode edge">CDN<small>prefetch next stories</small></div><div class="farrow">→<small>view events</small></div>
+  <div class="fnode async">Kafka → watermarks, viewer lists, counts</div>
+</div>
+<div class="callout instagram"><span class="callout-title">📸 In Instagram</span>
+In the architecture diagram, the <strong>Stories Service (24h TTL)</strong> stores story metadata in the Cassandra-style metadata store (partitioned by author), media in <strong>Object Storage</strong> behind the <strong>CDN</strong>, tray inboxes and seen-state in the <strong>Redis</strong> cache tier, and publishes <code>StoryCreated</code> to <strong>Kafka</strong> for tray fan-out, media processing, notifications ("X added to their story" for close relationships) and analytics. Publicly, Instagram has said Stories reached around 500M daily users; with assumptions like those in section 2, that's hundreds of millions of new stories and tens of billions of views per day — which is why view recording, not story creation, dominates the design. Instagram is also known to use Cassandra heavily (its engineers have spoken publicly about running it at large scale, including the Rocksandra storage-engine work), a natural fit for append-heavy, TTL-friendly data like stories and views.</div>
+<ul>
+  <li><strong>Expiry</strong>: read paths filter on the story ID's embedded timestamp; TTLs and sweepers clean up; the archive and highlights retain what the author keeps.</li>
+  <li><strong>Celebrities</strong>: stories of very large accounts are pulled at tray-build time rather than fanned out, and their view writes are bucketed and batched.</li>
+  <li><strong>Experience</strong>: aggressive, adaptive prefetching makes tapping feel instant; seen-state syncs across devices via server-side watermarks.</li>
+</ul>
+
+<h2>13. Trade-offs &amp; common pitfalls</h2>
+<div class="pros-cons">
+  <div class="pros"><h4>✅ What this design gets right</h4><ul>
+    <li>Exact 24 h visibility via query-time filtering, independent of cleanup lag</li>
+    <li>Cheap tray reads via push fan-out, bounded by a celebrity pull path</li>
+    <li>Compact, idempotent seen-state with per-author watermarks</li>
+    <li>Hot stories spread over many partitions; counts maintained incrementally</li>
+    <li>Instant UX through prefetching</li>
+  </ul></div>
+  <div class="cons"><h4>⚠️ Costs and compromises</h4><ul>
+    <li>Several expiry mechanisms to operate and keep consistent</li>
+    <li>Fan-out write amplification for ordinary authors with many followers</li>
+    <li>Watermarks treat skipped stories as seen</li>
+    <li>Viewer counts are eventually consistent (seconds behind)</li>
+    <li>Prefetching wastes bandwidth on stories never watched</li>
+  </ul></div>
+</div>
+<h4>Common pitfalls</h4>
+<ul>
+  <li><strong>Relying only on TTL/lifecycle for visibility</strong> → stories visible past 24 h because compaction or lifecycle processing lags.</li>
+  <li><strong>Lifecycle rules deleting highlighted media</strong> → broken highlights. Keep ephemeral and permanent media separate or reference-count.</li>
+  <li><strong>Partitioning views by story_id alone</strong> → hot partitions for celebrity stories.</li>
+  <li><strong><code>COUNT(*)</code> for view counts</strong> → scanning millions of rows per refresh.</li>
+  <li><strong>Checking privacy only at fan-out</strong> → someone removed from close friends still sees the story already in their tray.</li>
+  <li><strong>Using client time for expiry</strong> → users change their phone clock to see or hide stories.</li>
+  <li><strong>Mixing TTL'd and permanent rows in one Cassandra table</strong> → tombstone build-up and poor compaction.</li>
+</ul>
+
+<h2>14. Real-world technologies</h2>
+<div class="table-wrap"><table>
+  <tr><th>Technology</th><th>Role in a stories system</th></tr>
+  <tr><td>Apache Cassandra / ScyllaDB (TTL, TimeWindowCompactionStrategy)</td><td>Story metadata and view records with native TTL and efficient expiry of time-bucketed data</td></tr>
+  <tr><td>Redis (sorted sets, hashes, EXPIRE, HyperLogLog, bitmaps)</td><td>Tray inboxes, seen watermarks, approximate unique view counts, bitmaps</td></tr>
+  <tr><td>DynamoDB TTL</td><td>Managed alternative: items deleted asynchronously after expiry (so still filter at query time)</td></tr>
+  <tr><td>Amazon S3 lifecycle rules / GCS Object Lifecycle</td><td>Reclaiming ephemeral media in bulk by prefix or tag</td></tr>
+  <tr><td>Apache Kafka + Flink/Spark Streaming</td><td>View-event pipeline; batching viewer-list writes; aggregating counts</td></tr>
+  <tr><td>Delayed queues (SQS delay, Redis ZSET schedulers)</td><td>Triggering the sweeper's "story expired" side effects</td></tr>
+  <tr><td>CDN + HLS/DASH</td><td>Serving story photos and video segments; prefetching first segments</td></tr>
+</table></div>
+
+<h2>15. Interview corner</h2>
+<details class="qa"><summary>How would you implement the 24-hour expiry of stories?</summary>
+<p>In layers. Correctness: every read path filters on the story's server-assigned timestamp (embedded in its time-sortable ID): <code>id &gt; id_at(now − 24h)</code>, and media URLs are signed with short expiry. Reclamation: store active stories in a Cassandra table with <code>USING TTL 86400</code> and time-window compaction; Redis tray entries and seen-state with EXPIRE; a sweeper driven by a delayed queue purges caches and emits StoryExpired; S3 lifecycle rules delete ephemeral media under a dedicated prefix after a couple of days. Archived/highlighted stories live in non-TTL tables and permanent storage. TTL alone isn't enough because tombstones/compaction and lifecycle processing are asynchronous.</p></details>
+<details class="qa"><summary>How do you build the stories tray quickly for a user who follows 1,000 accounts?</summary>
+<p>Hybrid fan-out. On StoryCreated, workers add <code>author → latest_ts</code> to each follower's Redis sorted-set tray inbox (skipping blocked/hidden/non-close-friends). Celebrities above a threshold aren't fanned out; their active stories are cached globally and merged at read time for the few celebrities the viewer follows. Tray read: ZRANGEBYSCORE over the last 24 h (typically 30–100 authors), merge celebrities, re-check privacy, look up seen watermarks, rank by an affinity model with unseen first. One sorted-set read plus small multi-gets, well under 100 ms.</p></details>
+<details class="qa"><summary>How do you store which stories each user has seen, for 500M daily viewers?</summary>
+<p>Per (viewer, author) watermark = highest story ID seen, in a Redis hash per viewer with 24 h expiry. Because an author's stories play in order and new ones only append, unseen = <code>latest_story_id &gt; watermark</code>, and playback resumes at the first ID above it. Updates use a "max" so they're idempotent and order-insensitive. Roughly 50 authors × ~20 B per viewer ≈ 1 KB → ~500 GB total, discarded daily. The client batches mark-seen calls; a Kafka pipeline applies them. A Bloom filter would be smaller but its false positives would hide unseen stories, so I'd reserve it for ranking surfaces.</p></details>
+<details class="qa"><summary>A celebrity's story gets 40M views in an hour. What breaks and how do you fix it?</summary>
+<p>If views are partitioned by story_id, one Cassandra partition (one replica set) takes ~11k writes/s and grows to gigabytes — a hot partition. Fix: bucket the key <code>(story_id, hash(viewer) % N)</code> with N chosen per author size; route view events through Kafka and batch-write; maintain the view count incrementally in the stream (or HyperLogLog for uniques) instead of counting rows; page the viewer list for the author and show a ranked subset; TTL the views after ~48 h. Reads of that story are served from CDN/cache, so the read side is fine.</p></details>
+<details class="qa"><summary>How do highlights coexist with a 24-hour TTL?</summary>
+<p>Visibility expiry ≠ deletion. Stories are written to an archive table without TTL (if archiving is on); highlights reference archived story IDs. Media for archived/highlighted stories must not be removed by lifecycle rules: either store it in a permanent prefix from the start when archiving is enabled, copy it on "add to highlight", or reference-count blobs and only delete at zero. Highlight reads apply account privacy and blocks like any profile content.</p></details>
+<details class="qa"><summary>A user removes a friend from Close Friends after posting a close-friends story. Can the friend still see it?</summary>
+<p>They must not. Fan-out already pushed the author into the friend's tray, so correctness requires a read-time check: when building the tray and when fetching the story list or media URLs, the service verifies the viewer is currently on the close-friends list. Stale tray entries are filtered out (and optionally removed asynchronously). Signed media URLs expire quickly, limiting replay of a previously fetched URL.</p></details>
+<details class="qa"><summary>How do you make tapping through stories feel instant?</summary>
+<p>Prefetch. The tray response includes signed CDN URLs of each author's first unseen item; the app preloads the first few authors' first items, then while viewing item k preloads k+1, k+2 and the next author's first item. For video it preloads only the first segment of the ABR stream. Depth adapts to network, battery and data-saver settings and is tuned on tap-through probabilities to limit wasted egress. Popular stories are hot in CDN edges, so prefetch requests are cheap cache hits.</p></details>
+
+<h2>16. Check your understanding</h2>
+<details class="quiz"><summary>Cassandra hides expired cells on read. Why is its TTL still not enough to guarantee a story disappears everywhere at exactly 24 hours?</summary>
+<p>The Cassandra row does disappear on time, but derived copies (Redis caches, tray entries, CDN URLs, other tables) don't share that TTL, and storage reclamation (tombstones, compaction) and object lifecycle rules are asynchronous. A query-time filter on every read path plus short-lived signed URLs give one consistent, exact rule everywhere.</p></details>
+<details class="quiz"><summary>With 500M viewers each watching 40 stories/day, what is the average view-write rate, and how does client batching of 10 views per request change the request rate?</summary>
+<p>20B views/day ÷ 86,400 ≈ <strong>231k views/s</strong>. Batching 10 views per call cuts it to ≈ <strong>23k requests/s</strong> at the API (the number of view records stays the same, but they're written in bulk via the stream).</p></details>
+<details class="quiz"><summary>A viewer's watermark for author A is story 105. A has stories 101, 104, 105, 108, 110. What does the ring show, and where does playback start?</summary>
+<p>Latest story 110 &gt; 105, so the ring shows <strong>unseen</strong>. Playback starts at the first story with ID &gt; 105: <strong>108</strong>.</p></details>
+<details class="quiz"><summary>Why is a Bloom filter risky for the tray's seen/unseen ring?</summary>
+<p>Bloom filters have false positives: they may say "seen" for a story never viewed. The ring would turn grey and the viewer might skip the author — the author silently loses views. They have no false negatives, so they suit "avoid re-showing" use cases, not exact UI state.</p></details>
+<details class="quiz"><summary>Scenario: you add a lifecycle rule deleting everything under <code>stories/</code> after 2 days. Users complain highlights are broken. Why, and what's the fix?</summary>
+<p>Highlighted (and archived) stories share the same prefix, so their media was deleted. Separate ephemeral from retained media (different prefixes or object tags), copy on "add to highlight", or reference-count blobs and delete via a sweeper only when unreferenced.</p></details>
+<details class="quiz"><summary>Why does the tray use push fan-out for most authors but pull for celebrities?</summary>
+<p>Push makes reads cheap (one sorted-set read) at the cost of one write per follower per story. For an author with 300M followers that's 300M writes per story — too much amplification and delay. Pulling those few celebrity authors at read time (from a hot cache) bounds write cost, while the number of celebrities any viewer follows is small enough to merge cheaply.</p></details>
+<details class="quiz"><summary>How many partitions would a 50M-view story's viewer list be spread across with 64 buckets, and how many rows per partition?</summary>
+<p>64 partitions, ≈ 50M / 64 ≈ <strong>780k rows each</strong> — spread across many nodes instead of one 50M-row partition on a single replica set. Huge accounts may use more buckets.</p></details>
+
+<div class="takeaways">
+  <div class="t-title">🎯 Key takeaways</div>
+  <ul>
+    <li>Stories are <strong>hot then dead</strong> and <strong>write-heavy on read</strong>: views outnumber new stories ~50:1, and each view is a write.</li>
+    <li>Enforce expiry in <strong>layers</strong>: exact query-time filtering for visibility; Cassandra TTL, Redis EXPIRE, sweepers and lifecycle rules for cleanup.</li>
+    <li>Build the tray with <strong>hybrid fan-out</strong> (push for most, pull for celebrities), then rank <strong>unseen first by affinity</strong>.</li>
+    <li>Track seen-state with <strong>per-author watermarks</strong>; avoid hot partitions with <strong>bucketed keys</strong>, stream batching and incremental counts.</li>
+    <li>Highlights and the archive make "expiry" about <strong>visibility</strong>, so media lifecycle must respect retained stories.</li>
+    <li>Check privacy (close friends, hidden, blocks) at fan-out <em>and</em> read time, and <strong>prefetch</strong> for instant tap-through.</li>
+  </ul>
+</div>
+
+<h2>Related lessons</h2>
+<ul>
+  <li><a href="news-feed.html">News Feed</a> — the same fan-out-on-write vs read trade-off, in full</li>
+  <li><a href="media-upload.html">Media Upload</a> — how story media is uploaded</li>
+  <li><a href="caching.html">Caching</a> — Redis data structures, EXPIRE and hot keys</li>
+  <li><a href="databases.html">Databases</a> — why wide-column stores suit TTL'd, append-heavy data</li>
+  <li><a href="sharding.html">Sharding</a> — hot partitions and bucketed keys</li>
+  <li><a href="likes-comments.html">Likes &amp; Counters</a> — counting views and reactions at scale</li>
+  <li><a href="social-graph.html">Social Graph</a> — followers, close friends and blocks used for audience checks</li>
+  <li><a href="direct-messaging.html">Direct Messaging</a> — where story replies go</li>
+  <li><a href="object-storage.html">Object Storage</a> — lifecycle rules for media</li>
+</ul>
+
+</article>
+<script src="../assets/concepts.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>
